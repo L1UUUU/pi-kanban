@@ -106,6 +106,7 @@ export class HostApplication {
     return {
       id: d.id, projectId: d.projectId, title: d.title, description: d.description, version: d.revision, phase: d.phase, control: d.control,
       planningFlow: d.planningFlow ? structuredClone(d.planningFlow) : undefined,
+      executionFlow: d.executionFlow ? structuredClone(d.executionFlow) : undefined,
       plan: plan ? { id: plan.id, scope: plan.scope, ready: plan.ready, confirmed: d.confirmedPlanId === plan.id, specPath: plan.spec.location, spec: structuredClone(plan.spec), tickets: structuredClone(plan.tickets), boundaryReviewEvidence: plan.boundaryReview ? structuredClone(plan.boundaryReview.evidence) : undefined, requiredChecks: plan.requiredChecks.map(c => c.name), unresolvedQuestions: [...plan.unresolvedQuestions] } : undefined,
       result: result ? { id: result.id, contentId: result.contentId, notes: result.notes, createdAt: result.createdAt, codeRef: result.K.location, codeArtifact: structuredClone(result.K), knowledgeArtifacts: structuredClone(result.N), reviewEvidence: structuredClone(result.review.evidence), knowledgeRefs: result.N.map(n => n.id), accepted: d.acceptances.some(a => a.resultId === result.id && a.decision === 'accepted') } : undefined,
       activeContentId: d.activeContentId, methodSnapshot: structuredClone(d.methodSnapshot), findings: structuredClone(d.findings), workflowBlockers: [...d.blockedReasons],

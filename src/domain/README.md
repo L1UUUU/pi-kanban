@@ -106,6 +106,24 @@ increases model/data/budget authority.
 
 ## Implementation and acceptance handoff
 
+Production selects `implement-spec-staged-v1` in both phase slots. The persisted
+`executionFlow` binds approved planning and seam decisions, computes the serial
+ticket frontier and records TDD receipt identities. `execution-content` advances
+one ticket only after trusted source/test/stop verification. Both whole-spec
+axes run after the graph completes: `execution-review` keeps Standards and Spec
+separate on identical K; `execution-resolution` closes only the targeted findings
+after one scoped repair writer. Legacy `content-ready`, `review`, and finding
+closure reports cannot bypass this protocol.
+
+Each new context binds flow, input digest, scope, ticket and current content.
+Pause, cancel, changed decisions and old generations cannot advance it. Return
+feedback retains the rejected result/K and explicit reason for the next writer;
+unchanged approved scope and testing seams remain binding. Final delivery stores
+the complete execution record as immutable evidence, including both review axes.
+See [the execution adapter](../../docs/implementation-method-bundle.md).
+
+The original synthetic/legacy handoff remains available for regression fixtures:
+
 1. Receive `content-ready` with Host-verified stable K and N. A `contentStable`
    flag must represent real verified frozen bytes; it is not an Agent assertion.
 2. After actual writer stop, dispatch a distinct read-only review context, with

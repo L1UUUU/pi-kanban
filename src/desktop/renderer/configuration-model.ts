@@ -1,6 +1,17 @@
 import type { ConfigurationSummary, Demand, ModelAuthorizationCommand, ProviderConfiguration, ViewState } from './types.ts';
+import type { MethodSourceConfiguration } from '../../host/configuration.ts';
+import type { Stage } from '../../domain/types.ts';
 
 export const LOCAL_RESOURCE_SCOPE = 'demand-worktree-private-runtime-v1' as const;
+
+/** Display the selected staged contract; the Host remains the resource and authorization boundary. */
+export function methodSelectionDisclosure(stage: Stage, source?: MethodSourceConfiguration | null): { name: string; projection: string; detail: string; stagedSelection: boolean } {
+  if (stage === 'planning') return { name: source?.logicalName ?? 'design-feature', projection: '分阶段规划', detail: '外部 design-feature 来源与完整 skillBundle 分别锁定。', stagedSelection: !!source?.skillBundle && source.logicalName === 'design-feature' && source.adapter === 'design-feature-staged-v1' };
+  const stagedSelection = !!source?.executionBundle && source.logicalName === 'implement-spec' && source.adapter === 'implement-spec-staged-v1';
+  return { name: source?.logicalName ?? 'implement-spec', stagedSelection,
+    projection: stage === 'implementation' ? 'implement-spec · TDD 实施与限定修复' : 'implement-spec · 独立只读 code-review',
+    detail: stage === 'implementation' ? '按任务依赖推进，以 TDD 完成当前任务；修复仅针对已记录的发现或检查失败。' : '分别核对项目标准与 Spec，在独立只读上下文审查精确内容 K；所有任务完成后再做整个 Spec 的审查。' };
+}
 
 /** Configuration disclosure only; selection is never evidence of verified isolation. */
 export function runtimePolicyDisclosure(value?: unknown): { id: string; label: string; detail: string } {

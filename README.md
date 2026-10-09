@@ -51,7 +51,7 @@ Node 检查只能读取获准源码并使用私有临时区。测试须显式使
 
 本仓库没有原始私有规划 ZIP、个人会话、真实凭据或付费模型授权。原始产品规格用编号追溯，公开文档为本项目重新编写。
 
-私有 `design-feature` 入口仍由用户配置本地路径和摘要，不复制到仓库。公共下游依赖已按精确提交附带于 `vendor/mattpocock-skills`，保留原文、调用限制、来源和 MIT 许可；自动阶段调用及本地产物位置由独立适配规则明确限定。生产规划不再接受 `explicit-text-v1` 拼接方法；该旧接口仅保留给其他文本方法及合成回归。实际 Pi 的逐阶段加载与生产协议已用确定性模型传输测试，不能据此宣称真实模型质量或目标 Windows 隔离通过。
+私有 `design-feature` 入口仍由用户配置本地路径和摘要，不复制到仓库。公共下游依赖已按精确提交附带于 `vendor/mattpocock-skills`，保留原文、调用限制、来源和 MIT 许可；自动阶段调用及本地产物位置由独立适配规则明确限定。生产规划使用 `design-feature-staged-v1`，实施与 Review 均选择 `implement-spec-staged-v1`；旧文本接口仅保留用于检查和合成回归。实施按本地 ticket 依赖逐项执行 TDD，全部完成后由独立只读上下文分别审查 Standards 和 Spec，修复后做限定范围的独立核验。Review 对照基线和冻结内容 K，包括未提交改动。实际 Pi 的逐阶段加载与生产协议采用确定性模型传输测试，不能据此宣称真实模型质量或目标 Windows 隔离通过。
 
 ## 进一步阅读
 
@@ -62,5 +62,6 @@ Node 检查只能读取获准源码并使用私有临时区。测试须显式使
 - [开发与测试说明](docs/development.md)
 - [运行配置与有限授权](docs/configuration.md)
 - [规划技能锁定、阶段加载与适配范围](docs/planning-method-bundle.md)
+- [implement-spec 实施、双轴 Review 与修复边界](docs/implementation-method-bundle.md)
 - [需求规则 API](src/domain/README.md)
 - [Windows 原生候选](native/windows/README.md)

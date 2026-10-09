@@ -13,6 +13,8 @@ export interface ExecutionPrerequisites {
   launchFor(run: RunAttempt): Omit<LaunchRequest, 'demandId' | 'grantId' | 'role' | 'writes' | 'highResource'>;
   verifyWorkspaceAfterStop(demandId: string): boolean;
   verifyReport(report: WorkerReport, run: RunAttempt): ReportVerification;
+  /** Keep domain ownership until the Host finishes applying a stopped handoff. */
+  settlementPending?(run: RunAttempt): boolean;
   classifyExit?(run: RunAttempt): { outcome: 'handoff' | 'safe-retry' | 'unknown'; evidence: string };
 }
 
@@ -87,9 +89,11 @@ export class ExecutionCoordinator {
   }
   async observeCompletedRuns(): Promise<void> {
     for (const run of this.#store.listRuns().filter(run => run.status !== 'stopped')) {
+      if (this.#prerequisites.settlementPending?.(run)) continue;
       const runtime = this.supervisor.list().find(candidate => candidate.grantId === run.id);
       if (!runtime) continue;
       const observed = runtime.state === 'stopped' ? runtime : await this.supervisor.observe(runtime.runId);
+      if (this.#prerequisites.settlementPending?.(run)) continue;
       if (observed.state === 'stopped' && observed.evidence && this.#prerequisites.verifyWorkspaceAfterStop(run.demandId)) {
         this.classifyStoppedRun(run);
         this.#workflow.confirmStopped(run.id, { processAbsent: true, descendantsAbsent: true, workspaceVerified: true, evidence: observed.evidence });
@@ -107,7 +111,10 @@ export class ExecutionCoordinator {
     const returns = demand.acceptances.filter(item => item.decision === 'returned').length;
     const revisions = this.#store.history(run.demandId).filter(item => item.kind === 'user-command' && (item.data as { command?: { type?: string } }).command?.type === 'revise-plan').length;
     const planning = run.planningStep ? `:planning-${run.planningFlowId}:${run.planningRevision}:${run.planningStep}` : '';
-    const key = `execution:${run.demandId}:${run.stage}:returns-${returns}:revisions-${revisions}:${run.planId ?? 'initial'}:${run.contentId ?? 'work'}${planning}`;
+    // Distinct execution axes/tickets have distinct operations. Input-only
+    // revisions (pause/resume or a blocker clarification) never replenish one.
+    const execution = run.executionStep ? `:flow-${run.executionFlowId}:${run.executionStep}:${run.executionScope}:${run.executionTicketId ?? 'whole'}` : '';
+    const key = `execution:${run.demandId}:${run.stage}:returns-${returns}:revisions-${revisions}:${run.planId ?? 'initial'}:${run.contentId ?? 'work'}${planning}${execution}`;
     this.#store.db.prepare('INSERT INTO host_run_operation_keys VALUES(?,?)').run(run.id, key);
     return key;
   }

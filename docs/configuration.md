@@ -32,7 +32,7 @@ unlimited, approved, a default provider, a working method or verified isolation.
 
 All listed keys are required, except the backward-compatible optional
 `runtime.shell`, `runtime.policyVariant`, and conditional method `skillBundle`
-fields described below. Unknown keys are rejected, including `authorized`,
+and `executionBundle` fields described below. Unknown keys are rejected, including `authorized`,
 `verified`, `executionEnabled`, `apiKey`, arbitrary headers, and authorization
 IDs inside the provider configuration. Current schema version is exactly `1`.
 
@@ -40,23 +40,27 @@ The user’s actual `design-feature` content is **not supplied by this repositor
 Leave `methods.planning` null until the actual source and its explicit
 digest-locked graph are selected. The public downstream closure is supplied in
 `vendor/mattpocock-skills`, pinned to commit
-`b0618bc436ad893b3c5e84e55fba86586d34a404`; no private entry is included. The implementation and review stages may
-use separately and explicitly named candidate methods. A logical method name or
-a passing fixture is not evidence that the actual user method was validated.
+`b0618bc436ad893b3c5e84e55fba86586d34a404`; no private entry is included.
 
-This repository supplies two new, explicitly named candidates:
-[implementation-candidate-v1](../methods/implementation-candidate-v1.md) and
-[review-candidate-v1](../methods/review-candidate-v1.md). They implement the
-documented scope, verification and independent-review conventions as text methods;
-they are not the user's preexisting methods and have not been evaluated with a
-paid model. Select and hash them explicitly if desired, with `dependencies: []`.
-The Host's report adapter supplies the concrete role-specific protocol separately,
-so external methods do not need to guess report fields or native evidence IDs.
+Production implementation and Review both select the public `implement-spec`
+root with `implement-spec-staged-v1`. Implementation projects `tdd` and scoped
+fix work; Review projects `code-review` into fresh independent read-only
+contexts. These share an explicit fourteen-file execution closure, separately
+locked from the unchanged planning `skillBundle`. Importing either selection
+only verifies resources. It does not grant invocation, model, spending, data
+transmission, workspace-write, publication or runtime privileges.
+
+The older [implementation-candidate-v1](../methods/implementation-candidate-v1.md)
+and [review-candidate-v1](../methods/review-candidate-v1.md) text selections remain
+inspectable for compatibility and deterministic fixtures. They cannot substitute
+for the staged production adapter. The product does not concatenate candidate
+text or use static text as a fallback when the selected closure is missing.
 
 ## Exact method sources
 
-Implementation/review text methods use this shape (illustrative paths and hashes
-must be replaced with the actual file selections and hashes):
+Legacy inspectable text methods use this shape (illustrative paths and hashes
+must be replaced with actual file selections and hashes; this does not enable
+staged production execution):
 
 ```json
 {
@@ -75,8 +79,10 @@ must be replaced with the actual file selections and hashes):
   `explicit-text-v1` planning selection can remain inspectable, but the production
   dispatcher blocks it. Legacy synthetic fixtures do not establish production
   compatibility.
-- Implementation and review require explicit logical names, e.g.
-  `implementation-candidate-v1` and `independent-review-candidate-v1`.
+- Production implementation and Review require logical name `implement-spec`,
+  adapter `implement-spec-staged-v1`, and their explicit `executionBundle`. Each
+  stage selects this root; `tdd` and `code-review` are stage projections rather
+  than alternative root methods. Legacy text sources remain inspectable only.
 - Every method declares `dependencies`, including `[]` when none are needed.
   Declare **all** files the method requires, including transitive dependencies.
   The file loader follows no textual links, shell paths, imports, extension files,
@@ -127,6 +133,65 @@ restricted to declared links inside the active skill's pinned closure. Other
 stage bodies, global skills and scripts cannot be loaded through these tools.
 Source and planning artifacts travel as labeled task data, not `AGENTS.md`
 system instructions.
+
+### Staged implementation and Review bundle
+
+Use `bundledImplementationMethod(vendorRoot)` with the explicit absolute path to
+`vendor/mattpocock-skills`, then serialize its output in both
+`methods.implementation` and `methods.review`:
+
+```ts
+const selected = bundledImplementationMethod(absoluteVendorRoot);
+configuration.methods.implementation = selected;
+configuration.methods.review = structuredClone(selected);
+```
+
+This helper constructs references without scanning or reading a directory. Its
+root is exactly `skills/engineering/implement-spec/SKILL.md`, with the pinned
+upstream bytes. `executionBundle` declares fourteen resources: `implement-spec`,
+`tdd`, `code-review`, `codebase-design`, each original `agents/openai.yaml`, TDD
+and codebase-design references, license, and invocation policy. Thirteen files
+are declared dependencies; loading adds a generated `<entry-id>:skill-bundle`
+manifest as the fourteenth dependency. The generated identity is reserved across
+all stages. Shared exact public resources may have the same identity and file
+reference across planning, implementation and Review.
+
+`executionBundle` is not accepted on planning or on a legacy adapter, and
+`skillBundle` remains planning-only. The parser verifies stage, adapter, logical
+root, complete resource graph, every reference identity and pinned digest.
+Changing a resource hash, stage mapping, root or adapter override cannot silently
+select another upstream method. Load failure exposes no partial materials for
+the affected stage. Method snapshots bind the complete execution graph, not just
+the root text; restart uses the frozen snapshot rather than following changed
+settings. The private planning entry stays at its external user-selected path
+and is never copied into the public bundle or exposed to these phases.
+
+At runtime the selected root governs the workflow, while the current substep
+gets only its permitted resource projection through authenticated progressive
+reads. An implementation writer uses TDD evidence for eligible tickets in the
+persisted dependency graph. Once all tickets are done, fresh read-only contexts
+review the entire Spec on two axes: project standards and Spec consistency.
+Every review binds exact content K. Standards findings distinguish a documented
+violation, including its cited basis, from a design smell. Original review
+records are immutable and retain their original content version.
+
+A single implementation context repairs the explicit set of findings and
+related check failures. The following read-only resolution records state the
+outcome and evidence for those exact findings at the new content K. They do not
+silently rewrite original reviews or start an unrestricted review loop. Changes
+to scope, interfaces or testing seams require an explicit product decision and
+revision/confirmation of the affected design. Closing a decision item alone
+does not authorize a design change.
+
+The Execution tab displays persisted ticket progress and eligible frontier,
+whole-Spec axis evidence, current/historical K, scoped repair and focused
+resolutions. Eligibility does not imply that a run is active or authorized;
+missing graph data is shown as unknown. Pauses, prior rounds, failed checks and
+user decisions remain visible through the existing controls and evidence views.
+The adapter's destination override is local results only: no push, PR creation,
+merge, deployment or ready-for-publication declaration is performed. Original
+upstream invocation metadata is preserved, and only explicit adapter-scoped
+invocation is supported; no generic invocation rights are inferred.
 
 To compute a hash without executing the file, Node 24 can be used locally:
 
@@ -416,3 +481,12 @@ The staged production journey uses those public files with a synthetic private
 entry and deterministic transport. An external private entry can be locally
 validated without copying it into the test suite; validation of its bytes is
 not a real-model planning run. CI for the new final commit remains to be checked.
+
+`tests/configuration-execution.test.ts` verifies the actual public execution
+closure in both phase selections, stage/adapter/root/digest rejection, reserved
+manifest identities, stale-file fail-closed behavior and preservation of the
+external private planning entry. `tests/execution-renderer.test.ts` verifies the
+actual renderer's exact-content labeling, dependent-ticket eligibility, separate
+violation/smell presentation, focused resolution, history and explicit decisions.
+These are local contract/UI checks and do not establish real-model quality or
+Windows runtime isolation.

@@ -4,6 +4,8 @@ import { isAbsolute, join, parse, resolve, sep } from 'node:path';
 import type { AgentMaterial } from '../agent/resources.ts';
 import { createBundledPlanningManifest, parsePlanningSkillManifest, planningManifestMaterial, planningBundleDigest, PLANNING_SKILL_ADAPTER, resolvePlanningBundle, PINNED_PLANNING_COMMIT } from '../agent/planning-skills.ts';
 import type { PlanningSkillManifest } from '../agent/planning-skills.ts';
+import { createBundledImplementationManifest, parseImplementationSkillManifest, implementationManifestMaterial, implementationBundleDigest, IMPLEMENTATION_SKILL_ADAPTER, resolveImplementationBundle, PINNED_IMPLEMENTATION_COMMIT, PINNED_IMPLEMENTATION_FILES } from '../agent/implementation-skills.ts';
+import type { ImplementationSkillManifest } from '../agent/implementation-skills.ts';
 import type { Methods, MethodSnapshot, Stage } from '../domain/types.ts';
 import type { ModelGrant } from '../runtime/budget.ts';
 import { RuntimeError } from '../runtime/types.ts';
@@ -36,6 +38,8 @@ export interface MethodSourceConfiguration extends FileReference {
   logicalName: string; version: string; adapter: string; dependencies: FileReference[];
   /** Explicit portable graph; original private entry remains an external file reference. */
   skillBundle?: PlanningSkillManifest;
+  /** Separate public implement-spec closure, shared by implementation and read-only Review. */
+  executionBundle?: ImplementationSkillManifest;
 }
 export interface ModelLimits {
   maxRequests: number; maxTokens: number; maxCostMicros: number;
@@ -75,6 +79,17 @@ export function bundledPlanningMethod(entry: FileReference, vendorRoot: string):
   const skillBundle = createBundledPlanningManifest(checkedEntry);
   return { ...checkedEntry, logicalName: 'design-feature', version: `upstream-${PINNED_PLANNING_COMMIT}`, adapter: PLANNING_SKILL_ADAPTER,
     dependencies: skillBundle.resources.filter(resource => resource.id !== entry.id).map(resource => ({ id: resource.id, path: join(root, ...resource.path.split('/')), sha256: resource.sha256 })), skillBundle };
+}
+
+/** Explicitly select the pinned public root for either implementation or Review; no authorization is granted. */
+export function bundledImplementationMethod(vendorRoot: string): MethodSourceConfiguration {
+  const root = localPath(vendorRoot, 'implementation vendor root');
+  const rootPath = 'skills/engineering/implement-spec/SKILL.md';
+  const pinned = PINNED_IMPLEMENTATION_FILES.find(file => file.path === rootPath)!;
+  const entry = { id: `mattpocock/${rootPath}`, path: join(root, ...rootPath.split('/')), sha256: pinned.sha256 };
+  const executionBundle = createBundledImplementationManifest({ id: entry.id, sha256: entry.sha256 });
+  return { ...entry, logicalName: 'implement-spec', version: `upstream-${PINNED_IMPLEMENTATION_COMMIT}`, adapter: IMPLEMENTATION_SKILL_ADAPTER,
+    dependencies: executionBundle.resources.filter(resource => resource.id !== entry.id).map(resource => ({ id: resource.id, path: join(root, ...resource.path.split('/')), sha256: resource.sha256 })), executionBundle };
 }
 
 function fail(code: string, message: string): never { throw new RuntimeError(code, message); }
@@ -167,7 +182,7 @@ function runtimeConfiguration(value: unknown): RuntimeConfiguration {
   };
 }
 function methodSource(value: unknown, stage: Stage): MethodSourceConfiguration {
-  const o = object(value, ['id', 'path', 'sha256', 'logicalName', 'version', 'adapter', 'dependencies', 'skillBundle'], `methods.${stage}`, ['skillBundle']);
+  const o = object(value, ['id', 'path', 'sha256', 'logicalName', 'version', 'adapter', 'dependencies', 'skillBundle', 'executionBundle'], `methods.${stage}`, ['skillBundle', 'executionBundle']);
   const ref = fileReference({ id: o.id, path: o.path, sha256: o.sha256 }, `methods.${stage}`);
   const logicalName = identifier(o.logicalName, `methods.${stage}.logicalName`);
   if (stage === 'planning' && logicalName !== 'design-feature') fail('PLANNING_METHOD_REQUIRED', 'Planning must point to the supplied design-feature method; candidate text cannot silently replace it.');
@@ -177,13 +192,21 @@ function methodSource(value: unknown, stage: Stage): MethodSourceConfiguration {
   const adapter = identifier(o.adapter, 'method adapter');
   if (Object.hasOwn(o, 'skillBundle') && (stage !== 'planning' || adapter !== PLANNING_SKILL_ADAPTER)) fail('INVALID_CONFIGURATION', 'Only the explicit staged planning adapter accepts a skill bundle.');
   if (adapter === PLANNING_SKILL_ADAPTER && (stage !== 'planning' || !Object.hasOwn(o, 'skillBundle'))) fail('PLANNING_METHOD_REQUIRED', 'Staged planning requires its explicit digest-locked skill graph.');
+  if (Object.hasOwn(o, 'executionBundle') && (stage === 'planning' || adapter !== IMPLEMENTATION_SKILL_ADAPTER || logicalName !== 'implement-spec')) fail('INVALID_CONFIGURATION', 'Only implementation and Review with the explicit implement-spec staged adapter accept an execution bundle.');
+  if (adapter === IMPLEMENTATION_SKILL_ADAPTER && (stage === 'planning' || logicalName !== 'implement-spec' || !Object.hasOwn(o, 'executionBundle'))) fail('IMPLEMENTATION_METHOD_REQUIRED', 'Staged implementation and Review require the implement-spec root and its explicit digest-locked execution graph.');
   const skillBundle = Object.hasOwn(o, 'skillBundle') ? parsePlanningSkillManifest(o.skillBundle) : undefined;
   if (skillBundle) {
     const references = [ref, ...dependencies];
     if (skillBundle.entryId !== ref.id || skillBundle.resources.length !== references.length || skillBundle.resources.some(resource => !references.some(reference => reference.id === resource.id && reference.sha256 === resource.sha256))) fail('INVALID_CONFIGURATION', 'The planning graph must bind every configured method/dependency exactly once by identity and digest.');
     if (references.some(reference => reference.id === `${ref.id}:skill-bundle`)) fail('INVALID_CONFIGURATION', 'The generated planning manifest identity is reserved.');
   }
-  return { ...ref, logicalName, version: string(o.version, 'method version', 80), adapter, dependencies, ...(skillBundle ? { skillBundle } : {}) };
+  const executionBundle = Object.hasOwn(o, 'executionBundle') ? parseImplementationSkillManifest(o.executionBundle) : undefined;
+  if (executionBundle) {
+    const references = [ref, ...dependencies];
+    if (executionBundle.entryId !== ref.id || executionBundle.resources.length !== references.length || executionBundle.resources.some(resource => !references.some(reference => reference.id === resource.id && reference.sha256 === resource.sha256))) fail('INVALID_CONFIGURATION', 'The execution graph must bind every configured method/dependency exactly once by identity and digest.');
+    if (references.some(reference => reference.id === `${ref.id}:skill-bundle`)) fail('INVALID_CONFIGURATION', 'The generated execution manifest identity is reserved.');
+  }
+  return { ...ref, logicalName, version: string(o.version, 'method version', 80), adapter, dependencies, ...(skillBundle ? { skillBundle } : {}), ...(executionBundle ? { executionBundle } : {}) };
 }
 function limits(value: unknown): ModelLimits {
   const o = object(value, ['maxRequests', 'maxTokens', 'maxCostMicros', 'currency', 'expiresAt', 'meteringPolicy'], 'provider.limits');
@@ -225,6 +248,10 @@ export function parseConfiguration(value: unknown): WorkbenchConfiguration {
     materialIdentities.set(ref.id, identity);
   }
   if (parsed.methods.planning?.skillBundle && materialIdentities.has(`${parsed.methods.planning.id}:skill-bundle`)) fail('INVALID_CONFIGURATION', 'No configured stage may reuse the generated planning manifest identity.');
+  for (const stage of ['implementation', 'review'] as const) {
+    const method = parsed.methods[stage];
+    if (method?.executionBundle && materialIdentities.has(`${method.id}:skill-bundle`)) fail('INVALID_CONFIGURATION', 'No configured stage may reuse the generated execution manifest identity.');
+  }
   if (Buffer.byteLength(JSON.stringify(parsed), 'utf8') > MAX_CONFIGURATION_BYTES) fail('CONFIGURATION_TOO_LARGE', 'Configuration exceeds the bounded control frame.');
   return parsed;
 }
@@ -291,6 +318,7 @@ function errorText(error: unknown): string {
 }
 function methodDigest(source: MethodSourceConfiguration): string {
   if (source.skillBundle) return planningBundleDigest(source.id, source.version, source.skillBundle);
+  if (source.executionBundle) return implementationBundleDigest(source.id, source.version, source.executionBundle);
   return sha256(JSON.stringify({ id: source.id, logicalName: source.logicalName, version: source.version, adapter: source.adapter,
     files: [{ id: source.id, sha256: source.sha256 }, ...source.dependencies.map(d => ({ id: d.id, sha256: d.sha256 })).sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))] }));
 }
@@ -301,8 +329,8 @@ export function loadMethods(configuration: WorkbenchConfiguration): LoadedMethod
   let totalBytes = 0;
   for (const stage of STAGES) {
     const source = config.methods[stage];
-    const summary: MethodConfigurationSummary = { stage, logicalName: source?.logicalName ?? (stage === 'planning' ? 'design-feature' : stage), status: 'missing', source: source ? { id: source.id, path: source.path, sha256: source.sha256 } : null, snapshot: null, dependencyCount: source?.dependencies.length ?? 0, blockers: [] };
-    if (!source) summary.blockers.push(stage === 'planning' ? 'The actual user-supplied design-feature method and its explicitly declared dependencies are missing.' : `An explicitly named ${stage} method is missing.`);
+    const summary: MethodConfigurationSummary = { stage, logicalName: source?.logicalName ?? (stage === 'planning' ? 'design-feature' : 'implement-spec'), status: 'missing', source: source ? { id: source.id, path: source.path, sha256: source.sha256 } : null, snapshot: null, dependencyCount: source?.dependencies.length ?? 0, blockers: [] };
+    if (!source) summary.blockers.push(stage === 'planning' ? 'The actual user-supplied design-feature method and its explicitly declared dependencies are missing.' : `The explicit implement-spec ${stage} method and its digest-locked execution bundle are missing.`);
     else {
       try {
         const materials: AgentMaterial[] = [];
@@ -317,14 +345,15 @@ export function loadMethods(configuration: WorkbenchConfiguration): LoadedMethod
           if (sha256(content!) !== reference.sha256) fail('METHOD_ENCODING_INVALID', 'Method text must round-trip as exact UTF-8 without a byte-order mark.');
           materials.push({ id: reference.id, kind: 'method', sha256: reference.sha256, content: content! });
         }
-        const manifest = source.skillBundle ? planningManifestMaterial(source.id, source.skillBundle) : undefined;
+        const manifest = source.skillBundle ? planningManifestMaterial(source.id, source.skillBundle) : source.executionBundle ? implementationManifestMaterial(source.id, source.executionBundle) : undefined;
         if (manifest) {
           totalBytes += Buffer.byteLength(manifest.content, 'utf8');
           if (totalBytes > MAX_METHOD_TOTAL_BYTES) fail('CONFIGURATION_TOO_LARGE', 'The three stages exceed the total method material bound.');
           materials.push(manifest);
         }
         const snapshot: MethodSnapshot = { id: source.id, version: source.version, digest: methodDigest(source), adapter: source.adapter, dependencies: [...source.dependencies.map(d => `${d.id}@${d.sha256}`), ...(manifest ? [`${manifest.id}@${manifest.sha256}`] : [])].sort() };
-        if (manifest) resolvePlanningBundle(snapshot, materials);
+        if (source.skillBundle) resolvePlanningBundle(snapshot, materials);
+        if (source.executionBundle) resolveImplementationBundle(snapshot, materials);
         result.methods[stage] = snapshot; result.materials[stage] = materials;
         summary.status = 'configured'; summary.snapshot = snapshot;
       } catch (error) { summary.status = 'invalid'; summary.blockers.push(errorText(error)); }

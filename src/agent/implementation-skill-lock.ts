@@ -1,0 +1,89 @@
+/** Separate execution closure. The original planning lock remains unchanged. */
+export const PINNED_IMPLEMENTATION_REPOSITORY = "https://github.com/mattpocock/skills";
+export const PINNED_IMPLEMENTATION_COMMIT = "b0618bc436ad893b3c5e84e55fba86586d34a404";
+export const PINNED_IMPLEMENTATION_FILES = [
+  {
+    "path": ".agents/invocation.md",
+    "sha256": "a8ee3ff9cab8fe247c5de4312320117c001df548960970a2769856349ec09402",
+    "gitBlob": "4877b32cd55bf708be61d90b95b720003f0ffdb5",
+    "bytes": 3850
+  },
+  {
+    "path": "LICENSE",
+    "sha256": "0e7ac423bf2c6e223b7c5b156f8cf72da49d748e56a1641402c31f22ad07dbb5",
+    "gitBlob": "f1dd2c09108dde1a5f56097cee8461b3ea834499",
+    "bytes": 1068
+  },
+  {
+    "path": "skills/engineering/code-review/SKILL.md",
+    "sha256": "09eb147f793e4647949edd32dbad278f0554dfb56e0d46b699cd4c2c55bf0357",
+    "gitBlob": "373a4f26e6cfa3617778397945bb069d9cb184bc",
+    "bytes": 6670
+  },
+  {
+    "path": "skills/engineering/code-review/agents/openai.yaml",
+    "sha256": "8229ca854e11dc8e6aef2131ee03f31fb1561cf905fab9ccc325180cf3331352",
+    "gitBlob": "9076774ba327f49068db9273feceda03bfe940fa",
+    "bytes": 100
+  },
+  {
+    "path": "skills/engineering/codebase-design/DEEPENING.md",
+    "sha256": "f3dd099ce99289bd213914d8ee3e2429b78309c3957ca4583f7659551b1d53c1",
+    "gitBlob": "cd94075cfd754d147555c5d747a16431ed4c7dd8",
+    "bytes": 2553
+  },
+  {
+    "path": "skills/engineering/codebase-design/DESIGN-IT-TWICE.md",
+    "sha256": "52b52e75655a27aea59c6966b410bac82448968ad46ef1ebb9f07c274e3ae010",
+    "gitBlob": "d0990138c35c800bd821289a73115e52680c1620",
+    "bytes": 2665
+  },
+  {
+    "path": "skills/engineering/codebase-design/SKILL.md",
+    "sha256": "2c20617f87ec8af6a434859f381b2f061a69b530444e74eb39e78bb016a6d1e2",
+    "gitBlob": "3f63c8146dd2604b419c929e9876b90c30d410e9",
+    "bytes": 6446
+  },
+  {
+    "path": "skills/engineering/codebase-design/agents/openai.yaml",
+    "sha256": "edebc9e4fcfe102114012575eaa9600b9b5fd08c311664f389c36e7bc717740f",
+    "gitBlob": "3180715edb37f6e96bec42f92f00169faa8886ef",
+    "bytes": 102
+  },
+  {
+    "path": "skills/engineering/implement-spec/SKILL.md",
+    "sha256": "7a22dd2e60b8fcece478ced9d2533582adf3520d695acd3ab715341535c9e56d",
+    "gitBlob": "183923797ab58f1b3ef09e03bc1f1f203c309f37",
+    "bytes": 2780
+  },
+  {
+    "path": "skills/engineering/implement-spec/agents/openai.yaml",
+    "sha256": "fd41efb42c60c96320d6531be7e4bf15cbf5518cd652d57dff27ccffa46988e9",
+    "gitBlob": "f5e91af21e38eb1a167ea5aa93dfc7da3c4637b4",
+    "bytes": 168
+  },
+  {
+    "path": "skills/engineering/tdd/SKILL.md",
+    "sha256": "5505d25bbaa8fc14a79e4d20163936958992a2995b7f1dd1d6197edc9ed722e0",
+    "gitBlob": "01eadaa34e7c9a63a67d6dc3cce1cc81b0e49985",
+    "bytes": 3629
+  },
+  {
+    "path": "skills/engineering/tdd/agents/openai.yaml",
+    "sha256": "ea6f01cf1b8c06a4b0f5b649d74b1b8ce8685e72af1b38d70d877693e092af0b",
+    "gitBlob": "651b838a7663e027b1b8884491e867f26bb9a021",
+    "bytes": 87
+  },
+  {
+    "path": "skills/engineering/tdd/mocking.md",
+    "sha256": "3ceb807fdf4a47d6a93d4d9a891e5ba6d362a6247bd08adc451feebfc17361ef",
+    "gitBlob": "71cbfee674d93244ce81d1830b930ca9a69200bd",
+    "bytes": 1481
+  },
+  {
+    "path": "skills/engineering/tdd/tests.md",
+    "sha256": "859f9e592c188fda4fc7277dd180e4ce9c7a2e13f6efe1f6f29eccc9d28c106a",
+    "gitBlob": "7ab86479f925a1f9e8ba680af33cb3b12e015381",
+    "bytes": 2214
+  }
+] as const;

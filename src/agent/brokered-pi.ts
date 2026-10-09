@@ -9,6 +9,7 @@ import type { PiModelChannel,ModelPurpose } from '../runtime/pi-channel.ts';
 import { RuntimeError } from '../runtime/types.ts';
 import type { RuntimeRole } from '../runtime/types.ts';
 import type { PlanningSkillSession } from './planning-skills.ts';
+import type { ImplementationSkillSession } from './implementation-skills.ts';
 
 export interface BrokeredPiOptions {
   cwd:string;agentDir:string;role:RuntimeRole;materials:readonly AgentMaterial[];
@@ -17,6 +18,7 @@ export interface BrokeredPiOptions {
   compaction:{enabled:boolean;reserveTokens:number;keepRecentTokens:number};
   retry:{enabled:boolean;maxRetries:number;baseDelayMs:number};
   planningSkills?:PlanningSkillSession;
+  implementationSkills?:ImplementationSkillSession;
 }
 /** Production-oriented SDK adapter, usable only inside an externally isolated Worker.
  * Its only model transport is the private Host channel. It holds no provider credentials
@@ -29,7 +31,9 @@ export async function createBrokeredPiSession(options:BrokeredPiOptions):Promise
     throw new RuntimeError('RETRY_LIMIT','At most two bounded automatic retries are allowed');
   if(['review','boundary-review'].includes(options.role)&&options.sessionManager.buildSessionContext().messages.length)
     throw new RuntimeError('REVIEW_HISTORY_DENIED','Review requires independent empty native history');
-  const resources=explicitResourceLoader(options.role,options.materials,{planningSkills:options.planningSkills});
+  if(options.implementationSkills&&options.sessionManager.buildSessionContext().messages.length)
+    throw new RuntimeError('EXECUTION_HISTORY_DENIED','Each execution stage requires a fresh empty native context');
+  const resources=explicitResourceLoader(options.role,options.materials,{planningSkills:options.planningSkills,implementationSkills:options.implementationSkills});
   const names=options.tools.map(x=>x.name);
   if(new Set(names).size!==names.length||names.some(x=>!/^controlled_[a-z0-9_]+$/.test(x)))
     throw new RuntimeError('TOOL_SCOPE_DENIED','Only explicitly supplied controlled_* bridge tools may be activated');

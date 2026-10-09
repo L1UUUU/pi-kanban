@@ -16,9 +16,10 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
-    # The unchanged Git-heavy suite took 12.5 minutes on one Windows runner;
-    # a later runner was 1.63x slower. Keep a finite margin for the full suite.
-    timeout-minutes: 25
+    # The 375-test Git-heavy suite took 20.4 minutes on Windows in run 24.
+    # The staged execution journeys add real Git/SDK cases; keep a finite margin
+    # for the expanded suite. This does not change any product execution budget.
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

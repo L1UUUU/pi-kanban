@@ -1,5 +1,5 @@
 import type { KnowledgeAction, KnowledgeLifecycleView } from '../../host/knowledge-lifecycle.ts';
-import type { ArtifactRef, Finding, Methods, PlanningFlow, Stage } from '../../domain/types.ts';
+import type { ArtifactRef, ExecutionFlow, Finding, Methods, PlanningFlow, Stage } from '../../domain/types.ts';
 import type { ConfigurationSummary } from '../../host/configuration.ts';
 export type { ConfigurationSummary, ProviderConfiguration } from '../../host/configuration.ts';
 /** Display-only Host snapshot. This is not an authorization boundary or a second workflow engine. */
@@ -36,6 +36,7 @@ export interface Demand {
   control: Control;
   plan?: Plan;
   planningFlow?: PlanningFlow;
+  executionFlow?: ExecutionFlow;
   result?: Result;
   blockers: string[];
   /** Persisted workflow blockers, excluding runtime diagnostic prerequisites. */

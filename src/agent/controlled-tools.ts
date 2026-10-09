@@ -5,16 +5,17 @@ import { resolve,relative,isAbsolute,dirname,join } from 'node:path';
 import type { RuntimeRole } from '../runtime/types.ts';
 import { RuntimeError } from '../runtime/types.ts';
 import { controlledReportParameters } from './report-contract.ts';
-import type { PlanningWorkStep } from '../domain/types.ts';
+import type { PlanningWorkStep,ExecutionWorkStep } from '../domain/types.ts';
 export interface NativePinnedWorkspace { version:1;kind:'native-pinned-workspace';path:string;generation:string }
 /** Defense-in-depth tool paths; the external AppContainer/Job is the security boundary. */
 export function controlledTools(options:{workspace:string;scratch:string;role:RuntimeRole;maxFileBytes:number;commandTimeoutMs:number;maxOutputBytes:number;
-  generation?:string;workspaceCapability?:NativePinnedWorkspace;planningStep?:PlanningWorkStep;
+  generation?:string;workspaceCapability?:NativePinnedWorkspace;planningStep?:PlanningWorkStep;executionStep?:ExecutionWorkStep;
   report:(body:Record<string,unknown>)=>Promise<unknown>;stopRequired:(reason:string)=>void;
   write?:(toolCallId:string,path:string,content:string,perform:()=>void)=>Promise<void>;
   delete?:(toolCallId:string,path:string,perform:()=>void)=>Promise<void>;
   check?:(toolCallId:string,args:string[],signal:AbortSignal|undefined)=>Promise<{output:string;exitCode:number|null;[key:string]:unknown}>}):ToolDefinition[]{
   if('shell' in options&&options.shell!=null)throw new RuntimeError('SHELL_NOT_SUPPORTED','The Node-only product cannot register a shell tool');
+  if(options.executionStep&&(options.planningStep||options.role!==(['ticket-implementation','ticket-fix'].includes(options.executionStep)?'implementation':'review')))throw new RuntimeError('EXECUTION_TOOL_ROLE_DENIED','Execution tools must match one active writer or read-only review stage');
   // The private Host may provide this only after native exact-path pinning and
   // launch proof. It is an explicit alternative contract, never an error fallback.
   const capability=options.workspaceCapability;
@@ -102,7 +103,7 @@ export function controlledTools(options:{workspace:string;scratch:string;role:Ru
       }
       const found={matches,truncated,skippedFiles};return result(JSON.stringify(found),found);
     }},
-    {name:'controlled_report',label:'Report evidence to Host',description:'Submit one role-specific report using the complete schema and Host report adapter instructions. Exact P/C/check/finding IDs and artifact references come from approved materials or visible tool receipts. Omit Host-bound identity fields. Reports never approve work, accept results, or prove their own authenticity.',parameters:controlledReportParameters(options.role,options.planningStep),async execute(_id,params){return result(JSON.stringify(await options.report(fields(fields(params).report))));}},
+    {name:'controlled_report',label:'Report evidence to Host',description:'Submit one role-specific report using the complete schema and Host report adapter instructions. Exact P/C/check/finding IDs and artifact references come from approved materials or visible tool receipts. Omit Host-bound identity fields. Reports never approve work, accept results, or prove their own authenticity.',parameters:controlledReportParameters(options.role,options.planningStep,options.executionStep),async execute(_id,params){return result(JSON.stringify(await options.report(fields(fields(params).report))));}},
     {name:'controlled_node',label:'Run a bounded Node check',description:'Execute source-preserving Node arguments inside this externally isolated Job, with private scratch. No shell or inherited user environment. On the pinned Windows runtime, use --test --test-isolation=none for in-process Node tests; child-process stdio/IPC pipe creation is unsupported. Do not silently change required check semantics; report blocked if a check requires unsupported process isolation or tools.',parameters:Type.Object({args:Type.Array(Type.String(),{maxItems:64})}),
       async execute(toolCallId,params,signal){
         const args=fields(params).args;if(!Array.isArray(args)||!args.length||args.length>64||args.some(x=>typeof x!=='string'||x.includes('\0')||x.length>8192)||args.join('').length>32768)throw new RuntimeError('TOOL_INPUT','Bounded string arguments required');

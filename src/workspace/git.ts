@@ -112,6 +112,19 @@ export class ControlledGit {
   status(cwd: string): string[] { return this.run(cwd,['status','--ignore-submodules=all','--porcelain=v1','-z','--untracked-files=all']).toString().split('\0').filter(Boolean); }
   staged(cwd: string): string[] { return this.run(cwd,['diff','--ignore-submodules=all','--cached','--name-only','-z']).toString().split('\0').filter(Boolean); }
   tracked(cwd: string): string[] { return this.run(cwd,['ls-files','-z']).toString().split('\0').filter(Boolean); }
+  /** Logical tracked modes for filesystems without POSIX executable bits. An
+   * unresolved or non-ordinary index is never interpreted as ordinary source. */
+  indexFiles(cwd: string): { path: string; mode: '100644' | '100755'; object: string }[] {
+    const records = this.run(cwd,['ls-files','--stage','-z']).toString().split('\0').filter(Boolean), seen = new Set<string>();
+    return records.map(record => {
+      const split = record.indexOf('\t');
+      insist(split > 0, 'INDEX_INVALID', 'Malformed index metadata cannot establish source modes.');
+      const [mode,object,stage] = record.slice(0,split).split(' '), path = record.slice(split+1); sourcePath(path);
+      insist(stage === '0' && !seen.has(path), 'INDEX_CONFLICT', 'Unresolved index entries cannot establish a frozen source snapshot.');
+      insist(mode === '100644' || mode === '100755', 'UNSUPPORTED_INDEX', 'Only ordinary stage-zero index files support frozen source modes.');
+      this.validateOid(object); seen.add(path); return {path,mode,object};
+    });
+  }
   guardPrivate(cwd: string): void {
     const files = [...this.tracked(cwd), ...this.staged(cwd)];
     insist(!files.some(p => /^\.local(?:\/|$)/i.test(p)), 'PRIVATE_TRACKED', 'Private application materials are tracked or staged. Preserve them and resolve this explicitly before continuing.');

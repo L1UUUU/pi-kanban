@@ -64,17 +64,58 @@ export interface PlanningIndependentVerification {
   kind: 'facts' | 'design-review'; runId: string; contextId: string; flowId: string; flowRevision: number;
   inputDigest: string; evidenceDigest: string; actualRunObserved: boolean; isolatedInputsVerified: boolean; readOnlyVerified: boolean;
 }
+/** Persisted implement-spec protocol. Both implementation and review select the
+ * adapter; legacy report shapes cannot advance this flow. */
+export type ExecutionScope = 'ticket' | 'whole-spec';
+export type ExecutionAxis = 'standards' | 'spec';
+export type ExecutionWorkStep = 'ticket-implementation' | 'ticket-fix' | 'review-standards' | 'review-spec' | 'resolution-standards' | 'resolution-spec';
+export type ExecutionStep = ExecutionWorkStep | 'complete';
+export interface ExecutionBinding { flowId: string; flowRevision: number; inputDigest: string; executionStep: ExecutionWorkStep; scope: ExecutionScope; ticketId?: string; contentId?: string }
+export type ExecutionReportBinding = ExecutionBinding;
+export interface ExecutionFindingInput extends FindingInput { category: 'documented-violation' | 'smell' | 'spec-violation'; reference: ArtifactRef; clause?: string; requiresDesignDecision: boolean }
+export interface ExecutionTddEvidence { mode: 'red-green' | 'preserve-behavior'; rationale?: string; testingSeams: string[]; red: ArtifactRef[]; green: ArtifactRef[] }
+export interface ExecutionContentRecord { contentId: string; scope: ExecutionScope; ticketId?: string; runId: string; inputDigest: string; flowRevision: number; tdd: ExecutionTddEvidence; repairScopeId?: string }
+export interface ExecutionTicketState { ticketId: string; status: 'pending' | 'implementing' | 'reviewing' | 'repairing' | 'done'; contentId?: string; completedContentId?: string; reviewIds: string[]; resolutionIds: string[] }
+export interface ExecutionReviewInput { id: string; axis: ExecutionAxis; contentId: string; evidence: ArtifactRef; knowledgeReviewed: boolean; findings: ExecutionFindingInput[] }
+export interface ExecutionReviewRecord extends ExecutionReviewInput { sequence: number; scope: ExecutionScope; ticketId?: string; runId: string; contextId: string; inputDigest: string; flowRevision: number }
+export interface ExecutionDisposition { findingId: string; outcome: 'fixed' | 'false-positive' | 'not-applicable' | 'unresolved'; rationale: string; evidence: ArtifactRef }
+export interface ExecutionResolutionInput { id: string; axis: ExecutionAxis; contentId: string; repairScopeId: string; evidence: ArtifactRef; dispositions: ExecutionDisposition[] }
+export interface ExecutionResolutionRecord extends ExecutionResolutionInput { sequence: number; scope: ExecutionScope; ticketId?: string; runId: string; contextId: string; inputDigest: string; flowRevision: number }
+export interface ExecutionRepairScope { id: string; scope: ExecutionScope; ticketId?: string; baseContentId: string; reviewIds: string[]; findingIds: string[]; checkIds: string[]; reason: string }
+export interface ExecutionUserDecision { id: string; kind: 'blocker-resolution' | 'finding-decision'; reason: string; userId: string; createdAt: string; scope: ExecutionScope; ticketId?: string; findingId?: string; approvedInputDigest: string; permitsScopeChange: false }
+export type ExecutionArchive = Omit<ExecutionFlow, 'history'>;
+export interface ExecutionFlow {
+  id: string; revision: number; planId: string; planningFlowId: string; approvedInputDigest: string;
+  userDecisions?: ExecutionUserDecision[];
+  returnInstruction?: { resultId: string; contentId: string; code: ArtifactRef; knowledge: ArtifactRef[]; reason: string; userId: string; createdAt: string };
+  baseCommit?: string; step: ExecutionStep; scope: ExecutionScope; ticketId?: string;
+  tickets: ExecutionTicketState[]; implementations: ExecutionContentRecord[]; checkInputIds: string[]; reviews: ExecutionReviewRecord[]; resolutions: ExecutionResolutionRecord[];
+  repairScope?: ExecutionRepairScope; repairHistory: ExecutionRepairScope[]; history: ExecutionArchive[];
+}
+export type ExecutionWorkerReport = ExecutionBinding & (
+  | { type: 'execution-content'; content: ContentInput; tdd: ExecutionTddEvidence; repairScopeId?: string }
+  | { type: 'execution-review'; review: ExecutionReviewInput }
+  | { type: 'execution-resolution'; resolution: ExecutionResolutionInput }
+);
+export interface ExecutionStageVerification {
+  runId: string; executionStep: ExecutionWorkStep; flowId: string; flowRevision: number; inputDigest: string; baseCommit: string;
+  sourceVerified: boolean; requiredSkillVerified: boolean; actualRunObserved: boolean; actualStopVerified: boolean; tddVerified?: boolean;
+}
+export interface ExecutionIndependentVerification {
+  axis: ExecutionAxis; runId: string; contextId: string; flowId: string; flowRevision: number; contentId: string;
+  inputDigest: string; evidenceDigest: string; actualRunObserved: boolean; isolatedInputsVerified: boolean; readOnlyVerified: boolean;
+}
 export interface ContentInput { id: string; planId: string; code: ArtifactRef; knowledge: ArtifactRef[]; maintenance: 'complete' | 'not-needed'; deliveryNotes: string }
 export interface ContentSnapshot extends ContentInput { createdByRun: string; cycle: number }
 export interface CheckEvidence { id: string; contentId: string; requirementId: string; status: 'passed' | 'failed' | 'unavailable'; evidence: ArtifactRef; environment: string }
 export interface FindingInput { id: string; severity: 'blocking' | 'suggestion' | 'decision'; location: string; basis: string; impact: string; verification: string }
 export interface Finding extends FindingInput { contentId: string; reviewRunId: string; status: 'open' | 'disputed' | 'closed'; dispute?: ArtifactRef; resolution?: ArtifactRef }
 export interface ReviewRecord { id: string; contentId: string; runId: string; contextId: string; evidence: ArtifactRef; knowledgeReviewed: boolean; findings: string[] }
-export interface DeliveryResult { id: string; demandId: string; P: string; K: ArtifactRef; N: ArtifactRef[]; E: CheckEvidence[]; review: ReviewRecord; findingClosures: Finding[]; notes: string; contentId: string; createdAt: string }
+export interface DeliveryResult { execution?: ExecutionArchive; id: string; demandId: string; P: string; K: ArtifactRef; N: ArtifactRef[]; E: CheckEvidence[]; review: ReviewRecord; findingClosures: Finding[]; notes: string; contentId: string; createdAt: string }
 export interface Acceptance { resultId: string; decision: 'accepted' | 'returned'; userId: string; reason?: string; createdAt: string }
 export interface Grant { planId: string; userId: string; localCommit: boolean; createdAt: string }
 export interface DemandMessage { id: string; text: string; kind: 'question' | 'information' | 'change-request'; state: 'saved' | 'delivered' | 'applied'; runId?: string }
-export interface Demand { id: string; projectId: string; title: string; description: string; revision: number; control: Control; phase: Phase; planningStarted: boolean; planningFlow?: PlanningFlow; methodSnapshot: Methods; plans: PlanRevision[]; activePlanId?: string; confirmedPlanId?: string; grant?: Grant; contents: ContentSnapshot[]; activeContentId?: string; checks: CheckEvidence[]; reviews: ReviewRecord[]; findings: Finding[]; results: DeliveryResult[]; activeResultId?: string; acceptances: Acceptance[]; cycle: number; blockedReasons: string[]; invalidatedContentIds: string[]; messages: DemandMessage[]; createdAt: string }
+export interface Demand { id: string; projectId: string; title: string; description: string; revision: number; control: Control; phase: Phase; planningStarted: boolean; planningFlow?: PlanningFlow; executionFlow?: ExecutionFlow; methodSnapshot: Methods; plans: PlanRevision[]; activePlanId?: string; confirmedPlanId?: string; grant?: Grant; contents: ContentSnapshot[]; activeContentId?: string; checks: CheckEvidence[]; reviews: ReviewRecord[]; findings: Finding[]; results: DeliveryResult[]; activeResultId?: string; acceptances: Acceptance[]; cycle: number; blockedReasons: string[]; invalidatedContentIds: string[]; messages: DemandMessage[]; createdAt: string }
 export interface UserContext { readonly kind: 'trusted-user'; readonly userId: string }
 export interface WorkerContext { readonly kind: 'worker'; readonly runId: string }
 export interface CommandBase { requestId: string; demandId: string; expectedRevision?: number; originalText?: string }
@@ -92,7 +133,7 @@ export type UserCommand = CommandBase & (
   | { type: 'decide-finding'; findingId: string; reason: string }
   | PlanningUserCommand
 );
-export interface ReportBase { requestId: string; demandId: string; runId: string; generation: number }
+export interface ReportBase extends Partial<Omit<ExecutionBinding, 'scope'>> { scope?: ExecutionScope | 'requirements' | 'design'; requestId: string; demandId: string; runId: string; generation: number }
 export type WorkerReport = ReportBase & (
   | { type: 'plan-draft'; plan: PlanInput }
   | { type: 'plan-ready'; planId: string; boundaryReview: BoundaryReview }
@@ -105,6 +146,7 @@ export type WorkerReport = ReportBase & (
   | { type: 'message-delivered' | 'message-applied'; messageId: string }
   | { type: 'runtime-ended' }
   | PlanningWorkerReport
+  | ExecutionWorkerReport
 );
 /** These attestations must come from trusted Host adapters, never report payloads.
  * They record externally verified facts, not proofs supplied by an Agent. */
@@ -113,9 +155,9 @@ export interface BoundaryReviewVerification {
   evidenceDigest: string; actualReviewObserved: boolean; isolatedInputsVerified: boolean;
 }
 export interface PlanningStageVerification { runId: string; planningStep: PlanningWorkStep; flowId: string; flowRevision: number; inputDigest: string; sourceVerified: boolean; requiredSkillVerified: boolean; actualRunObserved: boolean; actualStopVerified: boolean }
-export interface ReportVerification { artifactsVerified?: boolean; contentStable?: boolean; reviewInputsVerified?: boolean; boundaryReview?: BoundaryReviewVerification; planningIndependent?: PlanningIndependentVerification; planningStage?: PlanningStageVerification }
+export interface ReportVerification { artifactsVerified?: boolean; contentStable?: boolean; reviewInputsVerified?: boolean; boundaryReview?: BoundaryReviewVerification; planningIndependent?: PlanningIndependentVerification; planningStage?: PlanningStageVerification; executionStage?: ExecutionStageVerification; executionIndependent?: ExecutionIndependentVerification }
 export interface Receipt { id: string; requestId: string; demandId: string; revision: number; status: 'applied' | 'noop' | 'historical'; outcome: string; createdAt: string }
-export interface RunAttempt { id: string; demandId: string; stage: Stage; planningStep?: PlanningWorkStep; planningFlowId?: string; planningRevision?: number; generation: number; contextId: string; planId?: string; contentId?: string; cycle: number; status: 'starting' | 'running' | 'stopping' | 'unknown' | 'stopped'; writer: boolean; highResource: boolean; method: MethodSnapshot; contextSources: string[]; processIdentity?: string; stopReason?: string; createdAt: string }
+export interface RunAttempt { id: string; demandId: string; stage: Stage; planningStep?: PlanningWorkStep; planningFlowId?: string; planningRevision?: number; executionStep?: ExecutionWorkStep; executionFlowId?: string; executionRevision?: number; executionScope?: ExecutionScope; executionTicketId?: string; generation: number; contextId: string; planId?: string; contentId?: string; cycle: number; status: 'starting' | 'running' | 'stopping' | 'unknown' | 'stopped'; writer: boolean; highResource: boolean; method: MethodSnapshot; contextSources: string[]; processIdentity?: string; stopReason?: string; createdAt: string }
 export interface DispatchConditions { profileVerified: boolean; budgetAvailable: boolean; workspaceVerified: boolean; demandId?: string; highResource?: boolean }
 export interface StopProof { processAbsent: boolean; descendantsAbsent: boolean; workspaceVerified: boolean; evidence: string }
 export interface RecoveryProof extends StopProof { profileVerified: boolean; budgetAvailable: boolean }

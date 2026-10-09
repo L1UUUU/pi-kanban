@@ -3,6 +3,8 @@ import { createRoot } from 'react-dom/client';
 import { App } from './App.tsx';
 import { syntheticPlanningFlow } from './planning-preview.ts';
 import { PLANNING_STEPS } from './planning-model.ts';
+import { applySyntheticExecution } from './execution-preview.ts';
+import { EXECUTION_STEP_LABELS } from './execution-model.ts';
 import type { PlanningStep } from '../../domain/types.ts';
 import type { ConfigurationSummary, ViewState, WorkbenchBridge } from './types.ts';
 import './styles.css';
@@ -86,6 +88,12 @@ if (params.has('planning')) {
     target.phase = 'awaiting-authorization';
     target.plan = { id: 'synthetic-staged-plan', scope: target.planningFlow.understanding!.scope, ready: true, confirmed: true, spec: target.planningFlow.spec!.evidence, tickets: { id: 'synthetic-ticket-index', digest: 'f'.repeat(64), location: 'synthetic-only://ticket-index' } };
   }
+}
+if (params.has('execution')) {
+  const selected = params.get('execution')!;
+  const step = Object.hasOwn(EXECUTION_STEP_LABELS, selected) ? selected as keyof typeof EXECUTION_STEP_LABELS : 'ticket-implementation';
+  applySyntheticExecution(state.demands[0]!, step, params.get('executionState'));
+  if (params.get('executionState') === 'offline') state.runtime.connection = 'disconnected';
 }
 
 if (params.has('decisions')) {

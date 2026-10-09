@@ -18,6 +18,9 @@ export function planMaterial(plan: PlanInput): AgentMaterial {
 }
 export interface SourceSnapshot {
   schemaVersion: 1; demandId: string; head: string | null;
+  /** Windows source modes are logical Git index modes. Bind the complete exact
+   * stage-zero index identity so repeated snapshots also detect index drift. */
+  indexDigest?: string;
   changes: string[];
   files: { path: string; sha256: string; bytes: number; executable: boolean }[];
 }
@@ -87,6 +90,9 @@ export class ProductionEvidence {
     requireFact(binding, 'WORKSPACE_MISSING', 'Prepare the dedicated demand worktree first.');
     const root = canonicalDirectory(binding.worktreePath);
     const inspection = workspace.inspectContent({ demandId, expectedCommit: binding.head });
+    const indexFiles = process.platform === 'win32' ? workspace.git.indexFiles(root) : undefined;
+    const indexModes = new Map(indexFiles?.map(file => [file.path.toLowerCase(), file.mode]));
+    requireFact(!indexFiles || indexModes.size === indexFiles.length, 'INDEX_AMBIGUOUS_PATH', 'Case-colliding index paths cannot establish Windows source modes.');
     const files: SourceSnapshot['files'] = []; let bytes = 0; let entries = 0;
     const walk = (folder: string, prefix: string): void => {
       for (const name of readdirSync(folder).sort()) {
@@ -104,11 +110,11 @@ export class ProductionEvidence {
           requireFact(stat.isFile() && stat.nlink === 1, 'SOURCE_UNSAFE', 'Source must contain ordinary non-linked files only.');
           const body = readRegular(file, 1024 * 1024); bytes += body.length;
           requireFact(bytes <= 32 * 1024 * 1024, 'SOURCE_TOO_LARGE', 'Source data exceeds the 32 MiB run scope.');
-          files.push({ path: relative, sha256: hash(body), bytes: body.length, executable: process.platform !== 'win32' && (stat.mode & 0o111) !== 0 });
+          files.push({ path: relative, sha256: hash(body), bytes: body.length, executable: indexFiles ? indexModes.get(relative.toLowerCase()) === '100755' : (stat.mode & 0o111) !== 0 });
         }
       }
     };
-    walk(root, ''); return { schemaVersion: 1, demandId, head: inspection.head, changes: inspection.changes, files };
+    walk(root, ''); return { schemaVersion: 1, demandId, head: inspection.head, ...(indexFiles ? { indexDigest: hash(canonicalJson(indexFiles)) } : {}), changes: inspection.changes, files };
   }
   sourceMaterial(demandId: string): AgentMaterial {
     const content = canonicalJson(this.source(demandId)); return { id: `source-scope:${demandId}`, kind: 'source', sha256: hash(content), content };

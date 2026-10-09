@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { applyExecutionReport, assertExecutionBinding, ensureExecutionFlow, executionArtifactRefs, executionResultEvidence, isStagedExecution, nextExecutionStep, recordExecutionDecision, reopenExecution, requireExecutionMethods, STAGED_EXECUTION_ADAPTER } from './execution.ts';
 import { applyPlanningCommand, applyPlanningMessage, applyPlanningReport, ensurePlanningFlow, isStagedPlanning, nextPlanningStep, planningArtifactRefs, resetPlanning, STAGED_PLANNING_ADAPTER } from './planning.ts';
 import { DomainError, WorkbenchStore, canonical, digest, invariant } from './store.ts';
 import type { Acceptance, ArtifactRef, Demand, DispatchConditions, Methods, MethodSnapshot, PlanRevision, Project, Receipt, RecoveryProof, ReportVerification, RunAttempt, Stage, StopProof, UserCommand, UserContext, WorkerContext, WorkerReport } from './types.ts';
@@ -85,6 +86,7 @@ export class WorkflowService {
           const designChanged=!!command.confirmDesign && demand.confirmedPlanId!==command.planId;
           const authorizedPlan = this.currentPlan(demand,command.planId);
           if (demand.planningFlow) invariant(authorizedPlan.ready && demand.planningFlow.step === 'complete' && demand.confirmedPlanId === authorizedPlan.id && authorizedPlan.designBinding?.finalConfirmationDigest === demand.planningFlow.finalDesignConfirmation?.digest, 'STAGED_CONFIRMATION_REQUIRED', 'Finish separately confirmed staged planning before granting implementation authority.');
+          if (isStagedExecution(demand)) requireExecutionMethods(demand);
           if (command.confirmDesign) demand.confirmedPlanId=command.planId;
           if (!designChanged && demand.grant?.planId===command.planId && (!command.localCommit || demand.grant.localCommit)) return ['noop','Implementation authority already exists.'];
           demand.grant={planId:command.planId,userId:user.userId,localCommit:command.localCommit ?? demand.grant?.localCommit ?? false,createdAt:now()}; break;
@@ -93,7 +95,7 @@ export class WorkflowService {
           const control = command.type==='pause'?'paused':command.type==='cancel'?'cancelled':'exited';
           if(demand.control===control) return ['noop','Control already recorded.'];
           invariant(demand.control!=='cancelled','CANCELLED','Cancelled demands cannot be resumed or silently changed.');
-          demand.control=control; this.stopRuns(demand,control); break;
+          demand.control=control; if (demand.executionFlow) demand.executionFlow.revision++; this.stopRuns(demand,control); break;
         }
         case 'resume':
           invariant(demand.control!=='cancelled','CANCELLED','A cancelled demand cannot resume.');
@@ -117,18 +119,19 @@ export class WorkflowService {
         case 'return-result': {
           invariant(demand.activeResultId===command.resultId,'STALE_RESULT','Return the exact current result.'); text(command.reason,'reason');
           demand.acceptances.push({resultId:command.resultId,decision:'returned',userId:user.userId,reason:command.reason,createdAt:now()});
-          demand.activeResultId=undefined; demand.activeContentId=undefined; demand.cycle++; demand.blockedReasons=[]; break;
+          demand.activeResultId=undefined; demand.activeContentId=undefined; demand.cycle++; demand.blockedReasons=[]; reopenExecution(demand, command.reason); break;
         }
         case 'switch-method':
           method(command.method); text(command.reason,'reason'); invariant(command.impactReviewed,'IMPACT_UNREVIEWED','Method changes require recorded impact review.');
           invariant(!this.store.listRuns(demand.id).some(activeRun),'RUN_ACTIVE','Stop the current run before replacing its method.');
           invariant(!demand.activeResultId,'RESULT_PROTECTED','Submitted results are immutable.');
+          if (demand.executionFlow && command.stage !== 'planning') invariant(command.method.adapter === STAGED_EXECUTION_ADAPTER, 'STAGED_METHOD_DOWNGRADE', 'A staged execution flow cannot switch to a method that bypasses its review or ticket obligations.');
           if (command.stage === 'planning' && demand.planningFlow) {
             invariant(command.method.adapter === STAGED_PLANNING_ADAPTER, 'STAGED_METHOD_DOWNGRADE', 'A staged planning flow cannot switch to a method that bypasses its decisions.');
             resetPlanning(demand, 'requirements'); demand.planningFlow.step = 'facts'; demand.planningFlow.facts = undefined; demand.planningFlow.understanding = undefined;
           }
           if (command.stage === 'planning' && !demand.planningFlow && command.method.adapter === STAGED_PLANNING_ADAPTER) { demand.activePlanId = undefined; demand.confirmedPlanId = undefined; demand.grant = undefined; demand.activeContentId = undefined; }
-          demand.methodSnapshot[command.stage]=structuredClone(command.method); demand.cycle++; break;
+          demand.methodSnapshot[command.stage]=structuredClone(command.method); demand.cycle++; if (demand.executionFlow && command.stage !== 'planning') demand.executionFlow.revision++; break;
         case 'message':
           text(command.messageId,'messageId'); text(command.text,'text');
           invariant(['question','information','change-request'].includes(command.kind),'INVALID_INPUT','Unknown message kind.');
@@ -143,11 +146,13 @@ export class WorkflowService {
           text(command.reason,'reason');const finding=demand.findings.find(f=>f.id===command.findingId);
           invariant(finding?.severity==='decision','NOT_FOUND','An open user-decision finding is required.');
           if(finding.status==='closed') return ['noop','Decision already recorded.'];
+          recordExecutionDecision(demand, { id: command.requestId, kind: 'finding-decision', findingId: finding.id, reason: command.reason, userId: user.userId, createdAt: now() });
           finding.status='closed';finding.resolution={id:command.requestId,digest:digest(command),location:`user-command:${command.requestId}`};
           demand.blockedReasons=demand.blockedReasons.filter(r=>r!==`User decision required: ${finding.id}`);break;
         }
         case 'resolve-blocker':
           text(command.reason,'reason'); invariant(!this.store.listRuns(demand.id).some(activeRun),'RUN_ACTIVE','Verify stopped execution before resolving a blocker.');
+          recordExecutionDecision(demand, { id: command.requestId, kind: 'blocker-resolution', reason: command.reason, userId: user.userId, createdAt: now() });
           demand.blockedReasons=[]; demand.cycle++; break;
         default: throw new DomainError('INVALID_COMMAND','Unsupported user command.');
       }
@@ -166,10 +171,16 @@ export class WorkflowService {
     return this.apply(`run:${report.runId}:${report.requestId}`,report,demand=>{
       const run=this.store.getRun(report.runId);
       const newerRun=this.store.listRuns(demand.id).some(other=>other.generation>run.generation);
-      const stale=(run.planningFlowId && (run.planningFlowId !== demand.planningFlow?.id || run.planningRevision !== demand.planningFlow.revision || run.planningStep !== demand.planningFlow.step)) || newerRun || (run.planId && run.planId!==demand.activePlanId) || run.cycle!==demand.cycle || (run.contentId && run.contentId!==demand.activeContentId);
+      const executionStale = run.executionFlowId && (run.executionFlowId !== demand.executionFlow?.id || run.executionRevision !== demand.executionFlow?.revision || run.executionStep !== demand.executionFlow?.step || run.executionScope !== demand.executionFlow?.scope || run.executionTicketId !== demand.executionFlow?.ticketId || demand.control !== 'active' || run.status === 'stopping' || run.status === 'unknown' || run.status === 'stopped');
+      const stale=executionStale || (run.planningFlowId && (run.planningFlowId !== demand.planningFlow?.id || run.planningRevision !== demand.planningFlow.revision || run.planningStep !== demand.planningFlow.step)) || newerRun || (run.planId && run.planId!==demand.activePlanId) || run.cycle!==demand.cycle || (run.contentId && run.contentId!==demand.activeContentId);
       if(stale) { this.audit(demand.id,'historical-report',report); return ['historical','Report retained for its original version.']; }
       invariant(!demand.activeResultId || report.type==='runtime-ended','RESULT_PROTECTED','Submitted content cannot be changed by a report.');
+      if (run.executionFlowId && !['runtime-ended'].includes(report.type)) assertExecutionBinding(demand, run, report);
       switch(report.type) {
+        case 'execution-content': case 'execution-review': case 'execution-resolution': {
+          invariant(!this.store.listRuns(demand.id).some(other => other.id !== run.id && other.contextId === run.contextId), 'REVIEW_NOT_INDEPENDENT', 'Every staged execution context must have a fresh identity.');
+          applyExecutionReport(demand, run, report, verification, this.requiredChecks(demand).map(check => check.id)); break;
+        }
         case 'planning-facts': case 'planning-questions': case 'planning-clarification': case 'planning-design': case 'planning-design-review': case 'planning-design-resolution': case 'planning-spec': case 'planning-tickets': {
           const contexts = this.store.listRuns(demand.id).filter(other => other.id !== run.id);
           invariant(!contexts.some(other => other.contextId === run.contextId), 'REVIEW_NOT_INDEPENDENT', 'Each staged step requires a new context identity.');
@@ -200,6 +211,7 @@ export class WorkflowService {
           plan.ready=true; plan.boundaryReview=structuredClone(boundary); break;
         }
         case 'content-ready': {
+          invariant(!isStagedExecution(demand) && !demand.executionFlow, 'STAGED_EXECUTION_REPORT_REQUIRED', 'Legacy content-ready cannot bypass persisted execution.');
           this.role(run,'implementation'); const content=report.content;
           this.currentPlan(demand,content.planId); invariant(demand.grant?.planId===content.planId,'AUTHORITY_MISSING','No authority for this plan.');
           text(content.id,'content.id'); text(content.deliveryNotes,'deliveryNotes'); artifact(content.code); content.knowledge.forEach(artifact);
@@ -221,6 +233,7 @@ export class WorkflowService {
           break;
         }
         case 'review': {
+          invariant(!isStagedExecution(demand) && !demand.executionFlow, 'STAGED_EXECUTION_REPORT_REQUIRED', 'Legacy review cannot bypass the two independent review axes.');
           this.role(run,'review'); this.currentContent(demand,report.contentId); artifact(report.evidence); text(report.reviewId,'reviewId');
           invariant(verification.artifactsVerified && verification.reviewInputsVerified,'REVIEW_INPUTS_UNVERIFIED','Host must verify actual stable code, spec, evidence and local materials in independent inputs.');
           invariant(report.knowledgeReviewed,'KNOWLEDGE_UNREVIEWED','Review must cover applicable local maintenance, including a no-change conclusion.');
@@ -236,11 +249,13 @@ export class WorkflowService {
           demand.reviews.push({id:report.reviewId,contentId:report.contentId,runId:run.id,contextId:run.contextId,evidence:structuredClone(report.evidence),knowledgeReviewed:true,findings:report.findings.map(f=>f.id)}); break;
         }
         case 'dispute': {
+          invariant(!isStagedExecution(demand) && !demand.executionFlow, 'STAGED_EXECUTION_REPORT_REQUIRED', 'Staged repairs and disputes require exact scoped resolution.');
           this.role(run,'implementation'); artifact(report.evidence); const finding=demand.findings.find(f=>f.id===report.findingId);
           invariant(finding && finding.status!=='closed','FINDING_NOT_OPEN','The finding is not open.');
           finding.status='disputed'; finding.dispute=structuredClone(report.evidence); break;
         }
         case 'resolve-finding': {
+          invariant(!isStagedExecution(demand) && !demand.executionFlow, 'STAGED_EXECUTION_REPORT_REQUIRED', 'Legacy finding closure cannot bypass focused independent resolution.');
           this.role(run,'review'); this.currentContent(demand,report.contentId); artifact(report.evidence);
           invariant(verification.artifactsVerified && verification.reviewInputsVerified,'REVIEW_INPUTS_UNVERIFIED','Finding resolution requires verified reviewer evidence.');
           const finding=demand.findings.find(f=>f.id===report.findingId); invariant(finding,'NOT_FOUND','Finding does not exist.');
@@ -283,7 +298,9 @@ export class WorkflowService {
         const plan=demand.plans.find(p=>p.id===demand.activePlanId);
         const generation=Math.max(0,...this.store.listRuns(demand.id).map(r=>r.generation))+1;
         const planningStep = stage === 'planning' ? nextPlanningStep(demand) : null;
-        const run: RunAttempt={id:id('run'),demandId:demand.id,stage,...(planningStep ? {planningStep,planningFlowId:demand.planningFlow!.id,planningRevision:demand.planningFlow!.revision} : {}),generation,contextId:id('context'),planId:plan?.id,contentId:stage==='review'?content?.id:undefined,cycle:demand.cycle,status:'starting',writer:stage==='implementation',highResource,method:structuredClone(selected),contextSources:[...(planningStep ? planningArtifactRefs(demand, planningStep).map(ref => ref.id) : []),...(plan?[plan.spec.id,plan.tickets.id]:[]),...(stage==='review' && content?[content.code.id,...content.knowledge.map(n=>n.id),...demand.checks.filter(e=>e.contentId===content.id).map(e=>e.evidence.id)]:[])],createdAt:now()};
+        const executionStep = stage !== 'planning' ? nextExecutionStep(demand) : null;
+        const run: RunAttempt={id:id('run'),demandId:demand.id,stage,...(planningStep ? {planningStep,planningFlowId:demand.planningFlow!.id,planningRevision:demand.planningFlow!.revision} : {}),...(executionStep ? { executionStep, executionFlowId: demand.executionFlow!.id, executionRevision: demand.executionFlow!.revision, executionScope: demand.executionFlow!.scope, executionTicketId: demand.executionFlow!.ticketId } : {}),generation,contextId:id('context'),planId:plan?.id,contentId:executionStep || stage==='review'?content?.id:undefined,cycle:demand.cycle,status:'starting',writer:stage==='implementation',highResource,method:structuredClone(selected),contextSources:[...(executionStep ? executionArtifactRefs(demand, executionStep).map(ref => ref.id) : []),...(planningStep ? planningArtifactRefs(demand, planningStep).map(ref => ref.id) : []),...(plan?[plan.spec.id,plan.tickets.id]:[]),...(stage==='review' && content?[content.code.id,...content.knowledge.map(n=>n.id),...demand.checks.filter(e=>e.contentId===content.id).map(e=>e.evidence.id)]:[])],createdAt:now()};
+        if (executionStep && stage === 'implementation') { const ticket = demand.executionFlow!.tickets.find(item => item.ticketId === demand.executionFlow!.ticketId); if (ticket) ticket.status = executionStep === 'ticket-fix' ? 'repairing' : 'implementing'; }
         this.store.saveRun(run); demand.revision++; this.store.saveDemand(demand); this.store.db.prepare("UPDATE domain_outbox SET status='done' WHERE id=?").run(entry.id); this.audit(demand.id,'run-claimed',run); return run;
       }
       return null;
@@ -402,13 +419,14 @@ export class WorkflowService {
   private requiredChecks(d: Demand) { const project=this.store.getProject(d.projectId); const plan=d.plans.find(p=>p.id===d.activePlanId);const map=new Map(project.baseChecks.map(c=>[c.id,c]));for(const c of plan?.requiredChecks ?? []) { invariant(!map.has(c.id) || canonical(map.get(c.id))===canonical(c),'CHECK_REQUIREMENT_CONFLICT','Demand cannot override project check requirements.');map.set(c.id,c); }return [...map.values()]; }
   private validateStopProof(proof: StopProof): void { invariant(proof.processAbsent && proof.descendantsAbsent && proof.workspaceVerified,'STOP_UNVERIFIED','Actual process tree absence and workspace state must be verified.');text(proof.evidence,'stop evidence'); }
   private stopRuns(d: Demand, reason: string): void { for(const run of this.store.listRuns(d.id).filter(activeRun)){run.status='stopping';run.stopReason=reason;this.store.saveRun(run);this.enqueue(`stop:${run.id}`,d.id,'stop-run',{runId:run.id,reason});} }
-  private intentKey(d: Demand, stage: Stage): string { return `start:${d.id}:${stage}:${d.activePlanId??'draft'}:${stage==='review'?d.activeContentId??'none':'work'}:${d.cycle}:${stage === 'planning' && d.planningFlow ? `${d.planningFlow.id}:${d.planningFlow.revision}:${d.planningFlow.step}` : 'legacy'}:attempt:${Math.max(0,...this.store.listRuns(d.id).map(r=>r.generation))+1}`; }
+  private intentKey(d: Demand, stage: Stage): string { return `start:${d.id}:${stage}:${d.activePlanId??'draft'}:${stage==='review'?d.activeContentId??'none':'work'}:${d.cycle}:${stage === 'planning' && d.planningFlow ? `${d.planningFlow.id}:${d.planningFlow.revision}:${d.planningFlow.step}` : stage !== 'planning' && d.executionFlow ? `${d.executionFlow.id}:${d.executionFlow.revision}:${d.executionFlow.step}:${d.executionFlow.scope}:${d.executionFlow.ticketId ?? 'all'}` : 'legacy'}:attempt:${Math.max(0,...this.store.listRuns(d.id).map(r=>r.generation))+1}`; }
   private nextStage(d: Demand): Stage | null {
     if((d.activeContentId && d.invalidatedContentIds.includes(d.activeContentId)) || d.control!=='active' || d.blockedReasons.length || d.activeResultId || !d.planningStarted) return null;
     const plan=d.plans.find(p=>p.id===d.activePlanId);
     if (isStagedPlanning(d) && d.planningFlow && d.planningFlow.step !== 'complete') return nextPlanningStep(d) ? 'planning' : null;
     if(!plan?.ready) return 'planning';
     if(d.confirmedPlanId!==plan.id || d.grant?.planId!==plan.id) return null;
+    if (isStagedExecution(d)) { const step = nextExecutionStep(d); return step ? step === 'ticket-implementation' || step === 'ticket-fix' ? 'implementation' : 'review' : null; }
     if(!d.activeContentId) return 'implementation';
     const content=this.currentContent(d,d.activeContentId);
     const reviewed=d.reviews.some(r=>r.contentId===content.id);
@@ -419,6 +437,7 @@ export class WorkflowService {
   }
   private reconcile(d: Demand): void {
     ensurePlanningFlow(d);
+    ensureExecutionFlow(d);
     if(d.activeContentId && d.invalidatedContentIds.includes(d.activeContentId)) {d.phase='blocked';return;}
     if(d.blockedReasons.length) {d.phase='blocked';for(const reason of new Set(d.blockedReasons))this.notify(d,`blocked:${digest(reason)}`,reason);return;}
     if(d.activeResultId) { d.phase=d.acceptances.some(a=>a.resultId===d.activeResultId && a.decision==='accepted')?'accepted':'awaiting-acceptance'; return; }
@@ -428,14 +447,16 @@ export class WorkflowService {
     else if(!plan?.ready) d.phase='planning';
     else if(d.confirmedPlanId!==plan.id) d.phase='awaiting-design';
     else if(d.grant?.planId!==plan.id) d.phase='awaiting-authorization';
+    else if(d.executionFlow && d.executionFlow.planId === plan.id && d.executionFlow.step !== 'complete') d.phase = d.executionFlow.step === 'ticket-implementation' ? 'implementing' : d.executionFlow.step === 'ticket-fix' ? 'rework' : 'reviewing';
     else if(!d.activeContentId) d.phase=d.cycle?'rework':'implementing';
     else {
       const content=this.currentContent(d,d.activeContentId); const review=[...d.reviews].reverse().find(r=>r.contentId===content.id);
       const checks=this.requiredChecks(d).map(req=>[...d.checks].reverse().find(e=>e.contentId===content.id&&e.requirementId===req.id));
-      const blockers=d.findings.filter(f=>f.severity!=='suggestion' && f.status!=='closed');
+      const executionFindingIds = d.executionFlow ? new Set(d.executionFlow.reviews.flatMap(review => review.findings.map(finding => finding.id))) : undefined;
+      const blockers=d.findings.filter(f=>(!isStagedExecution(d) || executionFindingIds?.has(f.id)) && f.severity!=='suggestion' && f.status!=='closed');
       const live=this.store.listRuns(d.id).some(activeRun);
-      if(review && checks.every(c=>c?.status==='passed') && !blockers.length && !live) {
-        const result={id:id('result'),demandId:d.id,P:plan.id,K:structuredClone(content.code),N:structuredClone(content.knowledge),E:structuredClone(checks as Demand['checks']),review:structuredClone(review),findingClosures:structuredClone(d.findings.filter(f=>f.status==='closed')),notes:content.deliveryNotes,contentId:content.id,createdAt:now()};
+      if((!isStagedExecution(d) || d.executionFlow?.step === 'complete') && review && checks.every(c=>c?.status==='passed') && !blockers.length && !live) {
+        const result={...(isStagedExecution(d) ? { execution: executionResultEvidence(d) } : {}),id:id('result'),demandId:d.id,P:plan.id,K:structuredClone(content.code),N:structuredClone(content.knowledge),E:structuredClone(checks as Demand['checks']),review:structuredClone(review),findingClosures:structuredClone(d.findings.filter(f=>f.status==='closed' && (!isStagedExecution(d) || executionFindingIds?.has(f.id)))),notes:content.deliveryNotes,contentId:content.id,createdAt:now()};
         d.results.push(result);d.activeResultId=result.id;d.phase='awaiting-acceptance';this.notify(d,`accept:${result.id}`,'Stable result ready for acceptance.');return;
       }
       d.phase=review && (blockers.some(f=>f.contentId===content.id&&f.severity==='blocking') || checks.some(c=>c?.status==='failed'))?'rework':checks.some(c=>!c)?'checking':'reviewing';
@@ -443,7 +464,7 @@ export class WorkflowService {
     const stage=this.nextStage(d);
     if(stage && !this.store.listRuns(d.id).some(activeRun)) {
       if(!d.methodSnapshot[stage]) {d.phase='blocked';this.notify(d,`method:${stage}` ,`Missing ${stage} method; no fallback is permitted.`);return;}
-      this.enqueue(this.intentKey(d,stage),d.id,'start-run',{stage,planningStep:stage === 'planning' ? nextPlanningStep(d) : null,planningFlowId:d.planningFlow?.id??null,planningRevision:d.planningFlow?.revision??null,planId:d.activePlanId??null,contentId:d.activeContentId??null,cycle:d.cycle});
+      this.enqueue(this.intentKey(d,stage),d.id,'start-run',{stage,planningStep:stage === 'planning' ? nextPlanningStep(d) : null,planningFlowId:d.planningFlow?.id??null,planningRevision:d.planningFlow?.revision??null,executionStep:stage !== 'planning' ? nextExecutionStep(d) : null,executionFlowId:d.executionFlow?.id??null,executionRevision:d.executionFlow?.revision??null,executionScope:d.executionFlow?.scope??null,executionTicketId:d.executionFlow?.ticketId??null,planId:d.activePlanId??null,contentId:d.activeContentId??null,cycle:d.cycle});
     }
   }
   private enqueue(key: string,demandId: string,kind: string,payload: unknown): void {this.store.db.prepare('INSERT OR IGNORE INTO domain_outbox(business_key,demand_id,kind,payload,created_at) VALUES (?,?,?,?,?)').run(key,demandId,kind,JSON.stringify(payload),now());}

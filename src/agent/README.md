@@ -95,7 +95,24 @@ paths. The production journey tests exercise these same methods through actual
 Worker/Host framing using deterministic provider responses and synthetic native
 observations. The private entry stays external; no private text is checked into
 test fixtures. These tests do not establish real-model output quality or native
-isolation, and CI for the new final commit remains to be verified.
+isolation. Consult the exact-commit CI and its individual job outcomes.
+
+## implement-spec execution resources
+
+Implementation and Review both retain the pinned `implement-spec` root identity
+through a separate execution bundle. Each private stage loads that root and its
+TDD or code-review dependency progressively; successful model consumption of
+both exact bodies is required before a nonblocked handoff. Contexts always start
+empty, with source/artifact data outside system instructions. The Host owns the
+serial frontier, exact base-to-K evidence (including uncommitted changes),
+read-only Standards/Spec contexts and focused repair scope. It never grants
+upstream shell, multi-worktree, reset, push or PR actions.
+
+The [execution adapter contract](../../docs/implementation-method-bundle.md)
+records the original provenance and explicit scoped differences. Installed SDK
+journeys and local Node test receipts exercise behavior with a deterministic
+provider and explicitly synthetic native observations; real confinement remains
+a separately measured gate.
 
 ## Deliberately remaining
 
