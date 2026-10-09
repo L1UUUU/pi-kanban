@@ -34,29 +34,30 @@ const fileHash = path => hash(readFileSync(path));
 const challenge = randomBytes(32).toString('hex');
 writeFileSync(join(root, 'other', 'private.txt'), `OTHER-${challenge}`);
 writeFileSync(join(root, 'host', 'control.txt'), `HOST-${challenge}`);
-// Only explicit official runtime locations and executable/DLL files are copied.
-// Installed Program Files ACLs are never modified and neighboring configs/keys
-// are not included in the granted manifest.
+// Shell preparation runs only after the independent Node/Pi/recovery probes.
+// Copy three required official executables and the bounded usr/bin DLL set, never
+// all Git programs or neighboring config/key files. Installed ACLs stay untouched.
 let shellFixture = null;
-if (options.has('--git-bash')) {
+function prepareShellFixture() {
   const installed = realpathSync(options.get('--git-bash')), shellRoot = join(root, 'runtime-shell'), files = [];
-  for (const folder of ['usr/bin', 'mingw64/bin', 'mingw64/libexec/git-core']) {
-    const sourceDirectory = join(installed, folder); if (!existsSync(sourceDirectory)) continue;
-    for (const entry of readdirSync(sourceDirectory, { withFileTypes: true })) {
-      if (!entry.isFile() || !/\.(exe|dll)$/i.test(entry.name)) continue;
-      const source = join(sourceDirectory, entry.name); assert.ok(!lstatSync(source).isSymbolicLink());
-      const destination = join(shellRoot, folder, entry.name); mkdirSync(dirname(destination), { recursive: true }); copyFileSync(source, destination);
-      files.push({ path: destination, sha256: fileHash(destination) });
-    }
+  const sourceDirectory = join(installed, 'usr', 'bin'), requiredExecutables = new Set(['bash.exe', 'cat.exe', 'rm.exe']);
+  const selected = readdirSync(sourceDirectory, { withFileTypes: true })
+    .filter(entry => entry.isFile() && (requiredExecutables.has(entry.name.toLowerCase()) || /\.dll$/i.test(entry.name)))
+    .sort((a, b) => a.name.localeCompare(b.name));
+  for (const name of requiredExecutables) assert.ok(selected.some(entry => entry.name.toLowerCase() === name), `Official Git fixture is missing ${name}`);
+  assert.ok(selected.length <= 512, `Official Bash fixture has ${selected.length} files; the exact manifest bound remains 512`);
+  for (const entry of selected) {
+    const source = join(sourceDirectory, entry.name); assert.ok(!lstatSync(source).isSymbolicLink());
+    const destination = join(shellRoot, 'usr', 'bin', entry.name); mkdirSync(dirname(destination), { recursive: true }); copyFileSync(source, destination);
+    files.push({ path: destination, sha256: fileHash(destination) });
   }
-  assert.ok(files.length > 0 && files.length <= 512, 'A bounded exact official Git runtime manifest is required');
   const executable = join(shellRoot, 'usr', 'bin', 'bash.exe'); assert.ok(files.some(file => file.path === executable));
   const home = join(root, 'shell-version-home'); mkdirSync(home);
   const version = spawnSync(join(installed, 'usr', 'bin', 'bash.exe'), ['--noprofile', '--norc', '-c', 'printf %s "$BASH_VERSION"'], { encoding: 'utf8', windowsHide: true, timeout: 10000, env: { SystemRoot: process.env.SystemRoot, SystemDrive: process.env.SystemDrive, HOME: home, USERPROFILE: home, TEMP: home, TMP: home } });
   assert.equal(version.status, 0, `Official Bash version probe failed: ${version.stderr}`); const semanticVersion = version.stdout.match(/^\d+\.\d+\.\d+/)?.[0]; assert.ok(semanticVersion);
   const manifestPath = join(root, 'host', 'shell-manifest.json'); writeFileSync(manifestPath, JSON.stringify({ schemaVersion: 1, rootPath: shellRoot, files }));
   writeFileSync(join(shellRoot, 'private-sibling.txt'), 'UNLISTED-PRIVATE-RUNTIME-SIBLING');
-  shellFixture = { rootPath: shellRoot, files, path: executable, version: semanticVersion, sha256: fileHash(executable), kind: 'git-bash', manifest: { path: manifestPath, sha256: fileHash(manifestPath) } };
+  return { rootPath: shellRoot, files, path: executable, version: semanticVersion, sha256: fileHash(executable), kind: 'git-bash', manifest: { path: manifestPath, sha256: fileHash(manifestPath) } };
 }
 const transcript = [], probes = [], liveHelpers = new Set();
 const record = (kind, value) => { const event = { kind, at: new Date().toISOString(), value }; transcript.push(event); writeFileSync(join(outputDirectory, 'transcript.json'), JSON.stringify(transcript, null, 2)); };
@@ -232,7 +233,13 @@ try {
   assert.equal(late.runRecord.identity, null);
   assert.equal(new NativeRecoveryStore(late.recoveryStore.directory).observe(late.runRecord, late.profile)?.state, 'stopped');
   passed('late-launch-stop', 'A stop/EOF queued before Host identity registration terminated the eventual native generation, revoked ACLs and produced authenticated recovery proof.');
-  if (shellFixture) {
+  // Reparse provisioning must fail before launch, with actual Win32 denial.
+  const linkWorkspace = join(root, 'source-reparse'); mkdirSync(linkWorkspace); symlinkSync(join(root, 'other'), join(linkWorkspace, 'escape'), 'junction');
+  const rejected = launch('review', 'reparse', linkWorkspace, true); await rejected.wait(() => rejected.event('native.resources', value => value.phase === 'provision'), 'reparse denial');
+  assert.notEqual(rejected.event('native.resources').status, 0); assert.equal(rejected.event('native.started'), undefined); await rejected.wait(() => rejected.exited, 'never-created authenticated cleanup'); assert.equal(new NativeRecoveryStore(rejected.recoveryStore.directory).observe(rejected.runRecord, rejected.profile)?.state, 'stopped'); passed('reparse-denied', 'Native provisioner rejected a real junction before spawning any Worker. Race attacks are not claimed.');
+  if (options.has('--git-bash')) {
+    shellFixture = prepareShellFixture();
+    record('shell-fixture', { executables: ['bash.exe', 'cat.exe', 'rm.exe'], fileCount: shellFixture.files.length, manifestSha256: shellFixture.manifest.sha256 });
     const bashPath = path => path.replace(/\\/g, '/').replace(/^([a-zA-Z]):/, (_, drive) => `/${drive.toLowerCase()}`);
     const quote = text => `'${text.replace(/'/g, `'"'"'`)}'`;
     for (const role of ['implementation', 'review']) {
@@ -259,10 +266,6 @@ try {
     }
     passed('git-bash-compatibility', `Actual locked Bash ${shellFixture.version}, ${shellFixture.files.length} exact copied executable/DLL dependencies, same-SID/Job subprocess receipt, external cat/rm commands, per-role read/write/delete rights, private/sibling denials, live-listener no-network and actual zero-Job/revocation stop. No installed-runtime ACLs changed.`);
   }
-  // Reparse provisioning must fail before launch, with actual Win32 denial.
-  const linkWorkspace = join(root, 'source-reparse'); mkdirSync(linkWorkspace); symlinkSync(join(root, 'other'), join(linkWorkspace, 'escape'), 'junction');
-  const rejected = launch('review', 'reparse', linkWorkspace, true); await rejected.wait(() => rejected.event('native.resources', value => value.phase === 'provision'), 'reparse denial');
-  assert.notEqual(rejected.event('native.resources').status, 0); assert.equal(rejected.event('native.started'), undefined); await rejected.wait(() => rejected.exited, 'never-created authenticated cleanup'); assert.equal(new NativeRecoveryStore(rejected.recoveryStore.directory).observe(rejected.runRecord, rejected.profile)?.state, 'stopped'); passed('reparse-denied', 'Native provisioner rejected a real junction before spawning any Worker. Race attacks are not claimed.');
   evidence.status = 'passed'; save(); console.log(JSON.stringify({ nativeWorkerProbePassed: true, actualNodePi: true, paidModelCalls: 0, releaseAuthorized: false, report: join(outputDirectory, 'report.json') }));
 } catch (error) {
   evidence.status = 'failed'; evidence.error = String(error?.stack ?? error); record('failure', { error: evidence.error }); save(); console.error(evidence.error); process.exitCode = 1;

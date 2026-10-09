@@ -213,8 +213,9 @@ Run the expanded diagnostic, including an explicitly selected preinstalled offic
 node native/windows/probe-worker.mjs --helper build/native/Release/pi_kanban_native_helper.exe --worker dist/worker/main.mjs --output artifacts/windows-worker --policy lpac-registry-read-no-network-v2 --git-bash "C:\Program Files\Git"
 ```
 
-The fixture copies only enumerated executable/DLL files from fixed official Git runtime
-subdirectories into its disposable tree. It hashes the complete exact-file manifest and
+After retaining independent Node/Pi/recovery observations, the fixture copies only the
+three required official `bash.exe`, `cat.exe`, `rm.exe` files and the bounded `usr/bin` DLL
+set into its disposable tree. It hashes the complete exact-file manifest and
 never changes installed Git ACLs. Shell startup is the pinned executable with fixed
 `--noprofile --norc -c` arguments, scratch HOME, curated manifest-root PATH and no inherited
 credentials/config/proxy environment. Every dependency is pinned and hashed before launch;
