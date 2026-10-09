@@ -115,15 +115,17 @@ A non-null `runtime` has these fields (required unless marked optional):
   semantic `version`, and `sha256`. Node must pin a Node 24 version.
 - `pi`: null, or the same file-reference fields plus
   `package: "@earendil-works/pi-coding-agent"` and an exact version.
-- `shell`: null, or an explicitly locked Git Bash executable and manifest as
-  described below. Older schema-v1 documents may omit this field; parsing
-  canonicalizes omission to null. There is no default shell or PATH discovery.
+- `shell`: **null for the approved Node-only product scope**. Older schema-v1
+  documents may omit this field; parsing canonicalizes omission to null. A legacy
+  non-null Git Bash selection can remain visible for inspection but blocks product
+  execution and must be cleared. It never becomes a supported optional runtime.
+  There is no default shell or PATH discovery.
 - `policyVariant`: optional exact enum `lpac-strict-v1`,
   `lpac-registry-read-no-network-v2` or `appcontainer-no-network-v3`. Omission
   canonicalizes to `lpac-strict-v1`. Null, unknown values and automatic selection
   are rejected. The registry-read variant explicitly adds that capability to
   LPAC while retaining network denial. It remains a diagnostic candidate with
-  observed compatibility failures, not a verified production profile. The
+  actual hosted-Windows Node/Pi observations, not a verified production profile. The
   standard AppContainer candidate selects `appcontainer-no-network-v3`, with no
   network capability and no filesystem-root ACL grant. Neither alternate policy
   is ever selected after another policy fails. Selection is preserved in
@@ -173,8 +175,8 @@ Only public verification material belongs in this file. Signing keys must stay
 with the independently controlled recorder and are never created or imported by
 configuration loading.
 
-Evidence binds the exact OS build, runtime artifacts, policy variant and optional
-shell manifest. It must cover permitted work, role restrictions, cross-demand
+Evidence binds the exact OS build, runtime artifacts, policy variant and absence
+of shell authority in the Node-only product. Legacy diagnostic signatures can also bind a shell manifest, but cannot enable the product. It must cover permitted work, role restrictions, cross-demand
 and shared-Git denial, Host/private-channel boundaries, real network denial,
 descendant termination, helper closure, reparse handling and role transition.
 Changing a bound artifact or capability policy invalidates the old evidence.
@@ -183,11 +185,14 @@ The repository's CI recorder reports partial observations with
 production. Target-machine validation and independent release authorization
 remain required.
 
-### Optional locked Git Bash
+### Unsupported legacy Git Bash metadata
 
-The shell is an additional explicit runtime artifact. This example is a schema
-illustration only; substitute the selected installation's exact version and
-hashes. Importing it neither runs Bash nor authorizes a command.
+The approved first product scope excludes Git Bash. **Do not add this selection to
+a Node-only configuration; set `runtime.shell` to null.** The following schema is
+retained only to inspect old configurations and reproduce separately labeled
+unsupported-feature diagnostics. It is not an optional production feature.
+Importing it neither runs Bash nor authorizes a command, and inspection reports a
+blocking unsupported selection even if all hashes are valid.
 
 ```json
 {
@@ -235,22 +240,20 @@ Host-managed metadata.
 
 The manifest is bounded separately to 4 MiB and at most 512 entries; it is never
 embedded into or allowed to enlarge the 128 KiB settings file. Each listed
-artifact is bounded to 256 MiB, with a 1 GiB total. Inspection verifies the
-manifest and all listed hashes, rejects duplicate paths, traversal, aliases,
+artifact is bounded to 256 MiB, with a 1 GiB total. The retained diagnostic manifest
+parser verifies the manifest and all listed hashes, rejects duplicate paths, traversal, aliases,
 symlinks and junctions, and never scans PATH or launches a process. A changed
 manifest or dependency invalidates the lock even if Bash itself is unchanged.
 Unknown fields, credential values, authorization flags and custom launch
-arguments are not supported.
+arguments are not supported. Product configuration inspection reports an unsupported
+shell selection without opening the shell executable or its manifest dependencies.
 
-`runtimeProfileInput` passes the exact executable and manifest locks to the
-independent native verifier without display IDs. Missing/null shell is omitted
-from the native profile and cannot enable shell tools. A configured shell stays
-unverified until authenticated evidence covers its exact executable, manifest,
-dependencies and actual Git Bash probe on the current Windows host. A generic
-process-spawn result, a version string or synthetic fixture is not such proof.
-The native runner fixes startup arguments to disable profile and rc-file
-loading; arbitrary shell fallback is unsupported. Separate role, workspace,
-process-tree, resource-budget and command checks still apply before use.
+`runtimeProfileInput` rejects a non-null shell selection. The independent runtime
+verifier, Host command dispatch and Worker bootstrap also reject shell authority.
+Missing/null shell is omitted from the native profile and advertises no shell tool.
+The retained native diagnostic adapter fixes startup arguments and exact dependency
+locks, but its failing MSYS compatibility probe cannot authorize product execution.
+The [support matrix](support-matrix.md) describes applicable direct Node commands.
 
 ## Provider selection and finite proposal
 

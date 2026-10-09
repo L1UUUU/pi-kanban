@@ -1,6 +1,6 @@
 # Security model and limits
 
-This is a fail-closed prototype, not a security certification.
+This is a fail-closed Node-native-tools prototype, not a security certification. The approved product profile has no shell. Legacy shell metadata may be retained for inspection, but it cannot enable execution.
 
 ## Protected boundaries
 
@@ -17,7 +17,9 @@ This is a fail-closed prototype, not a security certification.
 
 - No unverified production Worker launch, OS-independent sandbox claim, arbitrary HTTP proxy, inherited model credentials or implicit global Pi resource discovery
 - No automatic public sharing, push, PR, merge, deployment, destructive cleanup or credential creation by the application
-- No full support claim for Git hooks, signing, shell extensions, reparse variants, broad Windows capabilities, Node/Git Bash/Pi inside the candidate, hard power loss or sleep/resume
+- No Bash/POSIX commands, implicit system shell, npm-script shell fallback or arbitrary native CLI execution in the Node-only product scope
+- No full support claim for Git hooks, signing, shell extensions, reparse variants, broad Windows capabilities, hard power loss or sleep/resume
+- Hosted-Windows Node/Pi observations cover named probes only; complete target Windows 11 acceptance remains required
 - No semantic guarantee that arbitrary text contains no secrets: only explicitly permitted material may enter a real model context
 - No exact instantaneous spending cap promise; provider-reported overspend is recorded and blocks further requests
 

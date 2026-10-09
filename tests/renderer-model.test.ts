@@ -410,3 +410,38 @@ test('renderer: runtime policy selection discloses registry access and network p
   assert.equal(unknown.id, 'synthetic-unknown'); assert.match(unknown.label, /未知隔离策略/); assert.doesNotMatch(unknown.label, /网络禁止/);
   assert.notEqual(runtimePolicyDisclosure(null).id, strict.id, 'Only an omitted variant defaults to strict');
 });
+
+test('renderer: Node support scope stays unverified and legacy shell diagnostics escape imported paths', () => {
+  const compiled = buildSync({ stdin: { resolveDir: fileURLToPath(new URL('..', import.meta.url)), loader: 'tsx', contents: `
+    import React from 'react';
+    import { renderToStaticMarkup } from 'react-dom/server';
+    import { ConfigurationPanel } from './src/desktop/renderer/Configuration.tsx';
+    export const render = state => renderToStaticMarkup(React.createElement(ConfigurationPanel, { state, pending:false, preparing:false, offline:false, onImport:()=>{}, onReview:()=>{} }));
+    ` }, bundle: true, platform: 'node', format: 'cjs', write: false, logLevel: 'silent' }).outputFiles[0]!.text;
+  const compiledModule: { exports: Record<string, unknown> } = { exports: {} };
+  new Function('require', 'module', 'exports', compiled)(createRequire(import.meta.url), compiledModule, compiledModule.exports);
+  const render = compiledModule.exports.render as (state: ViewState) => string;
+  const empty = render(state());
+  assert.match(empty, /Node 原生受控工具/);
+  assert.match(empty, /不支持 Bash \/ POSIX shell/);
+  assert.match(empty, /Windows 目标机.*仍须由 Host 核验/);
+  assert.match(empty, /导入成功不代表执行已启用/);
+  assert.doesNotMatch(empty, /已导入不受支持的 shell/);
+
+  const config = configuration();
+  config.configuration.runtime = {
+    profileId: 'synthetic-node', osBuild: null, arch: 'x64', node: null, helper: null, worker: null, pi: null, policySha256: null,
+    shell: { id: 'synthetic-shell', kind: 'git-bash', path: '/synthetic/<img src=x onerror=alert(1)>/bash.exe', sha256: 'a'.repeat(64), version: 'synthetic', manifest: { id: 'synthetic-manifest', path: '/synthetic/manifest.json', sha256: 'b'.repeat(64) } },
+    evidence: { privateChannel: null, filesystem: null, processTree: null, network: null },
+  };
+  const legacy = render(state({ configuration: config }));
+  assert.match(legacy, /role="alert"><strong>已导入不受支持的 shell，执行受阻/);
+  assert.match(legacy, /shell 设为 null 或省略，再重新导入/);
+  assert.match(legacy, /&lt;img src=x onerror=alert\(1\)&gt;/);
+  assert.doesNotMatch(legacy, /<img|当前运行组合已启用/);
+  config.configuration.runtime.shell = null;
+  const cleared = render(state({ configuration: config }));
+  assert.doesNotMatch(cleared, /已导入不受支持的 shell/);
+  assert.match(cleared, /导入成功不代表执行已启用/);
+  assert.equal(config.executionEnabled, false);
+});

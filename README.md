@@ -2,7 +2,7 @@
 
 面向个人开发者的本地 AI 开发工作台：以需求为授权、执行和验收单位，把规划、实施、独立 Review、返工及本地经验关联在同一个工作区。
 
-**当前交付是可运行的桌面工作台与受控执行原型，仍是 draft。真实 Agent 自主执行默认关闭。** 已实现的跨平台规则、存储、Git、SDK 和受控进程测试，不等于 Windows 运行组合或真实模型效果已经通过。完整门槛与缺口见 [实施状态](docs/implementation-status.md)。
+**首个支持范围已收敛为 Node 原生受控工具，shell 必须为空；当前仍是 draft，真实 Agent 自主执行默认关闭。** 可用方向包括受控文件读写、删除、列举、搜索，以及 Node 测试和适用的 JavaScript CLI；任意 Bash 脚本、POSIX 管道和原生命令不在本阶段范围内。 已实现的跨平台规则、存储、Git、SDK 和受控进程测试，不等于 Windows 运行组合或真实模型效果已经通过。完整门槛与缺口见 [实施状态](docs/implementation-status.md)。
 
 ## 快速开始
 
@@ -36,7 +36,7 @@ npm run test:ui          # 浏览器交互回归；需已安装 Playwright Chrom
 - R：运行代次、单写入者、两个并行需求与一个高资源检查，持久停止意图和实际进程树观察；限额预留、未知用量保留、有限重试和无进展停止
 - Pi：实际 SDK 显式装配、独立原生会话、禁止默认全局资源发现；低层结束事件不会被解释成业务完成
 - 桌面：中文 Agent 工作区、稳定成果与检查、持久阻塞、旧版本操作拒绝、独立 Node Host、受限预加载桥、托盘关闭和明确退出
-- Windows：C++ AppContainer/Job Objects 候选启动器、私有通道、精确运行文件授权、停止/撤权回执与真实 Win32、Node/Pi 探针；Git Bash 使用独立锁定的文件清单，无隐式 PATH 发现
+- Windows：C++ AppContainer/Job Objects 候选启动器、私有通道、精确运行文件授权、停止/撤权回执与真实 Win32、Node/Pi 探针；Node-only 组合不配置 shell，Git Bash 仅保留不受支持的隔离诊断
 
 ## 数据与安全
 
@@ -44,13 +44,14 @@ Host 控制数据库位于应用用户数据目录；项目私有正文仅位于
 
 Git Hooks、过滤器、fsmonitor 和签名等未验证组合会明确阻塞，不在高权限 Host 中运行或静默跳过。生产 Worker 缺少真实隔离证据时拒绝启动；Linux 进程 fixture 仅用于监督测试，不是安全沙箱。
 
-Node/Git Bash 检查只能读取获准源码并使用私有临时区。源码生成通过受控写入/删除接口；检查命令改动源码会阻塞后续模型请求和交接。磁盘采用有限的周期检查与超限停止策略，不宣称瞬时硬配额。内置远端核验目前支持公共 GitHub 仓库。
+Node 检查只能读取获准源码并使用私有临时区。不能依赖 npm 脚本的系统 shell、Bash 管道或任意原生可执行文件；适用的 JavaScript CLI 必须由锁定的 Node 直接运行，依赖也必须在已授权资源范围内。源码生成通过受控写入/删除接口；检查命令改动源码会阻塞后续模型请求和交接。磁盘采用有限的周期检查与超限停止策略，不宣称瞬时硬配额。内置远端核验目前支持公共 GitHub 仓库。
 
 本仓库没有原始私有规划 ZIP、个人会话、真实凭据或付费模型授权。原始产品规格用编号追溯，公开文档为本项目重新编写。
 
 ## 进一步阅读
 
 - [架构与模块接口](docs/architecture.md)
+- [Node-only 支持矩阵](docs/support-matrix.md)
 - [实施状态、验收证据与剩余条件](docs/implementation-status.md)
 - [安全边界与已知限制](docs/security.md)
 - [开发与测试说明](docs/development.md)

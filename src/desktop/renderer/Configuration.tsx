@@ -16,6 +16,14 @@ export function ConfigurationPanel({ state, demand, pending, preparing, offline,
   const authorization = summary?.authorization;
   const alreadyRecorded = !!demand && authorization?.demandId === demand.id && authorization.configurationDigest === summary?.configurationDigest;
   return <section className="configuration-panel" aria-label="方法与模型配置">
+    <section className="runtime-support" aria-label="首版运行支持范围">
+      <div className="configuration-section-heading"><span className="configuration-step">首版支持范围</span><span className="tiny-pill">执行前须核验</span></div>
+      <h3>Node 原生受控工具</h3>
+      <p>支持范围：受控读写、删除、搜索、Node 测试与适用的 JavaScript CLI。写入和删除仍受阶段授权与需求工作区限制。</p>
+      <p>不支持 Bash / POSIX shell、shell 脚本及依赖 shell 的 CLI。运行配置中的 shell 必须为空。</p>
+      <p>Windows 目标机的隔离、文件系统、进程树与网络证据仍须由 Host 核验。导入成功不代表执行已启用。</p>
+      {runtime?.shell && <div className="runtime-unsupported" role="alert"><strong>已导入不受支持的 shell，执行受阻</strong><Fact label="遗留 shell 来源 · 仅用于排查" value={`${runtime.shell.kind} · ${runtime.shell.path}`} /><p>请将运行配置中的 shell 设为 null 或省略，再重新导入。清除后仍须核验其余运行条件。</p></div>}
+    </section>
     <div className="configuration-import"><div><span className="configuration-step">01 · 本地来源</span><h3>导入方法与模型配置</h3><p>选择本地 JSON 文件。有效的既有方法快照会保留，缺失方法可在首次派发前补齐。Host 校验来源与摘要后保存；导入本身不授权费用、资料传输或执行。</p></div><button className="button compact" onClick={onImport} disabled={pending || preparing || offline}><Icon name="folder" size={14} />{pending ? '正在导入…' : '导入运行配置'}</button></div>
     <div className="configuration-source"><span className={`status-dot ${summary?.sourceStatus === 'configured' ? 'success' : 'warning'}`} /><span>{summary?.sourceStatus === 'configured' ? `已载入配置 · 版本 ${summary.revision}` : summary?.sourceStatus === 'invalid' ? '配置未通过校验' : '尚未导入运行配置'}</span>{state.preview && <span className="tiny-pill">合成示例</span>}</div>
     {summary?.sourceStatus === 'configured' && <details className="configuration-reference"><summary>查看配置指纹</summary><Fact label="SHA-256 · 授权将绑定此摘要" value={summary.configurationDigest} /></details>}

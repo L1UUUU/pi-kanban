@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { PassThrough } from 'node:stream';
+import { execFileSync } from 'node:child_process';
 import { mkdtempSync,mkdirSync,writeFileSync,readFileSync,symlinkSync,existsSync,realpathSync,rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -11,6 +12,7 @@ import type { WorkerInit } from '../src/agent/worker-runtime.ts';
 import { PrivateFrameDecoder,encodePrivateFrame } from '../src/runtime/pipe-frames.ts';
 import { ModelBudgetLedger } from '../src/runtime/budget.ts';
 import { ModelBroker } from '../src/runtime/model-broker.ts';
+import type { ProviderResponse } from '../src/runtime/model-broker.ts';
 import { HostPiBrokerEndpoint } from '../src/runtime/pi-channel.ts';
 import { controlledTools } from '../src/agent/controlled-tools.ts';
 import { verifyWindowsRuntimeProfile,assertVerifiedProfile,VerifiedRuntimeProfile } from '../src/runtime/profile.ts';
@@ -20,9 +22,28 @@ function boot():WorkerInit{const f=fixture();return {version:1,type:'worker.init
 
 test('actual production Worker bootstrap + SDK tools + framed Host broker/report receipt executes in synthetic streams',async()=>{
   const init=boot(),db=new DatabaseSync(':memory:'),ledger=new ModelBudgetLedger(db,()=>{});let providerCalls=0,reports=0,checks=0,mutations=0;const events:string[]=[];const pendingMutations=new Map<string,string>();
-  ledger.grant({id:'g',demandId:'A',decisionId:'synthetic-source-and-derived-scope',provider:'one',modelId:'fixture',destination:'https://provider.invalid/v1/messages',credentialRef:'HOST-ONLY',data:[{id:'scope',sha256:createHash('sha256').update('fixture').digest('hex')}],allowedRoles:['implementation'],maxRequests:5,maxTokens:50000,maxCostMicros:5000,currency:'USD',expiresAt:new Date(Date.now()+60000).toISOString(),meteringPolicy:'test',contextPolicy:'approved-run-derived-v1'});
+  ledger.grant({id:'g',demandId:'A',decisionId:'synthetic-source-and-derived-scope',provider:'one',modelId:'fixture',destination:'https://provider.invalid/v1/messages',credentialRef:'HOST-ONLY',data:[{id:'scope',sha256:createHash('sha256').update('fixture').digest('hex')}],allowedRoles:['implementation'],maxRequests:6,maxTokens:60000,maxCostMicros:5000,currency:'USD',expiresAt:new Date(Date.now()+60000).toISOString(),meteringPolicy:'test',contextPolicy:'approved-run-derived-v1'});
   let endpoint:HostPiBrokerEndpoint;
-  const broker=new ModelBroker({ledger,readMaterial:async id=>endpoint.readMaterial(id),authorizeRun:()=>{},transport:{provider:'one',modelId:'fixture',destination:'https://provider.invalid/v1/messages',mode:'synthetic-no-network',async send(request){providerCalls++;if(providerCalls===4){const transcript=JSON.parse(request.materials[0]!.text);const toolMessages=transcript.messages.filter((message:{role:string})=>message.role==='toolResult');const visible=JSON.stringify(toolMessages.map((message:{content:unknown})=>message.content));assert.match(visible,/fixture-check/);assert.match(visible,/Host check receipt/);assert.match(visible,/exitCode/);}return providerCalls===1?{text:'',toolCalls:[{id:'write-1',name:'controlled_write',arguments:{path:'worker-generated.txt',content:'Generated under Worker token'}}],usage:{tokens:5,costMicros:5,source:'deterministic'}}:providerCalls===2?{text:'',toolCalls:[{id:'delete-1',name:'controlled_delete',arguments:{path:'worker-generated.txt'}}],usage:{tokens:5,costMicros:5,source:'deterministic'}}:providerCalls===3?{text:'',toolCalls:[{id:'node-1',name:'controlled_node',arguments:{args:['--version']}}],usage:{tokens:5,costMicros:5,source:'deterministic'}}:providerCalls===4?{text:'',toolCalls:[{id:'report-1',name:'controlled_report',arguments:{report:{type:'blocked',reason:'synthetic missing input'}}}],usage:{tokens:5,costMicros:5,source:'deterministic'}}:{text:'Reported synthetic blocker through the actual controlled tool.',usage:{tokens:5,costMicros:5,source:'deterministic'}};}}});
+  const broker=new ModelBroker({ledger,readMaterial:async id=>endpoint.readMaterial(id),authorizeRun:()=>{},transport:{provider:'one',modelId:'fixture',destination:'https://provider.invalid/v1/messages',mode:'synthetic-no-network',async send(request){
+    providerCalls++;
+    const transcript=JSON.parse(request.materials[0]!.text),names=transcript.messages.flatMap((message:{toolsAdded?:{name:string}[]})=>message.toolsAdded??[]).map((tool:{name:string})=>tool.name);
+    assert.deepEqual([...names].sort(),['controlled_delete','controlled_list','controlled_node','controlled_read','controlled_report','controlled_search','controlled_write']);
+    const toolMessages=transcript.messages.filter((message:{role:string})=>message.role==='toolResult');
+    if(providerCalls===3){
+      const search=toolMessages.find((message:{toolName:string})=>message.toolName==='controlled_search');
+      const found=JSON.parse(search.content[0].text);assert.deepEqual(found,{matches:[{path:'worker-generated.txt',line:1,text:'Generated under Worker token'}],truncated:false,skippedFiles:0});
+      assert.equal(toolMessages.find((message:{toolName:string})=>message.toolName==='controlled_read').content[0].text,'Generated under Worker token');
+    }
+    if(providerCalls===5){const visible=JSON.stringify(toolMessages.map((message:{content:unknown})=>message.content));assert.match(visible,/fixture-check/);assert.match(visible,/Host check receipt/);assert.match(visible,/exitCode/);}
+    const turns:NonNullable<ProviderResponse['toolCalls']>[]=[
+      [{id:'write-1',name:'controlled_write',arguments:{path:'worker-generated.txt',content:'Generated under Worker token'}}],
+      [{id:'read-1',name:'controlled_read',arguments:{path:'worker-generated.txt'}},{id:'search-1',name:'controlled_search',arguments:{query:'Worker token'}}],
+      [{id:'delete-1',name:'controlled_delete',arguments:{path:'worker-generated.txt'}}],
+      [{id:'node-1',name:'controlled_node',arguments:{args:['--version']}}],
+      [{id:'report-1',name:'controlled_report',arguments:{report:{type:'blocked',reason:'synthetic missing input'}}}],
+    ];
+    return {text:providerCalls===6?'Reported synthetic blocker through the actual controlled tool.':'',...(turns[providerCalls-1]?{toolCalls:turns[providerCalls-1]}:{}),usage:{tokens:5,costMicros:5,source:'deterministic'}};
+  }}});
   endpoint=new HostPiBrokerEndpoint({db,ledger,broker,binding:{...init,grantId:'g',reserveTokens:10000,reserveCostMicros:1000},authorizeRun:()=>{},authorizeContext:async()=>({decisionId:'synthetic-source-and-derived-scope'})});
   const toWorker=new PassThrough(),fromWorker=new PassThrough(),decoder=new PrivateFrameDecoder();
   const send=(value:unknown)=>toWorker.write(encodePrivateFrame(Buffer.from(JSON.stringify(value))));
@@ -35,7 +56,7 @@ test('actual production Worker bootstrap + SDK tools + framed Host broker/report
     if(value.type==='worker.report'){const report=value.report as Record<string,unknown>;reports++;assert.equal(report.runId,'domain-1');assert.equal(report.generation,1);assert.equal(report.type,'blocked');send({type:'worker.receipt',requestId:report.requestId,ok:true,value:{status:'applied'}});}
   }});
   const running=runWorkerFromStreams(toWorker,fromWorker,init.generation);send(init);
-  await running;await Promise.all(dispatches);assert.equal(providerCalls,5);assert.equal(mutations,2);assert.equal(reports,1);assert.equal(checks,1);assert.ok(events.includes('worker.ready'));assert.ok(events.includes('worker.settled'));assert.equal(ledger.snapshot('g').requests,5);
+  await running;await Promise.all(dispatches);assert.equal(providerCalls,6);assert.equal(mutations,2);assert.equal(reports,1);assert.equal(checks,1);assert.ok(events.includes('worker.ready'));assert.ok(events.includes('worker.settled'));assert.equal(ledger.snapshot('g').requests,6);assert.equal(events.includes('worker.shell-request'),false);
   toWorker.destroy();fromWorker.destroy();db.close();
 });
 test('Worker bootstrap rejects generation mismatch and incomplete finite limits',()=>{
@@ -112,4 +133,80 @@ test('private native workspace capability binds exact path and generation withou
   const init={...boot(),workspace,generation,workspaceCapability:capability};assert.equal(validateWorkerInit(init,generation).workspaceCapability,capability);
   for(const bad of [{...capability,path:f.scratch},{...capability,generation:'different'},{...capability,kind:'asserted-by-model'},{...capability,unchecked:true},null])
     assert.throws(()=>validateWorkerInit({...init,workspaceCapability:bad},generation),{code:'WORKER_BOOTSTRAP_INVALID'});
+});
+
+
+test('Node-only Worker and tool registration reject every enabled legacy shell capability', async t=>{
+  const init=boot();t.after(()=>rmSync(join(init.workspace,'..'),{recursive:true,force:true}));
+  assert.equal(validateWorkerInit(init,init.generation).shellEnabled,undefined);
+  assert.equal(validateWorkerInit({...init,shellEnabled:false},init.generation).shellEnabled,false);
+  for(const shellEnabled of [true,'true',1,null,{}])assert.throws(()=>validateWorkerInit({...init,shellEnabled},init.generation),{code:'SHELL_NOT_SUPPORTED'});
+  const options={workspace:init.workspace,scratch:init.scratch,role:init.role,...init.limits,report:async()=>({}),stopRequired:()=>{}};
+  let shellCalls=0;
+  assert.throws(()=>controlledTools({...options,shell:async()=>{shellCalls++;return {output:'forbidden',exitCode:0};}} as typeof options),{code:'SHELL_NOT_SUPPORTED'});
+  assert.equal(shellCalls,0);
+  const input=new PassThrough(),output=new PassThrough();let frames=0;output.on('data',()=>{frames++;});
+  const running=runWorkerFromStreams(input,output,init.generation);
+  input.write(encodePrivateFrame(Buffer.from(JSON.stringify({...init,shellEnabled:true}))));
+  await assert.rejects(running,{code:'SHELL_NOT_SUPPORTED'});assert.equal(frames,0);
+  input.destroy();output.destroy();
+});
+
+test('Node source search is literal, bounded, and excludes links, metadata and non-text files', async t=>{
+  const f=fixture();t.after(()=>rmSync(f.root,{recursive:true,force:true}));
+  mkdirSync(join(f.workspace,'src'));writeFileSync(join(f.workspace,'src','one.txt'),'first\nneedle.* literal\nlast');
+  writeFileSync(join(f.workspace,'src','other.txt'),'needleZZ is not a regex match');
+  for(const directory of ['.git','.LOCAL']){mkdirSync(join(f.workspace,directory));writeFileSync(join(f.workspace,directory,'secret'),'needle.* secret');}
+  writeFileSync(join(f.workspace,'binary'),Buffer.from([0xff,0xfe]));writeFileSync(join(f.workspace,'null-byte'),'needle.*\0secret');writeFileSync(join(f.workspace,'large'),'needle.*'.repeat(200));
+  writeFileSync(join(f.root,'outside'),'needle.* outside');symlinkSync(f.root,join(f.workspace,'escape'),'junction');
+  const options={workspace:f.workspace,scratch:f.scratch,role:'review' as const,maxFileBytes:1024,commandTimeoutMs:1000,maxOutputBytes:1024,report:async()=>({}),stopRequired:()=>{}};
+  const tool=controlledTools(options).find(tool=>tool.name==='controlled_search')!;
+  const execute=(input:unknown,signal?:AbortSignal)=>tool.execute('search',input,signal,undefined,{} as never);
+  const result=await execute({query:'needle.*'});
+  assert.deepEqual(result.details,{matches:[{path:'src/one.txt',line:2,text:'needle.* literal'}],truncated:false,skippedFiles:4});
+  for(const path of ['../outside','.LOCAL/secret','.git/secret','escape/outside'])await assert.rejects(execute({query:'needle.*',path}),{code:'TOOL_PATH_DENIED'});
+  for(const input of [{query:''},{query:'x\ny'},{query:'x',maxResults:0},{query:'x',maxResults:101},{query:'x',maxResults:1.5}])await assert.rejects(execute(input),{code:'TOOL_INPUT'});
+  writeFileSync(join(f.workspace,'matches'),'needle.* one\nneedle.* two');
+  const limited=await execute({query:'needle.*',path:'matches',maxResults:1});
+  assert.deepEqual(limited.details,{matches:[{path:'matches',line:1,text:'needle.* one'}],truncated:true,skippedFiles:0});
+  const small=controlledTools({...options,maxOutputBytes:160}).find(tool=>tool.name==='controlled_search')!;
+  const bounded=await small.execute('small',{query:'needle.*',path:'matches'},undefined,undefined,{} as never);
+  assert(Buffer.byteLength((bounded.content[0] as {text:string}).text)<=160);assert.equal((bounded.details as {truncated:boolean}).truncated,true);
+  const abort=new AbortController();abort.abort(new Error('search cancelled'));await assert.rejects(execute({query:'needle.*'},abort.signal),/search cancelled/);
+});
+
+test('Node read/list reject nonregular, oversized and unbounded output before unsafe reads', async t=>{
+  const f=fixture();t.after(()=>rmSync(f.root,{recursive:true,force:true}));
+  const options={workspace:f.workspace,scratch:f.scratch,role:'review' as const,maxFileBytes:1024,commandTimeoutMs:1000,maxOutputBytes:1024,report:async()=>({}),stopRequired:()=>{}};
+  const tools=controlledTools(options),read=tools.find(tool=>tool.name==='controlled_read')!,list=tools.find(tool=>tool.name==='controlled_list')!;
+  const readFile=(path:string)=>read.execute('read',{path},undefined,undefined,{} as never);
+  mkdirSync(join(f.workspace,'directory'));writeFileSync(join(f.workspace,'large'),'x'.repeat(1025));writeFileSync(join(f.workspace,'invalid'),Buffer.from([0xff]));
+  await assert.rejects(readFile('directory'),{code:'FILE_REQUIRED'});await assert.rejects(readFile('large'),{code:'FILE_TOO_LARGE'});await assert.rejects(readFile('invalid'),{code:'FILE_ENCODING_INVALID'});
+  if(process.platform!=='win32'){execFileSync('mkfifo',[join(f.workspace,'pipe')]);await assert.rejects(readFile('pipe'),{code:'FILE_REQUIRED'});}
+  for(const directory of ['.git','.LOCAL'])mkdirSync(join(f.workspace,directory));
+  const listed=JSON.parse(((await list.execute('list',{},undefined,undefined,{} as never)).content[0] as {text:string}).text);
+  assert.equal(listed.some((name:string)=>['.git','.local'].includes(name.toLowerCase())),false);
+  await assert.rejects(list.execute('list',{path:'.LOCAL'},undefined,undefined,{} as never),{code:'TOOL_PATH_DENIED'});
+  for(let index=0;index<1001;index++)writeFileSync(join(f.workspace,'directory',`entry-${index}`),'');
+  const countBounded=controlledTools({...options,maxOutputBytes:1024*1024}).find(tool=>tool.name==='controlled_list')!;
+  await assert.rejects(countBounded.execute('list',{path:'directory'},undefined,undefined,{} as never),{code:'TOOL_OUTPUT_LIMIT'});
+  const byteBounded=controlledTools({...options,maxOutputBytes:10}),smallRead=byteBounded.find(tool=>tool.name==='controlled_read')!,smallList=byteBounded.find(tool=>tool.name==='controlled_list')!;
+  writeFileSync(join(f.workspace,'ordinary'),'12345678901');
+  await assert.rejects(smallRead.execute('read',{path:'ordinary'},undefined,undefined,{} as never),{code:'TOOL_OUTPUT_LIMIT'});
+  await assert.rejects(smallList.execute('list',{},undefined,undefined,{} as never),{code:'TOOL_OUTPUT_LIMIT'});
+});
+
+
+test('source enumeration counts skipped links and invalid UTF-8 against finite scan limits', async t=>{
+  const f=fixture();t.after(()=>rmSync(f.root,{recursive:true,force:true}));
+  const links=join(f.workspace,'links'),invalid=join(f.workspace,'invalid');mkdirSync(links);mkdirSync(invalid);
+  for(let index=0;index<10_001;index++)symlinkSync(f.scratch,join(links,`link-${index}`),'junction');
+  const options={workspace:f.workspace,scratch:f.scratch,role:'review' as const,maxFileBytes:1024*1024,commandTimeoutMs:1000,maxOutputBytes:1024,report:async()=>({}),stopRequired:()=>{}};
+  const tools=controlledTools(options),search=tools.find(tool=>tool.name==='controlled_search')!,list=tools.find(tool=>tool.name==='controlled_list')!;
+  const found=await search.execute('links',{query:'never',path:'links'},undefined,undefined,{} as never);
+  assert.deepEqual(found.details,{matches:[],truncated:true,skippedFiles:10_000});
+  await assert.rejects(list.execute('links',{path:'links'},undefined,undefined,{} as never),{code:'TOOL_OUTPUT_LIMIT'});
+  const bytes=Buffer.alloc(1024*1024,0xff);for(let index=0;index<17;index++)writeFileSync(join(invalid,`binary-${index}`),bytes);
+  const scanned=await search.execute('invalid',{query:'never',path:'invalid'},undefined,undefined,{} as never);
+  assert.deepEqual(scanned.details,{matches:[],truncated:true,skippedFiles:16});
 });

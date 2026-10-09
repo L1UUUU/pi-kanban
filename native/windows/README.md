@@ -1,9 +1,15 @@
-# Windows AppContainer + Job candidate
+# Windows Node-native tools candidate
 
 Status: substantive native source; **not compiled or executed in the Linux authoring
 container**, with native compilation and CTest smoke subsequently passed in Windows CI. The production TypeScript driver remains disabled until exact signed runtime evidence and
 separately provisioned Host recorder trust pass; a JSON `verified: true` flag does nothing. The general helper, bounded IPC/Host driver, scoped resource provisioning and independent
 evidence verifier are now implemented; all units have now compiled in Windows CI; runtime validation remains incomplete.
+
+The first delivery scope is **Node-native tools only**: controlled source read/list/search,
+role-authorized write/delete, and bounded native Node checks, using the explicitly selected
+`lpac-registry-read-no-network-v2` candidate. Git Bash is unsupported and excluded from
+product bootstrap. Its actual failures remain separate diagnostics. The legacy strict
+default is unchanged; this scope does not enable unverified production execution.
 
 ## Native Windows 11 / Windows CI build
 
@@ -13,7 +19,7 @@ No dependency download or installer is included.
 ```powershell
 cmake -S native/windows -B build/native -A x64
 cmake --build build/native --config Release
-ctest --test-dir build/native -C Release --output-on-failure
+ctest --test-dir build/native -C Release --output-on-failure --no-tests=error -R '^native_registry_read_smoke$'
 ```
 
 Always retain `build/native/Testing/Temporary/LastTest.log`. A compile failure, denied
@@ -24,6 +30,21 @@ It deletes its own profile on exit, retains files on failure, and removes its un
 created test root on success. It never touches a business repository or real credential.
 Windows Server CI is a useful compile/smoke environment but does not prove Windows 11
 end-user behavior; capture exact OS build separately.
+
+CI requires this selected revised-v2 smoke and the Node-only bundled-Pi recorder below.
+Neither required step tolerates failure. A separate, explicitly non-gating diagnostic
+matrix runs legacy strict smoke, ordinary-v3 smoke, and the stock-Git-Bash revised-v2
+recorder. Those commands retain their original nonzero exit status, failing step outcome,
+raw logs and separate artifacts; CI summaries mark failures visibly. They cannot authorize
+shell support, broaden the selected policy, or turn an inconclusive denial into a pass.
+The diagnostic job's non-gating setting never applies to the required Node job.
+
+To reproduce the other smoke comparisons, run them separately and retain each log:
+
+```powershell
+ctest --test-dir build/native -C Release --output-on-failure --no-tests=error -R '^native_candidate_smoke$'
+ctest --test-dir build/native -C Release --output-on-failure --no-tests=error -R '^native_appcontainer_smoke$'
+```
 
 ## Candidate implementation
 
@@ -103,13 +124,14 @@ telemetry preserves that unresolved behavior for diagnosis.
 
 ## Real Node 24 / bundled Pi private-channel probe
 
-The native CTest smoke has passed on the Windows CI baseline. The broader recorder below
-must be run separately; a C++ fixture passing is not Node/Pi compatibility evidence.
+The selected revised-v2 native CTest smoke has passed on the Windows CI baseline. The
+broader recorder below must be run separately; a C++ fixture passing is not Node/Pi
+compatibility evidence. Select the policy explicitly; omitting it retains strict-v1.
 
 ```powershell
 npm ci --ignore-scripts
 npm run build
-node native/windows/probe-worker.mjs --helper build/native/Release/pi_kanban_native_helper.exe --worker dist/worker/main.mjs --output artifacts/windows-worker
+node native/windows/probe-worker.mjs --helper build/native/Release/pi_kanban_native_helper.exe --worker dist/worker/main.mjs --policy lpac-registry-read-no-network-v2 --output artifacts/windows-node-native
 ```
 
 `probe-worker.mjs` runs as the independent trusted Host, not in the sandbox. It copies the
@@ -122,6 +144,16 @@ Only the exact pinned executable and bundled Worker file receive read/execute gr
 parent runtime directories and their siblings do not. The legacy `readonlyRuntimeRoots`
 field name now contains those two exact files, never directory trees.
 
+The Node-only recorder additionally requires real Pi `controlled_read` and bounded literal
+`controlled_search` results before its native Node assertion check in each source role.
+It checks the actual advertised tools for absence of `controlled_shell` and built-ins,
+and checks that native Node has no PATH/ComSpec/SHELL environment. A valid `run-shell`
+request to the real helper, with empty shell fields and only Node/Worker runtime files,
+must return Win32 `ERROR_ACCESS_DENIED`, `launch-failed`, PID zero and no child exit code.
+A subsequent native Node command must still run, followed by zero-process and revoked-ACL
+cleanup. This tests shell unavailability at the helper as well as the advertised tool list;
+it does not claim to prove every possible indirect executable or service escape.
+
 Additional probes create a real same-Job Node heartbeat and verify zero-process stop plus
 quiescent writes, reject a real junction before launch, and close the Host control pipe to
 exercise authenticated cleanup across a reconstructed Host. Reports and raw framed
@@ -129,7 +161,9 @@ transcripts are retained, including bounded Worker diagnostics. Fixtures contain
 synthetic data and remain available for ACL inspection. A nonzero process status, timeout,
 missing observation, failed revoke or access-policy failure fails the probe.
 
-The recorder explicitly emits `releaseAuthorized: false`: it is partial real-runtime
+The report identifies `toolScope: "node-native-tools-only"`; adding `--git-bash` produces
+the separately labeled `node-and-git-bash-diagnostic` report. The recorder always emits
+`releaseAuthorized: false`: it is partial real-runtime
 validation, not a full release attestation. In particular it does not prove all reparse
 races, arbitrary network/service escape routes, catastrophic helper-crash cleanup, or full
 role-transition attack coverage. It cannot be used as a signed all-pass profile.
@@ -189,7 +223,7 @@ file. Output/log streams remain independently byte-bounded; the probe records po
 overshoot instead of relabeling monitoring as kernel-enforced storage containment.
 
 
-## Explicit policy candidates and locked Git Bash
+## Explicit policy candidates and unsupported Git Bash diagnostics
 
 `lpac-strict-v1` remains the default for legacy configurations. Actual Windows CI observed
 Node 24 starting and then exiting with Winsock initialization error 10107 under that strict
@@ -207,7 +241,9 @@ primary documentation distinguishes `registryRead` (HKLM read) from network capa
 https://learn.microsoft.com/en-us/windows/win32/secauthz/implementing-an-appcontainer
 https://learn.microsoft.com/en-us/windows/win32/secauthz/createprocessinsandbox
 
-Run the expanded diagnostic, including an explicitly selected preinstalled official Git:
+The helper retains a direct shell-fixture diagnostic only. The product never enables it
+from a shell profile. Run this non-gating comparison, including an explicitly selected
+preinstalled official Git:
 
 ```powershell
 node native/windows/probe-worker.mjs --helper build/native/Release/pi_kanban_native_helper.exe --worker dist/worker/main.mjs --output artifacts/windows-worker --policy lpac-registry-read-no-network-v2 --git-bash "C:\Program Files\Git"
@@ -429,3 +465,10 @@ Reproduce with the explicit revised-v2 command above and retain both `report.jso
 `transcript.json`. [The exact run artifact](https://github.com/L1UUUU/pi-kanban/actions/runs/37895356130/artifacts/11600570460)
 contains the successful subset, native receipts and the actual Bash error. Bounded failed
 Bash receipt output is also included in subsequent CI assertion diagnostics.
+
+The subsequent Node-only CI split adds native assertions for actual controlled read/search,
+Node assertion checks, advertised tool scope and helper shell denial. These additions need
+their own Windows execution; the historical 16-probe result above does not certify them.
+Even a successful required Node job remains partial Windows Server evidence, not complete
+Windows 11 release evidence. Every recorder result still sets `releaseAuthorized: false`,
+and production still requires independently verified exact runtime evidence.

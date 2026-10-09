@@ -3,7 +3,6 @@ import { lstatSync, realpathSync, openSync, fstatSync, closeSync, readSync, cons
 import { isAbsolute, relative, resolve, dirname } from 'node:path';
 import { release } from 'node:os';
 import { RuntimeError } from './types.ts';
-import { readLockedShellManifest } from './shell-profile.ts';
 import type { LockedShellRuntime } from './shell-profile.ts';
 export type { LockedShellRuntime } from './shell-profile.ts';
 import { MAX_WINDOWS_EVIDENCE_BYTES, requireWindowsProbeCoverage, validateWindowsEvidenceTrustAnchor, verifyWindowsEvidence } from './evidence-auth.ts';
@@ -15,8 +14,14 @@ export interface LockedRuntimeProfile {
   profileId: string; osBuild: string; arch: 'x64'; node: BinaryLock; helper: BinaryLock; worker: BinaryLock;
   pi: BinaryLock & { package: '@earendil-works/pi-coding-agent' }; policySha256: string;
   policyVariant?: WindowsRuntimePolicyVariant;
+  /** Retained for diagnostic/legacy data only; executable product profiles reject shells. */
   shell?: LockedShellRuntime | null;
   evidence: { id: string; path: string; sha256: string }[];
+}
+export const NODE_ONLY_RUNTIME_MESSAGE = 'The supported product runtime is Node-only. Git Bash and arbitrary shell commands are excluded; clear runtime.shell before verification or execution.';
+/** Product scope is enforced independently of imported configuration and diagnostic evidence. */
+export function assertNodeOnlyRuntime(value: { shell?: unknown }): void {
+  if (value.shell !== undefined && value.shell !== null) throw new RuntimeError('SHELL_NOT_SUPPORTED', NODE_ONLY_RUNTIME_MESSAGE);
 }
 function freezeDeep<T>(value: T): T { if (value && typeof value === 'object') { for (const item of Object.values(value)) freezeDeep(item); Object.freeze(value); } return value; }
 const verificationToken = Symbol('verified-runtime-profile');
@@ -68,6 +73,7 @@ function lockedPath(path: string) {
 function verifyProfile(input: unknown, trustedEvidenceRoot: string, trust: WindowsEvidenceTrustAnchor | undefined,
   make: (config: LockedRuntimeProfile, digests: string[]) => VerifiedRuntimeProfile): VerifiedRuntimeProfile {
   const value = object(input);
+  assertNodeOnlyRuntime(value);
   if (process.platform !== 'win32' || process.arch !== 'x64') throw new RuntimeError('WINDOWS_PROFILE_REQUIRED', 'Native Windows x64 is required; no platform fallback');
   // Evidence-root ownership, profile hashes and adjacent public keys cannot establish provenance.
   // No trust anchor is embedded in user-configurable profile JSON or implicitly provisioned here.
@@ -87,7 +93,6 @@ function verifyProfile(input: unknown, trustedEvidenceRoot: string, trust: Windo
   }
   if (!/^v?24\./.test(config.node.version) || config.pi.package !== '@earendil-works/pi-coding-agent')
     throw new RuntimeError('PROFILE_RUNTIME_MISMATCH', 'Expected Node 24 and the exact official Pi package');
-  if (config.shell !== undefined && config.shell !== null) readLockedShellManifest(config.shell);
   if (!Array.isArray(config.evidence) || !config.evidence.length || config.evidence.length > 32)
     throw new RuntimeError('ISOLATION_UNVERIFIED', 'Bounded independently captured Windows evidence required');
   const root = lockedPath(trustedEvidenceRoot), covered = new Set<string>(), digests: string[] = [];
@@ -107,7 +112,7 @@ function verifyProfile(input: unknown, trustedEvidenceRoot: string, trust: Windo
     for (const probe of report.probes) covered.add(probe.id);
     digests.push(ref.sha256);
   }
-  requireWindowsProbeCoverage(covered, config.shell != null);
+  requireWindowsProbeCoverage(covered);
   return make(config, digests);
 }
 /** The two-argument form intentionally fails closed until the Host has a pinned recorder trust anchor. */

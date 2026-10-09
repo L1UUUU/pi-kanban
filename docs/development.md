@@ -4,7 +4,7 @@
 
 Use Node 24. `package-lock.json` records exact package versions and registry integrity. `npm ci --ignore-scripts` installs the development/test dependencies without package lifecycle execution. Esbuild's platform package is included by the lock. Download the official Electron runtime separately with `npm run setup:electron` when running the desktop.
 
-`npm run check` runs strict type checking, Node tests and the production build. `npm run diagnostics` prints observed OS/Node/Git/SQLite/package versions and hashes without environment secrets. CI runs the portable suite on Linux and Windows and separately compiles/runs the native Win32 smoke. The source package contains no downloaded binary artifacts.
+`npm run check` runs strict type checking, Node tests and the production build. `npm run diagnostics` prints observed OS/Node/Git/SQLite/package versions and hashes without environment secrets. CI runs the portable suite on Linux and Windows. The explicitly selected Node-only native profile is a required job; alternative policy and excluded Git Bash probes are separately labeled diagnostics whose raw failures remain available. The source package contains no downloaded binary artifacts.
 
 ## Local data and cleanup
 
@@ -23,9 +23,9 @@ Browser tests use Playwright and record screenshots as CI artifacts. They establ
 ```powershell
 cmake -S native/windows -B build/native -A x64
 cmake --build build/native --config Release
-ctest --test-dir build/native -C Release --output-on-failure
+ctest --test-dir build/native -C Release --output-on-failure --no-tests=error -R '^native_registry_read_smoke$'
 npm run build
-node native/windows/probe-worker.mjs --helper build/native/Release/pi_kanban_native_helper.exe --worker dist/worker/main.mjs --policy lpac-registry-read-no-network-v2 --git-bash "C:\Program Files\Git" --output artifacts/windows-worker
+node native/windows/probe-worker.mjs --helper build/native/Release/pi_kanban_native_helper.exe --worker dist/worker/main.mjs --policy lpac-registry-read-no-network-v2 --output artifacts/windows-worker
 ```
 
 The native smoke manages unique temporary synthetic identities/resources. Preserve `build/native/Testing/Temporary/LastTest.log` including failures. Do not install a new backend or disable failed negative cases to make the suite green. The product targets Windows 11 x64/NTFS; hosted Windows Server CI is useful partial Win32 evidence, not proof of that target combination.
@@ -34,7 +34,7 @@ The command explicitly selects the revised registry-read LPAC diagnostic candida
 with no network capability and no ancestor/root ACL grants. The strict configuration
 default is unchanged. Its earlier metadata-grant experiment has been removed; fixed
 Node startup flags and the exact native-pinned workspace bootstrap now avoid requiring
-those grants. This candidate remains unverified until the actual probe succeeds.
+those grants. Its actual Node/Pi probes passed on hosted Windows Server; full target Windows 11 release verification remains pending.
 Ordinary AppContainer's inconclusive loopback result stays visible in its unchanged
 CTest negative case; zero-capability LPAC failed real Node Winsock startup.
 All policies are identified separately in observations. Network denial requires
@@ -44,7 +44,7 @@ denial proof. Policy changes are part of the signed runtime identity and require
 evidence. These no-model probes cannot authorize production execution or satisfy
 the real-model quality gates.
 
-`--git-bash` selects an existing official Git for Windows installation explicitly;
+Git Bash is excluded from the approved product scope. A separate non-gating diagnostic can append `--git-bash "C:\Program Files\Git"`; the actual failure remains in its report, never converted to success. `--git-bash` selects an existing official Git for Windows installation explicitly;
 adjust the example path to the actual installation. The recorder copies a bounded
 manifest of exact executable/DLL dependencies into its disposable fixture before
 applying ACLs. It does not change installed Git permissions or search for another
@@ -54,4 +54,4 @@ The locked Worker is emitted as `dist/worker/main.mjs`, including SDK dependenci
 
 ## Completing live validation
 
-The original actual `design-feature` source and all dependencies must be supplied, hashed and reviewed. Implementation/Review method candidates must be explicitly versioned. A real model requires provider/model, Host credential reference, exact data/destination authorization, finite request/token/cost policy and metering behavior. The complete native Worker + private channel must be verified for the chosen Node/Git Bash/Pi build before any live fixture run. Finally, run a dedicated real GitHub merge/read-only verification + later-demand reuse scenario and user acceptance; mock observations cannot substitute.
+The original actual `design-feature` source and all dependencies must be supplied, hashed and reviewed. Implementation/Review method candidates must be explicitly versioned. A real model requires provider/model, Host credential reference, exact data/destination authorization, finite request/token/cost policy and metering behavior. The complete native Worker + private channel must be verified for the chosen Node/Pi build without a shell before any live fixture run. Finally, run a dedicated real GitHub merge/read-only verification + later-demand reuse scenario and user acceptance; mock observations cannot substitute.

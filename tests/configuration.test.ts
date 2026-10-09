@@ -3,10 +3,9 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, sep } from 'node:path';
+import { join } from 'node:path';
 import { ConfigurationStore, CONFIGURATION_FILENAME, MAX_METHOD_BYTES, configurationDigest, createModelGrant, emptyConfiguration, inspectConfiguration, loadMethods, parseConfiguration, runtimeProfileInput } from '../src/host/configuration.ts';
 import type { FileReference, MethodSourceConfiguration, ProviderConfiguration, RuntimeConfiguration, ShellConfiguration, WorkbenchConfiguration } from '../src/host/configuration.ts';
-import { MAX_SHELL_MANIFEST_BYTES } from '../src/runtime/shell-profile.ts';
 
 function fixture(t: any) {
   const root = realpathSync.native(mkdtempSync(join(tmpdir(), 'pi-config-')));
@@ -182,17 +181,43 @@ for (const policyVariant of ['lpac-registry-read-no-network-v2', 'appcontainer-n
   assert.equal(configurationDigest({ ...loaded, revision: configuration.revision }), selectedDigest);
 });
 
-test('explicit Git Bash locks its executable and a separate manifest without granting execution', t => {
-  const { configuration, shell, rootPath } = shellFixture(t), summary = inspectConfiguration(configuration);
-  assert.equal(summary.runtime.status, 'configured-unverified'); assert.equal(summary.executionEnabled, false);
+test('legacy Git Bash metadata remains inspectable but cannot produce a product runtime profile', t => {
+  const { configuration, shell } = shellFixture(t), summary = inspectConfiguration(configuration);
+  assert.equal(summary.runtime.status, 'invalid'); assert.equal(summary.executionEnabled, false);
   assert.deepEqual(summary.configuration.runtime!.shell, shell);
-  const input = runtimeProfileInput(configuration);
-  assert.deepEqual(input.shell, { path: shell.path, version: shell.version, sha256: shell.sha256, kind: 'git-bash', manifest: { path: shell.manifest.path, sha256: shell.manifest.sha256 } });
-  assert(!('id' in input.shell!)); assert(!('id' in input.shell!.manifest));
-  assert(!JSON.stringify(input).includes('rootPath'), 'directory containment metadata is not a file or directory grant');
-  writeFileSync(join(rootPath, 'unlisted-secret.txt'), 'NOT-AUTHORIZED-FOR-SHELL');
-  assert.equal(inspectConfiguration(configuration).runtime.status, 'configured-unverified', 'only explicitly locked artifacts are inspected');
-  assert(!JSON.stringify(summary).includes('NOT-AUTHORIZED-FOR-SHELL'));
+  assert.match(summary.runtime.blockers.join(' '), /SHELL_NOT_SUPPORTED.*Node-only/);
+  assert.throws(() => runtimeProfileInput(configuration), { code: 'SHELL_NOT_SUPPORTED' });
+  const original = configurationDigest(configuration);
+  configuration.runtime!.shell = null;
+  assert.notEqual(configurationDigest(configuration), original);
+  assert.equal(inspectConfiguration(configuration).runtime.status, 'configured-unverified');
+  assert.equal(Object.hasOwn(runtimeProfileInput(configuration), 'shell'), false);
+});
+
+test('imported and persisted non-null shell configurations stay blocked until explicitly cleared', t => {
+  const { root, store, configuration, shell } = shellFixture(t), imported = join(root, 'legacy-shell.json');
+  writeFileSync(imported, JSON.stringify(configuration));
+  const saved = store.importFromFile(imported);
+  assert.deepEqual(store.load().runtime!.shell, shell);
+  assert.deepEqual(saved.runtime!.shell, shell);
+  assert.equal(store.inspect().sourceStatus, 'configured');
+  assert.equal(store.inspect().runtime.status, 'invalid');
+  assert.match(store.inspect().runtime.blockers.join(' '), /SHELL_NOT_SUPPORTED/);
+  assert.throws(() => runtimeProfileInput(store.load()), { code: 'SHELL_NOT_SUPPORTED' });
+  const repaired = store.save({ ...saved, runtime: { ...saved.runtime!, shell: null } });
+  assert.equal(repaired.runtime!.shell, null);
+  assert.equal(repaired.runtime!.policyVariant, 'lpac-strict-v1');
+  assert.equal(store.inspect().runtime.status, 'configured-unverified');
+  assert.equal(store.inspect().executionEnabled, false);
+});
+
+test('excluded shell metadata is rejected before manifest or executable inspection', t => {
+  const { configuration, shell, rootPath } = shellFixture(t);
+  rmSync(rootPath, { recursive: true }); rmSync(shell.manifest.path);
+  const summary = inspectConfiguration(configuration);
+  assert.deepEqual(summary.runtime.blockers.length, 1);
+  assert.match(summary.runtime.blockers[0]!, /SHELL_NOT_SUPPORTED/);
+  assert.throws(() => runtimeProfileInput(configuration), { code: 'SHELL_NOT_SUPPORTED' });
 });
 
 test('shell syntax rejects implicit discovery, version ranges, unknown kinds and authorization fields', t => {
@@ -201,73 +226,6 @@ test('shell syntax rejects implicit discovery, version ranges, unknown kinds and
     assert.throws(() => parseConfiguration({ ...configuration, runtime: { ...configuration.runtime, shell: { ...shell, ...change } } }));
   }
   assert.throws(() => parseConfiguration({ ...configuration, runtime: { ...configuration.runtime, shell: { ...shell, manifest: { ...shell.manifest, id: shell.id } } } }), /duplicate/);
-});
-
-test('changed executable, manifest or transitive shell artifact invalidates inspection', t => {
-  const { configuration, shell, executable, dependency } = shellFixture(t);
-  for (const reference of [executable, shell.manifest, dependency]) {
-    const original = readFileSync(reference.path); writeFileSync(reference.path, 'Changed artifact.');
-    const summary = inspectConfiguration(configuration);
-    assert.equal(summary.runtime.status, 'invalid'); assert.equal(summary.executionEnabled, false);
-    assert.match(summary.runtime.blockers.join(' '), /runtime\.shell:/);
-    writeFileSync(reference.path, original);
-    assert.equal(inspectConfiguration(configuration).runtime.status, 'configured-unverified');
-  }
-});
-
-test('shell manifest cannot omit the executable, duplicate identities or escape its installation root', t => {
-  const { configuration, file, manifest, executable, dependency, writeManifest } = shellFixture(t);
-  const outside = file('outside-runtime-artifact');
-  for (const files of [[], [dependency], [executable, executable], [executable, { ...executable, path: executable.path.toUpperCase() }], [executable, { path: outside.path, sha256: outside.sha256 }], [{ ...executable, sha256: '0'.repeat(64) }]]) {
-    writeManifest({ ...manifest, files });
-    assert.equal(inspectConfiguration(configuration).runtime.status, 'invalid');
-  }
-  writeManifest({ ...manifest, files: Array.from({ length: 513 }, () => executable) });
-  assert.equal(inspectConfiguration(configuration).runtime.status, 'invalid');
-  writeManifest(manifest);
-  assert.equal(inspectConfiguration(configuration).runtime.status, 'configured-unverified');
-});
-
-test('shell manifest rejects malformed, oversized and nonregular input without enlarging configuration', t => {
-  const { configuration, shell, manifest, writeManifest } = shellFixture(t);
-  for (const content of [Buffer.from('{broken JSON'), Buffer.from([0xff, 0xfe]), Buffer.alloc(MAX_SHELL_MANIFEST_BYTES + 1, ' ')]) {
-    writeFileSync(shell.manifest.path, content); shell.manifest.sha256 = createHash('sha256').update(content).digest('hex');
-    assert.equal(inspectConfiguration(configuration).runtime.status, 'invalid');
-  }
-  writeManifest({ ...manifest, authorized: true }); assert.equal(inspectConfiguration(configuration).runtime.status, 'invalid');
-  writeManifest(manifest); rmSync(shell.manifest.path); mkdirSync(shell.manifest.path);
-  assert.equal(inspectConfiguration(configuration).runtime.status, 'invalid');
-  assert(Buffer.byteLength(JSON.stringify(parseConfiguration(configuration))) < 128 * 1024);
-});
-
-test('shell manifest paths must be exact selections without traversal or directory aliases', t => {
-  const { configuration, manifest, executable, writeManifest } = shellFixture(t);
-  writeManifest({ ...manifest, rootPath: `${manifest.rootPath}${sep}.` });
-  assert.equal(inspectConfiguration(configuration).runtime.status, 'invalid');
-  writeManifest({ ...manifest, files: [{ ...executable, path: `${manifest.rootPath}${sep}usr${sep}bin${sep}..${sep}bin${sep}bash.exe` }] });
-  assert.equal(inspectConfiguration(configuration).runtime.status, 'invalid');
-});
-
-test('invalid UTF-8 within a shell manifest cannot silently select a replacement-character filename', t => {
-  const { configuration, shell, rootPath, manifest } = shellFixture(t);
-  const path = join(rootPath, 'replacement-\ufffd.dll'), content = 'Synthetic replacement-character dependency.';
-  writeFileSync(path, content);
-  const bytes = Buffer.from(JSON.stringify({ ...manifest, files: [...manifest.files, { path, sha256: createHash('sha256').update(content).digest('hex') }] }));
-  const offset = bytes.indexOf(Buffer.from('\ufffd'));
-  assert(offset >= 0);
-  const invalidUtf8 = Buffer.concat([bytes.subarray(0, offset), Buffer.from([0xff]), bytes.subarray(offset + 3)]);
-  writeFileSync(shell.manifest.path, invalidUtf8); shell.manifest.sha256 = createHash('sha256').update(invalidUtf8).digest('hex');
-  assert.equal(inspectConfiguration(configuration).runtime.status, 'invalid');
-});
-
-test('shell artifacts cannot be redirected through a linked installation directory', t => {
-  const { configuration, root, rootPath, shell, manifest, writeManifest } = shellFixture(t);
-  const alias = join(root, 'git-alias');
-  try { symlinkSync(rootPath, alias, process.platform === 'win32' ? 'junction' : 'dir'); }
-  catch (error: any) { if (process.platform === 'win32' && error.code === 'EPERM') { t.skip('Creating a junction fixture requires Windows test privilege'); return; } throw error; }
-  shell.path = join(alias, 'usr', 'bin', 'bash.exe');
-  writeManifest({ ...manifest, rootPath: alias, files: manifest.files.map(file => ({ ...file, path: join(alias, 'usr', 'bin', file.path.endsWith('bash.exe') ? 'bash.exe' : 'msys-2.0.dll') })) });
-  assert.equal(inspectConfiguration(configuration).runtime.status, 'invalid');
 });
 
 test('provider configuration requires exact HTTPS endpoint, reference-only credentials, immutable data and finite bounds', t => {

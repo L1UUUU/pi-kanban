@@ -119,10 +119,11 @@ and restart behavior without claiming any Windows execution. Actual Windows EOF 
 is separately exercised by the native Worker recorder.
 
 
-Optional Git Bash profiles require a pinned executable and bounded exact-file dependency
-manifest. The verifier authenticates shell and manifest identity in signed evidence and
-requires an actual `git-bash-compatibility` observation. `runShellCheck` accepts one bounded
-script; the native helper fixes startup flags and executes it under the same SID/Job and
-process/output/disk policies as Node. No ambient shell discovery or unrestricted fallback
-exists. Policy variants are also signed: absent legacy policy means strict LPAC, never the
-explicit registry-read diagnostic candidate.
+The approved product scope is Node-only: configuration may retain legacy shell metadata
+for inspection, but the executable profile verifier, Host dispatch and Worker bootstrap
+reject shell authority. A shell-free profile cannot be reused to authorize Bash. The
+native locked Git Bash adapter/manifest parser remain only for excluded-feature diagnostics;
+the observed MSYS named-object failure is preserved. No shared namespace grant or fallback
+is added. Policy variants remain signed: absent legacy policy means strict LPAC, never the
+explicit registry-read diagnostic candidate. Node-only scope does not waive independent
+Windows 11 evidence or authorize live execution.

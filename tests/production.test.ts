@@ -126,7 +126,7 @@ import type { BoundedProviderTransport } from '../src/runtime/model-broker.ts';
 
 class SyntheticNativePort {
   readonly id = 'synthetic-production-composition'; readonly isolation = 'synthetic-process-supervision-only' as const;
-  nativeCalls = 0; shellCalls = 0; onShellCheck?: () => void; launches: { run: RunRecord; init: WorkerInit }[] = []; bootstraps: WindowsRunBootstrap[] = []; replies: unknown[] = []; stopped = new Set<string>();
+  nativeCalls = 0; shellCalls = 0; onNodeCheck?: () => void; launches: { run: RunRecord; init: WorkerInit }[] = []; bootstraps: WindowsRunBootstrap[] = []; replies: unknown[] = []; stopped = new Set<string>();
   handler!: (run: RunRecord, frame: Uint8Array) => Promise<void>;
   bootstrap: (run: RunRecord) => WindowsRunBootstrap;
   constructor(bootstrap: (run: RunRecord) => WindowsRunBootstrap) { this.bootstrap = bootstrap; }
@@ -134,23 +134,21 @@ class SyntheticNativePort {
   setWorkerFrameHandler(handler: (run: RunRecord, frame: Uint8Array) => Promise<void>) { this.handler = handler; }
   preflight() {}
   async launch(run: RunRecord): Promise<ProcessIdentity> { const bootstrap = this.bootstrap(run); this.bootstraps.push(bootstrap); const init = bootstrap.workerInit as unknown as WorkerInit; const launch = { run, init }; this.launches.push(launch); if (init.checkOnly) await this.emit(launch, { type: 'worker.ready', sessionId: init.sessionId }); return { pid: 7000 + this.launches.length, birth: 'SYNTHETIC-BIRTH', generation: run.generation, controlId: run.runId, driver: this.id }; }
-  async runNodeCheck(_runId: string, _args: string[], _limits: { timeoutMs: number; maxOutputBytes: number }, requestId: string = randomUUID()) { this.nativeCalls++; return { requestId, exitCode: 0, output: 'Synthetic native check output.', reason: 'exited' as const, nativeEvidence: { synthetic: true } }; }
-  async runShellCheck(_runId: string, args: string[], _limits: { timeoutMs: number; maxOutputBytes: number }, requestId: string = randomUUID()) { assert.equal(args.length, 1); this.shellCalls++; this.onShellCheck?.(); return { requestId, exitCode: 0, output: 'Synthetic locked Git Bash output.', reason: 'exited' as const, nativeEvidence: { synthetic: true, arguments: ['--noprofile', '--norc', '-c', args[0]] } }; }
+  async runNodeCheck(_runId: string, _args: string[], _limits: { timeoutMs: number; maxOutputBytes: number }, requestId: string = randomUUID()) { this.nativeCalls++; this.onNodeCheck?.(); return { requestId, exitCode: 0, output: 'Synthetic native check output.', reason: 'exited' as const, nativeEvidence: { synthetic: true } }; }
+  async runShellCheck(_runId: string, args: string[], _limits: { timeoutMs: number; maxOutputBytes: number }, requestId: string = randomUUID()) { assert.equal(args.length, 1); this.shellCalls++; return { requestId, exitCode: 0, output: 'Synthetic locked Git Bash output.', reason: 'exited' as const, nativeEvidence: { synthetic: true, arguments: ['--noprofile', '--norc', '-c', args[0]] } }; }
   sendWorkerFrame(_id: string, value: unknown) { this.replies.push(value); }
   getResourceEvidence(id: string) { return { provisioned: this.launches.some(item => item.run.runId === id), revoked: this.stopped.has(id), status: 0 }; }
   async stop(run: RunRecord): Promise<Observation> { this.stopped.add(run.runId); return this.observe(run); }
   async observe(run: RunRecord): Promise<Observation> { return { state: this.stopped.has(run.runId) ? 'stopped' : 'alive', generation: run.generation, activePids: this.stopped.has(run.runId) ? [] : [7001], proof: 'SYNTHETIC process and ACL observation; no real isolation.' }; }
   async emit(launch: { run: RunRecord; init: WorkerInit }, body: Record<string, unknown>) { return this.handler(launch.run, Buffer.from(JSON.stringify({ version: 1, runId: launch.run.runId, ...(body.type === 'model.request' ? {} : { runtimeRunId: launch.run.runId }), generation: launch.run.generation, capability: launch.init.capability, ...body }))); }
 }
-function syntheticComposition(t: test.TestContext, localCommitAuthor?: ProductionOptions['localCommitAuthor'], shell = false) {
+function syntheticComposition(t: test.TestContext, localCommitAuthor?: ProductionOptions['localCommitAuthor']) {
   const f = fixture(t); const configuration = f.configuration; configuration.provider = provider();
   const runtimeRoot = join(f.root, 'runtime-files'); mkdirSync(runtimeRoot);
   const nodeRoot = join(runtimeRoot, 'node'), workerRoot = join(runtimeRoot, 'worker'); mkdirSync(nodeRoot); mkdirSync(workerRoot);
   const binary = (path: string) => { writeFileSync(path, 'SYNTHETIC binary bytes'); return { path, version: '24.0.0', sha256: hash('SYNTHETIC binary bytes') }; };
   const profile: LockedRuntimeProfile = { profileId: 'synthetic-profile', osBuild: 'SYNTHETIC-OS', arch: 'x64', node: binary(join(nodeRoot, 'node.exe')), helper: binary(join(runtimeRoot, 'helper.exe')), worker: binary(join(workerRoot, 'main.mjs')), pi: { ...binary(join(runtimeRoot, 'pi.json')), package: '@earendil-works/pi-coding-agent' }, policySha256: 'a'.repeat(64), evidence: [] };
-  if (shell) { const root = join(runtimeRoot, 'git-bash'); mkdirSync(root); const executable = binary(join(root, 'bash.exe')), library = binary(join(root, 'runtime.dll')), path = join(runtimeRoot, 'shell-manifest.json'), content = JSON.stringify({ schemaVersion: 1, rootPath: root, files: [executable, library].map(({ path, sha256 }) => ({ path, sha256 })) }); writeFileSync(path, content); profile.shell = { ...executable, version: '5.2.37', kind: 'git-bash', manifest: { path, sha256: hash(content) } }; }
   configuration.runtime = { profileId: profile.profileId, osBuild: profile.osBuild, arch: 'x64', node: { id: 'node', ...profile.node }, helper: { id: 'helper', ...profile.helper }, worker: { id: 'worker', ...profile.worker }, pi: { id: 'pi', ...profile.pi }, policySha256: profile.policySha256, evidence: { privateChannel: null, filesystem: null, processTree: null, network: null } };
-  if (profile.shell) configuration.runtime.shell = { id: 'shell', ...profile.shell, manifest: { id: 'shell-manifest', ...profile.shell.manifest } };
   f.configuration = configuration;
   const drivers: SyntheticNativePort[] = []; const calls: string[] = [];
   const transport: BoundedProviderTransport = { mode: 'synthetic-no-network', provider: 'openai', modelId: 'gpt-4.1-mini', destination: 'https://api.openai.com/v1/responses', async send(request) { calls.push(request.requestId); return { text: 'Synthetic planner/reviewer observation.', usage: { tokens: 20, costMicros: 10, source: 'SYNTHETIC-NO-NETWORK' } }; } };
@@ -169,7 +167,7 @@ function syntheticComposition(t: test.TestContext, localCommitAuthor?: Productio
   };
   const report = (driver: SyntheticNativePort, launch: { run: RunRecord; init: WorkerInit }, body: Record<string, unknown>) => driver.emit(launch, { type: 'worker.report', report: { ...body, requestId: randomUUID(), runId: launch.init.domainRunId, demandId: 'demand', generation: launch.init.domainGeneration } });
   const settled = (driver: SyntheticNativePort, launch: { run: RunRecord; init: WorkerInit }) => driver.emit(launch, { type: 'worker.settled', sessionId: launch.init.sessionId, aborted: false });
-  return { ...f, production, coordinator, drivers, calls, authorize, ready, report, settled };
+  return { ...f, profile, production, coordinator, drivers, calls, authorize, ready, report, settled };
 }
 const pendingRef = (id: string) => ({ id, digest: 'pending', location: 'host-artifact' });
 test('synthetic composition: actual orchestration launches separate boundary context and gates readiness', async t => {
@@ -314,10 +312,8 @@ test('model data preparation preserves only role-authorized explicitly selected 
   const readIds = f.store.db.prepare('SELECT revision_id FROM knowledge_reads').all().map(row => row.revision_id); assert.ok(readIds.includes('selected')); assert.ok(!readIds.includes('foreign'));
 });
 
-async function completeReview(f: ReturnType<typeof syntheticComposition>, primary: SyntheticNativePort, review: { run: RunRecord; init: WorkerInit }, shell = false) {
-  let check: { id: string; digest: string; location: string };
-  if (shell) { await primary.emit(review, { type: 'worker.shell-request', requestId: randomUUID(), toolCallId: 'shell-template', args: ['printf synthetic-baseline'] }); const reply = primary.replies.at(-1) as { ok: boolean; value: { evidence: typeof check } }; assert.equal(reply.ok, true); check = reply.value.evidence; }
-  else check = await nativeCheck(f, primary, review);
+async function completeReview(f: ReturnType<typeof syntheticComposition>, primary: SyntheticNativePort, review: { run: RunRecord; init: WorkerInit }) {
+  const check = await nativeCheck(f, primary, review);
   await f.report(primary, review, { type: 'check', check: { id: 'pass', contentId: 'c', requirementId: 'test', status: 'passed', evidence: check, environment: 'ignored' } });
   await f.report(primary, review, { type: 'review', reviewId: 'r', contentId: 'c', evidence: pendingRef('r-evidence'), knowledgeReviewed: true, findings: [], artifactBodies: [{ id: 'r-evidence', kind: 'check-evidence', text: 'Independent verified result.' }] });
   await f.settled(primary, review); await f.production.tick();
@@ -416,8 +412,8 @@ test('unproven implementation mutations stop egress even after a legitimate cont
   assert.equal(f.calls.length, 3); assert.equal(f.store.getDemand('demand').contents.length, 0);
 });
 
-async function integrateNewBaseline(f: ReturnType<typeof syntheticComposition>, shell = false) {
-  const { primary, review } = await enterReview(f, { localCommit: true }); await completeReview(f, primary, review, shell);
+async function integrateNewBaseline(f: ReturnType<typeof syntheticComposition>) {
+  const { primary, review } = await enterReview(f, { localCommit: true }); await completeReview(f, primary, review);
   const result = f.store.getDemand('demand').activeResultId!;
   writeFileSync(join(f.repo, 'new-baseline.txt'), 'New formal capability input.'); git(f.repo, 'add', 'new-baseline.txt'); git(f.repo, 'commit', '-m', 'Synthetic formal advance');
   const sourceCommit = git(f.repo, 'rev-parse', 'HEAD'), operationId = 'baseline-integration';
@@ -459,19 +455,41 @@ test('exact controlled deletion is observed under the Worker token and supports 
   assert.equal(f.calls.length, 5);
 });
 
-test('locked Git Bash uses the native receipt lane and exact dependency files without granting runtime directories', async t => {
-  const f = syntheticComposition(t, undefined, true), { primary, review } = await enterReview(f); assert.equal(review.init.shellEnabled, true);
-  const requestId = randomUUID(); await primary.emit(review, { type: 'worker.shell-request', requestId, toolCallId: 'shell-tool', args: ['printf synthetic'] });
-  const reply = primary.replies.at(-1) as { ok: boolean; value: { evidence: { id: string; digest: string; location: string } } }; assert.equal(reply.ok, true); assert.equal(primary.shellCalls, 1);
-  const receipt = JSON.parse(f.production.evidence.read('demand', reply.value.evidence).content); assert.equal(receipt.executable, 'git-bash'); assert.deepEqual(receipt.args, ['printf synthetic']); assert.deepEqual(receipt.nativeEvidence.arguments, ['--noprofile', '--norc', '-c', 'printf synthetic']);
-  assert.ok(primary.bootstraps[0]!.readonlyRuntimeRoots.some(path => path.endsWith('runtime.dll'))); assert.ok(primary.bootstraps[0]!.readonlyRuntimeRoots.every(path => !path.endsWith('git-bash')));
+test('Host refuses shell frames and bootstraps only the exact Node/Worker files', async t => {
+  const f = syntheticComposition(t), { primary, review } = await enterReview(f);
+  assert.equal(Object.hasOwn(review.init, 'shellEnabled'), false);
+  const prior = primary.nativeCalls;
+  await assert.rejects(primary.emit(review, { type: 'worker.shell-request', requestId: randomUUID(), toolCallId: 'shell-tool', args: ['printf synthetic'] }), { code: 'SHELL_NOT_SUPPORTED' });
+  assert.equal(primary.shellCalls, 0); assert.equal(primary.nativeCalls, prior);
+  assert.equal(f.store.db.prepare('SELECT count(*) AS n FROM host_native_check_lease').get()!.n, 0);
+  for (const driver of f.drivers) for (const bootstrap of driver.bootstraps) {
+    assert.deepEqual(bootstrap.readonlyRuntimeRoots, [f.profile.node.path, f.profile.worker.path]);
+    assert.equal(Object.hasOwn(bootstrap.workerInit!, 'shellEnabled'), false);
+  }
+  await completeReview(f, primary, review);
+  assert.equal(f.store.getDemand('demand').phase, 'awaiting-acceptance');
 });
 
-test('shell-generated source mutation stops model transmission instead of becoming an approved write', async t => {
-  const f = syntheticComposition(t, undefined, true);
+test('legacy shell configuration and synthetic shell profiles cannot enable or reuse a product driver', async t => {
+  const f = syntheticComposition(t);
+  const shell = { ...f.profile.node, kind: 'git-bash' as const, manifest: { path: f.profile.helper.path, sha256: f.profile.helper.sha256 } };
+  f.configuration.runtime!.shell = { ...shell, id: 'legacy-shell', manifest: { ...shell.manifest, id: 'legacy-manifest' } };
+  let diagnostics = f.production.diagnostics('demand');
+  assert.equal(diagnostics.executionEnabled, false); assert.equal(diagnostics.profileVerified, false);
+  assert.match(diagnostics.blockers.join(' '), /SHELL_NOT_SUPPORTED/);
+  await f.production.tick(); assert.equal(f.drivers.flatMap(driver => driver.launches).length, 0);
+  f.configuration.runtime!.shell = null;
+  f.profile.shell = shell;
+  diagnostics = f.production.diagnostics('demand');
+  assert.equal(diagnostics.executionEnabled, false); assert.match(diagnostics.blockers.join(' '), /SHELL_NOT_SUPPORTED/);
+  await f.production.tick(); assert.equal(f.drivers.flatMap(driver => driver.launches).length, 0);
+});
+
+test('Node-generated source mutation stops model transmission instead of becoming an approved write', async t => {
+  const f = syntheticComposition(t);
   await assert.rejects(enterReview(f, { async beforeHandoff(primary, implementation) {
-    primary.onShellCheck = () => writeFileSync(join(f.binding.worktreePath, 'code.txt'), 'Unproven shell-generated source');
-    await primary.emit(implementation, { type: 'worker.shell-request', requestId: randomUUID(), toolCallId: 'shell-write', args: ['attempt synthetic mutation'] });
+    primary.onNodeCheck = () => writeFileSync(join(f.binding.worktreePath, 'code.txt'), 'Unproven Node-generated source');
+    await primary.emit(implementation, { type: 'worker.check-request', requestId: randomUUID(), toolCallId: 'node-write', args: ['--eval', 'synthetic mutation'] });
     assert.equal((primary.replies.at(-1) as { error: string }).error, 'UNPROVEN_SOURCE_MUTATION'); assert.equal(primary.stopped.has(implementation.run.runId), true);
   } }), /Source differs/);
   assert.equal(f.calls.length, 3); assert.equal(f.store.getDemand('demand').contents.length, 0);
@@ -484,10 +502,20 @@ test('read-approved preexisting user files never become local commit authority',
   assert.equal(f.store.getDemand('demand').contents.length, 0); assert.equal(f.store.db.prepare("SELECT count(*) AS n FROM workspace_intents WHERE kind='commit'").get()!.n, 0);
 });
 
-test('fresh baseline replay preserves the locked Git Bash recipe instead of substituting Node', async t => {
-  const f = syntheticComposition(t, () => ({ name: 'Explicit Synthetic Author', email: 'explicit@example.invalid' }), true), input = await integrateNewBaseline(f, true), calls = f.calls.length;
-  const verified = await f.production.verifyBaselineChecks(input), lane = f.drivers.at(-1)!;
-  assert.equal(lane.shellCalls, 1); assert.equal(lane.nativeCalls, 0); assert.equal(f.calls.length, calls);
-  const ref = f.production.evidence.reference('demand', verified.evidenceRefs[0]!), receipt = JSON.parse(f.production.evidence.read('demand', ref).content);
-  assert.equal(receipt.executable, 'git-bash'); assert.deepEqual(receipt.args, ['printf synthetic-baseline']); assert.equal(receipt.head, input.expectedHead); assert.equal(verified.stopped, true);
+test('fresh baseline replay rejects an authentic historical shell recipe without substituting Node', async t => {
+  const f = syntheticComposition(t, () => ({ name: 'Explicit Synthetic Author', email: 'explicit@example.invalid' })), input = await integrateNewBaseline(f), calls = f.calls.length;
+  // Install a complete legacy receipt into the synthetic historical fixture. Its
+  // immutable artifact and stored body agree, so only product scope rejects it.
+  const demand = f.store.getDemand('demand'), result = demand.results.find(result => result.id === input.templateResultId)!, check = result.E.find(check => check.id === 'pass')!;
+  const prior = f.store.db.prepare('SELECT * FROM host_native_checks WHERE artifact_id=?').get(check.evidence.id)!;
+  const body = JSON.stringify({ ...JSON.parse(String(prior.body)), executable: 'git-bash', args: ['printf synthetic-baseline'] });
+  const legacy = f.production.evidence.save({ id: 'legacy-shell-check', projectId: demand.projectId, demandId: demand.id, runId: String(prior.domain_run_id), kind: 'check-evidence', text: body });
+  f.store.db.prepare('UPDATE host_native_checks SET artifact_id=?,body=? WHERE request_id=?').run(legacy.id, body, prior.request_id);
+  check.evidence = legacy; f.store.saveDemand(demand);
+  const driverCount = f.drivers.length, nativeCalls = f.drivers.reduce((total, driver) => total + driver.nativeCalls, 0);
+  await assert.rejects(f.production.verifyBaselineChecks(input), { code: 'SHELL_NOT_SUPPORTED' });
+  assert.equal(f.drivers.length, driverCount); assert.equal(f.calls.length, calls);
+  assert.equal(f.drivers.reduce((total, driver) => total + driver.nativeCalls, 0), nativeCalls);
+  assert.equal(f.drivers.reduce((total, driver) => total + driver.shellCalls, 0), 0);
+  assert.equal(f.store.db.prepare('SELECT count(*) AS n FROM host_native_check_lease').get()!.n, 0);
 });

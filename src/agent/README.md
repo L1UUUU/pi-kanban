@@ -45,12 +45,12 @@ The brokered SDK tests use the real installed SDK and deterministic Host provide
 including a custom tool invocation, actual automatic retry with unknown earlier usage held,
 and actual compaction. They demonstrate interception/accounting, not paid model quality.
 
-## Native Worker bootstrap (source complete; Windows validation pending)
+## Native Worker bootstrap (Node-only; target Windows validation pending)
 
 `worker-main.ts` is a separate Windows x64 entry accepting only the locked native generation.
 `worker-runtime.ts` binds a fresh Pi native session ID, immutable role/material/method context,
 capability model channel, report receipts and lifecycle events. It imports no synthetic adapter.
-`controlled-tools.ts` offers bounded source read/list/write, isolated Node execution and typed
+`controlled-tools.ts` offers bounded source read/list/search/write/delete, isolated Node execution and typed
 Host reporting. Read-only roles have no source-write tool. Tool timeout/output overflow asks
 for whole-Job stop instead of claiming killing one child controls its descendants.
 
@@ -61,13 +61,14 @@ artifact hashes, private handles and actual ACL/Job evidence must pass before re
 
 ## Deliberately remaining
 
-- Validate the implemented native private-handle bootstrap end-to-end with Windows Node/Pi,
-  and collect all required isolation evidence; no in-process test substitutes for this.
+- Complete the target Windows 11 private-handle and isolation matrix. Hosted-Windows actual Node/Pi probes passed; no in-process test substitutes for target evidence.
 - Validate real provider cancellation/late billing under explicitly authorized data/spend limits.
 - Obtain actual design-feature and downstream method sources/digests.
-- Verify Windows Node/Git Bash/Pi compatibility and full role/ACL/read boundary matrix.
+- Verify the exact Node/Pi combination and full role/ACL/read boundary matrix. Bash/POSIX is excluded from the approved first product scope.
 - Run genuine planning, implementation, independent review, repair, and human acceptance.
 
 The production Windows driver stays disabled while those prerequisites are unresolved.
 The real SDK no-model tests prove assembly/lifecycle behavior only, not real model quality
 or external OS isolation.
+
+The production Worker advertises no shell tool and rejects a shell-enabled bootstrap. Native Node checks preserve source and use private scratch; edits require the mediated write/delete path. Direct JavaScript CLI entry points are applicable only when their files/dependencies are already within the authorized resources; npm scripts do not gain a shell fallback.

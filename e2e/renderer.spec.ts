@@ -176,6 +176,12 @@ test.describe('Synthetic renderer interaction coverage (not backend acceptance)'
     await observeSyntheticCommands(page);
     await page.locator('.runtime-button').click();
     const dialog = page.getByRole('dialog');
+    const support = dialog.getByRole('region', { name: '首版运行支持范围', exact: true });
+    await expect(support).toContainText('Node 原生受控工具');
+    await expect(support).toContainText('受控读写、删除、搜索、Node 测试与适用的 JavaScript CLI');
+    await expect(support).toContainText('不支持 Bash / POSIX shell、shell 脚本及依赖 shell 的 CLI');
+    await expect(support).toContainText('Windows 目标机的隔离、文件系统、进程树与网络证据仍须由 Host 核验');
+    await expect(support).toContainText('导入成功不代表执行已启用');
     await expect(dialog.getByRole('button', { name: '审阅模型与资源授权', exact: true })).toBeDisabled();
     await dialog.getByRole('button', { name: '导入运行配置', exact: true }).click();
     await expect(dialog).toContainText('已载入配置 · 版本 1');
@@ -193,6 +199,49 @@ test.describe('Synthetic renderer interaction coverage (not backend acceptance)'
     await page.screenshot({ path: testInfo.outputPath('synthetic-runtime-configuration.png'), fullPage: true });
     await page.keyboard.press('Escape');
     await expect(dialog).toHaveCount(0);
+    await expect(page.locator('.live-count')).toHaveCount(0);
+  });
+
+  test('Node-only imported metadata still requires target Windows evidence and never enables the synthetic runtime', async ({ page }) => {
+    await openPreview(page, '?runtime=node');
+    await observeSyntheticCommands(page);
+    await page.locator('.runtime-button').click();
+    const dialog = page.getByRole('dialog');
+    await dialog.getByRole('button', { name: '导入运行配置', exact: true }).click();
+    await expect(dialog).toContainText('synthetic-node-runtime');
+    const support = dialog.getByRole('region', { name: '首版运行支持范围', exact: true });
+    await expect(support).toContainText('运行配置中的 shell 必须为空');
+    await expect(support.getByRole('alert')).toHaveCount(0);
+    await expect(dialog).toContainText('合成样例未验证原生隔离、受控进程与真实模型通道');
+    await expect(dialog.locator('.diagnostics-summary')).toContainText('自主执行尚未启用');
+    await expect(dialog.getByText('当前运行组合已启用', { exact: true })).toHaveCount(0);
+    expect(await readSyntheticCommands(page)).toEqual([]);
+    await page.keyboard.press('Escape');
+    await expect(page.locator('.inspector-runtime')).toContainText('运行前置条件待准备');
+  });
+
+  test('legacy shell import stays visibly unsupported through repeated import and reopening diagnostics', async ({ page }, testInfo) => {
+    await openPreview(page, '?runtime=unsupported-shell');
+    await observeSyntheticCommands(page);
+    await page.locator('.runtime-button').click();
+    const dialog = page.getByRole('dialog');
+    for (let attempt = 0; attempt < 2; attempt++) {
+      await dialog.getByRole('button', { name: '导入运行配置', exact: true }).click();
+      await expect(dialog).toContainText('已载入配置 · 版本 1');
+      const warning = dialog.getByRole('region', { name: '首版运行支持范围', exact: true }).getByRole('alert');
+      await expect(warning).toContainText('已导入不受支持的 shell，执行受阻');
+      await expect(warning).toContainText('git-bash · /synthetic/legacy/bin/bash.exe');
+      await expect(warning).toContainText('shell 设为 null 或省略，再重新导入');
+      await expect(dialog).toContainText('合成诊断：首版 Node 运行组合不支持 shell');
+      await expect(dialog.locator('.diagnostics-summary')).toContainText('自主执行尚未启用');
+    }
+    await page.keyboard.press('Escape');
+    await expect(page.locator('.inspector-runtime')).toContainText('运行前置条件待准备');
+    await page.locator('.runtime-button').click();
+    await expect(dialog.getByRole('alert')).toContainText('已导入不受支持的 shell，执行受阻');
+    await expect(dialog.getByText('当前运行组合已启用', { exact: true })).toHaveCount(0);
+    await page.screenshot({ path: testInfo.outputPath('synthetic-unsupported-shell-diagnostics.png'), fullPage: true });
+    expect(await readSyntheticCommands(page)).toEqual([]);
     await expect(page.locator('.live-count')).toHaveCount(0);
   });
 

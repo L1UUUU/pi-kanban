@@ -51,11 +51,17 @@ const syntheticConfiguration = (): ConfigurationSummary => {
   const sha256 = 'a'.repeat(64);
   const method = (stage: 'planning' | 'implementation' | 'review') => ({ id: `synthetic-${stage}`, path: `/synthetic/methods/${stage}.md`, sha256, logicalName: stage === 'planning' ? 'design-feature' : `synthetic-${stage}`, version: 'synthetic-v1', adapter: 'synthetic-only', dependencies: [] });
   const methods = { planning: method('planning'), implementation: method('implementation'), review: method('review') };
+  const legacyShell = params.get('runtime') === 'unsupported-shell';
+  const runtime: ConfigurationSummary['configuration']['runtime'] = legacyShell || params.get('runtime') === 'node' ? {
+    profileId: 'synthetic-node-runtime', osBuild: null, arch: 'x64', node: null, helper: null, worker: null, pi: null,
+    shell: legacyShell ? { id: 'synthetic-legacy-shell', kind: 'git-bash', path: '/synthetic/legacy/bin/bash.exe', sha256, version: 'synthetic-only', manifest: { id: 'synthetic-legacy-manifest', path: '/synthetic/legacy/manifest.json', sha256 } } : null,
+    policySha256: null, evidence: { privateChannel: null, filesystem: null, processTree: null, network: null },
+  } : null;
   return {
     schemaVersion: 1, revision: 1, configurationDigest: 'b'.repeat(64), sourceStatus: 'configured', executionEnabled: false,
-    configuration: { schemaVersion: 1, revision: 1, runtime: null, methods, provider: { provider: 'synthetic-provider', modelId: 'synthetic-model', destination: 'https://synthetic-model.example.invalid/v1/responses', credentialRef: 'host:synthetic-only', contextPolicy: params.get('contextPolicy') === 'derived' ? 'approved-run-derived-v1' : 'exact-materials-only', data: [{ id: 'synthetic-demand-brief', sha256 }, { id: 'synthetic-method-material', sha256: 'c'.repeat(64) }], allowedRoles: ['planning', 'review'], limits: { maxRequests: 6, maxTokens: 12000, maxCostMicros: 1250000, currency: 'USD', expiresAt: '2099-01-01T00:00:00.000Z', meteringPolicy: 'synthetic-exact-usage' } } },
+    configuration: { schemaVersion: 1, revision: 1, runtime, methods, provider: { provider: 'synthetic-provider', modelId: 'synthetic-model', destination: 'https://synthetic-model.example.invalid/v1/responses', credentialRef: 'host:synthetic-only', contextPolicy: params.get('contextPolicy') === 'derived' ? 'approved-run-derived-v1' : 'exact-materials-only', data: [{ id: 'synthetic-demand-brief', sha256 }, { id: 'synthetic-method-material', sha256: 'c'.repeat(64) }], allowedRoles: ['planning', 'review'], limits: { maxRequests: 6, maxTokens: 12000, maxCostMicros: 1250000, currency: 'USD', expiresAt: '2099-01-01T00:00:00.000Z', meteringPolicy: 'synthetic-exact-usage' } } },
     methods: (['planning', 'implementation', 'review'] as const).map(stage => ({ stage, logicalName: methods[stage]!.logicalName, status: 'configured', source: methods[stage], snapshot: { id: methods[stage]!.id, version: 'synthetic-v1', digest: sha256, adapter: 'synthetic-only' }, dependencyCount: 0, blockers: [] })),
-    planningMethodMissing: false, provider: { status: 'configured-unapproved', blockers: [] }, runtime: { status: 'missing', blockers: ['合成样例未验证原生隔离、受控进程与真实模型通道。'] }, blockers: ['合成样例不会启用实际执行。'],
+    planningMethodMissing: false, provider: { status: 'configured-unapproved', blockers: [] }, runtime: { status: legacyShell ? 'invalid' : 'missing', blockers: [...(legacyShell ? ['合成诊断：首版 Node 运行组合不支持 shell；请清除遗留 shell 配置。'] : []), '合成样例未验证原生隔离、受控进程与真实模型通道。'] }, blockers: ['合成样例不会启用实际执行。'],
   };
 };
 const params = new URLSearchParams(location.search);

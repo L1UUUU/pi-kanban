@@ -12,6 +12,7 @@ const output = {
   node: { version: process.version, sha256: createHash('sha256').update(readFileSync(process.execPath)).digest('hex') },
   sqlite: db.prepare('SELECT sqlite_version() AS version').get().version, git,
   dependencies: Object.fromEntries(['@earendil-works/pi-coding-agent', 'electron', 'react', 'typescript', 'esbuild'].map(name => [name, { version: lock.packages[`node_modules/${name}`]?.version ?? null, integrity: lock.packages[`node_modules/${name}`]?.integrity ?? null }])),
+  supportScope: { id: 'node-native-tools-v1', shell: null, target: 'Windows 11 x64/NTFS', excluded: ['Bash/POSIX scripts and pipelines', 'system-shell npm scripts', 'arbitrary native CLI'] },
   executionEnabled: false,
   gates: { G1: 'blocked-native-isolation-verification', G2: 'partial-rule-tests-only', G3: 'blocked-real-methods-and-model-authorization', G4: 'blocked-real-remote-and-reuse-validation', G5: 'blocked-full-acceptance' },
 };

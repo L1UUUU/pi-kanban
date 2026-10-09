@@ -220,3 +220,14 @@ test('all three Windows policy variants require their own exact signed evidence'
   assert.throws(() => verifyWindowsEvidence(bytes(envelope(candidate)), expected, trust), { code: 'EVIDENCE_INAPPLICABLE' });
   assert.throws(() => verifyWindowsEvidence(bytes(envelope({ ...candidate, releaseAuthorized: false })), { ...expected, policyVariant: v3 }, trust), { code: 'EVIDENCE_INAPPLICABLE' });
 });
+
+
+test('production runtime verification rejects legacy shell profiles before platform or trust evaluation', () => {
+  const { expected } = fixture();
+  const shell = { ...binary('bash.exe'), kind: 'git-bash', manifest: { path: 'C:\\Synthetic\\shell-manifest.json', sha256: 'd'.repeat(64) } };
+  assert.throws(() => verifyWindowsRuntimeProfile({ ...expected, shell }, tmpdir(), trust), { code: 'SHELL_NOT_SUPPORTED' });
+  assert.throws(() => verifyWindowsRuntimeProfile({ ...expected, shell }, tmpdir()), { code: 'SHELL_NOT_SUPPORTED' });
+  if (process.platform !== 'win32') for (const absent of [{}, { shell: null }]) {
+    assert.throws(() => verifyWindowsRuntimeProfile({ ...expected, ...absent }, tmpdir(), trust), { code: 'WINDOWS_PROFILE_REQUIRED' });
+  }
+});

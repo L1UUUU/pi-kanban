@@ -20,7 +20,8 @@ export interface WorkerInit {
   limits:{maxFileBytes:number;commandTimeoutMs:number;maxOutputBytes:number};
   /** Host-only local validation lane. No Agent session or model operation exists. */
   checkOnly?:true;
-  shellEnabled?:boolean;
+  /** Legacy false is accepted; a shell-enabled bootstrap is always rejected. */
+  shellEnabled?:false;
   /** Private Host assertion delivered only after verified native launch, not model data. */
   workspaceCapability?:NativePinnedWorkspace;
 }
@@ -32,7 +33,7 @@ export function validateWorkerInit(input:unknown,generation:string):WorkerInit{
   for(const field of ['runId','demandId','domainRunId','workspace','scratch','sessionDir','sessionId','prompt'] as const)if(typeof value[field]!=='string'||!value[field]||value[field].length>100000)throw new RuntimeError('WORKER_BOOTSTRAP_INVALID','Explicit run/context fields required');
   if(!/^[a-f0-9]{64}$/.test(value.capability)||!Array.isArray(value.materials)||!value.limits)throw new RuntimeError('WORKER_BOOTSTRAP_INVALID','Private capability and limits required');
   if(value.checkOnly!==undefined&&(value.checkOnly!==true||value.role!=='check'))throw new RuntimeError('WORKER_BOOTSTRAP_INVALID','Check-only bootstrap requires the bounded check role');
-  if(value.shellEnabled!==undefined&&typeof value.shellEnabled!=='boolean')throw new RuntimeError('WORKER_BOOTSTRAP_INVALID','Invalid locked shell capability');
+  if(value.shellEnabled!==undefined&&value.shellEnabled!==false)throw new RuntimeError('SHELL_NOT_SUPPORTED','The Node-only Worker cannot enable a shell tool');
   if(value.workspaceCapability!==undefined){const cap=value.workspaceCapability;if(!cap||typeof cap!=='object'||cap.version!==1||cap.kind!=='native-pinned-workspace'||cap.path!==value.workspace||cap.generation!==generation||Object.keys(cap).sort().join(',')!=='generation,kind,path,version')throw new RuntimeError('WORKER_BOOTSTRAP_INVALID','Native workspace capability does not match the private run');}
   for(const key of ['maxFileBytes','commandTimeoutMs','maxOutputBytes'] as const){const limit=value.limits[key];if(!Number.isSafeInteger(limit)||limit<1)throw new RuntimeError('FINITE_POLICY_REQUIRED','Worker limits must be finite');}return value;
 }
@@ -67,12 +68,6 @@ export async function runWorkerFromStreams(input:Readable,output:Writable,expect
       send({version:1,type:'worker.report',runtimeRunId:boot.runId,generation:boot.generation,capability:boot.capability,report:bound});return reply;
     };
     const tools=controlledTools({workspace:boot.workspace,scratch:boot.scratch,role:boot.role,generation:boot.generation,workspaceCapability:boot.workspaceCapability,...boot.limits,report,
-      shell:boot.shellEnabled?async(toolCallId,command,signal)=>{
-        signal?.throwIfAborted();const requestId=randomUUID(),reply=new Promise<unknown>((resolve,reject)=>{pending.set(requestId,{resolve,reject});});
-        const abort=()=>{pending.get(requestId)?.reject(new RuntimeError('CHECK_ABORTED','Shell check canceled; Host retains its actual receipt and lease'));pending.delete(requestId);send({version:1,type:'worker.stop-required',runId:boot.runId,generation:boot.generation,capability:boot.capability,reason:'shell-check-aborted'});};signal?.addEventListener('abort',abort,{once:true});
-        send({version:1,type:'worker.shell-request',runId:boot.runId,generation:boot.generation,capability:boot.capability,requestId,toolCallId,args:[command]});
-        try{const value=await reply;if(!value||typeof value!=='object'||typeof(value as Record<string,unknown>).output!=='string')throw new RuntimeError('NATIVE_CHECK_INVALID','Host shell result is malformed');return value as {output:string;exitCode:number|null;[key:string]:unknown};}finally{signal?.removeEventListener('abort',abort);}
-      }:undefined,
       write:async(toolCallId,path,content,perform)=>{
         const requestId=randomUUID();const exchange=(type:string,body:Record<string,unknown>)=>{const response=new Promise<unknown>((resolve,reject)=>pending.set(requestId,{resolve,reject}));send({version:1,type,runId:boot.runId,generation:boot.generation,capability:boot.capability,requestId,...body});return response;};
         try{await exchange('worker.write-request',{action:'write',toolCallId,path,sha256:createHash('sha256').update(content).digest('hex'),bytes:Buffer.byteLength(content)});perform();await exchange('worker.write-complete',{});}

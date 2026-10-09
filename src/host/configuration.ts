@@ -6,7 +6,7 @@ import type { Methods, MethodSnapshot, Stage } from '../domain/types.ts';
 import type { ModelGrant } from '../runtime/budget.ts';
 import { RuntimeError } from '../runtime/types.ts';
 import type { RuntimeRole } from '../runtime/types.ts';
-import { readLockedShellManifest } from '../runtime/shell-profile.ts';
+import { assertNodeOnlyRuntime } from '../runtime/profile.ts';
 import type { WindowsRuntimePolicyVariant } from '../runtime/profile.ts';
 
 export const CONFIGURATION_SCHEMA_VERSION = 1;
@@ -23,7 +23,7 @@ export interface RuntimeConfiguration {
   profileId: string; osBuild: string | null; arch: 'x64' | null;
   node: RuntimeFileReference | null; helper: RuntimeFileReference | null; worker: RuntimeFileReference | null;
   pi: (RuntimeFileReference & { package: '@earendil-works/pi-coding-agent' }) | null;
-  /** Older schema-v1 documents may omit shell; parsing always normalizes it to null. */
+  /** Legacy metadata round-trips for explicit removal. Non-null shells block the Node-only product. */
   shell?: ShellConfiguration | null;
   /** Omission selects the strict policy only; alternate capabilities require explicit input. */
   policyVariant?: WindowsRuntimePolicyVariant;
@@ -324,7 +324,7 @@ function runtimeGaps(runtime: RuntimeConfiguration | null): string[] {
     else try { checkedFile(file, 256 * 1024 * 1024); } catch (error) { blockers.push(`runtime.${key}: ${errorText(error)}`); }
   }
   if (runtime.shell) {
-    try { readLockedShellManifest(runtime.shell); } catch (error) { blockers.push(`runtime.shell: ${errorText(error)}`); }
+    try { assertNodeOnlyRuntime(runtime); } catch (error) { blockers.push(`runtime.shell: ${errorText(error)}`); }
   }
   for (const [kind, reference] of Object.entries(runtime.evidence)) {
     if (!reference) blockers.push(`runtime.evidence.${kind} is missing.`);
@@ -348,12 +348,12 @@ export function inspectConfiguration(configuration: WorkbenchConfiguration, sour
 /** Maps input to the independent native verifier. No self-attested flags are introduced. */
 export function runtimeProfileInput(configuration: WorkbenchConfiguration) {
   const runtime = parseConfiguration(configuration).runtime;
+  if (runtime) assertNodeOnlyRuntime(runtime);
   if (!runtime || !runtime.osBuild || !runtime.arch || !runtime.node || !runtime.helper || !runtime.worker || !runtime.pi || !runtime.policySha256 || Object.values(runtime.evidence).some(ref => !ref)) fail('RUNTIME_CONFIGURATION_MISSING', 'All exact runtime bindings and evidence references are required.');
   const binary = (ref: RuntimeFileReference) => ({ path: ref.path, version: ref.version, sha256: ref.sha256 });
   return { profileId: runtime.profileId, osBuild: runtime.osBuild, arch: runtime.arch,
     node: binary(runtime.node), helper: binary(runtime.helper), worker: binary(runtime.worker),
     pi: { ...binary(runtime.pi), package: runtime.pi.package }, policyVariant: runtime.policyVariant ?? 'lpac-strict-v1', policySha256: runtime.policySha256,
-    ...(runtime.shell ? { shell: { ...binary(runtime.shell), kind: runtime.shell.kind, manifest: { path: runtime.shell.manifest.path, sha256: runtime.shell.manifest.sha256 } } } : {}),
     evidence: Object.values(runtime.evidence).map(ref => ({ ...ref! })),
   };
 }
