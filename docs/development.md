@@ -25,23 +25,24 @@ cmake -S native/windows -B build/native -A x64
 cmake --build build/native --config Release
 ctest --test-dir build/native -C Release --output-on-failure
 npm run build
-node native/windows/probe-worker.mjs --helper build/native/Release/pi_kanban_native_helper.exe --worker dist/worker/main.mjs --policy appcontainer-no-network-v3 --git-bash "C:\Program Files\Git" --output artifacts/windows-worker
+node native/windows/probe-worker.mjs --helper build/native/Release/pi_kanban_native_helper.exe --worker dist/worker/main.mjs --policy lpac-registry-read-no-network-v2 --git-bash "C:\Program Files\Git" --output artifacts/windows-worker
 ```
 
 The native smoke manages unique temporary synthetic identities/resources. Preserve `build/native/Testing/Temporary/LastTest.log` including failures. Do not install a new backend or disable failed negative cases to make the suite green. The product targets Windows 11 x64/NTFS; hosted Windows Server CI is useful partial Win32 evidence, not proof of that target combination.
 
-The command explicitly selects the original AppContainer/Job primary candidate,
-with no network capability and no ancestor/root ACL grants. It is compared with
-the optional LPAC variants; it does not replace the strict configuration default
-after a failed launch. The zero-capability LPAC candidate failed real Node
-Winsock startup. Its registry-read diagnostic variant passed Winsock but exposed
-root-metadata access and startup-cost problems; it is not a usable release
-profile. All policies are identified separately in observations;
-network denial requires successful Winsock initialization followed by an actual
-denied connection to a listening fixture. A failed Winsock startup is an unusable
-candidate, not proof of network isolation. Policy changes are part of the signed
-runtime identity and require new evidence. These no-model probes cannot authorize
-production execution or satisfy the real-model quality gates.
+The command explicitly selects the revised registry-read LPAC diagnostic candidate,
+with no network capability and no ancestor/root ACL grants. The strict configuration
+default is unchanged. Its earlier metadata-grant experiment has been removed; fixed
+Node startup flags and the exact native-pinned workspace bootstrap now avoid requiring
+those grants. This candidate remains unverified until the actual probe succeeds.
+Ordinary AppContainer's inconclusive loopback result stays visible in its unchanged
+CTest negative case; zero-capability LPAC failed real Node Winsock startup.
+All policies are identified separately in observations. Network denial requires
+successful Winsock initialization and an explicit access-denied socket creation or
+completed connection; startup failure, a pending connection and timeout are not
+denial proof. Policy changes are part of the signed runtime identity and require new
+evidence. These no-model probes cannot authorize production execution or satisfy
+the real-model quality gates.
 
 `--git-bash` selects an existing official Git for Windows installation explicitly;
 adjust the example path to the actual installation. The recorder copies a bounded

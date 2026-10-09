@@ -11,6 +11,7 @@ import { FramedPiModelChannel } from '../runtime/pi-channel.ts';
 import { PrivateModelPipeClient,PrivateFrameDecoder,encodePrivateFrame } from '../runtime/pipe-frames.ts';
 import type { ProviderResponse } from '../runtime/model-broker.ts';
 import { controlledTools } from './controlled-tools.ts';
+import type { NativePinnedWorkspace } from './controlled-tools.ts';
 
 export interface WorkerInit {
   version:1;type:'worker.init';runId:string;generation:string;demandId:string;domainRunId:string;domainGeneration:number;
@@ -20,6 +21,8 @@ export interface WorkerInit {
   /** Host-only local validation lane. No Agent session or model operation exists. */
   checkOnly?:true;
   shellEnabled?:boolean;
+  /** Private Host assertion delivered only after verified native launch, not model data. */
+  workspaceCapability?:NativePinnedWorkspace;
 }
 const reportTypes=new Set(['plan-draft','plan-ready','content-ready','check','review','dispute','resolve-finding','blocked','message-delivered','message-applied','runtime-ended']);
 export function validateWorkerInit(input:unknown,generation:string):WorkerInit{
@@ -30,6 +33,7 @@ export function validateWorkerInit(input:unknown,generation:string):WorkerInit{
   if(!/^[a-f0-9]{64}$/.test(value.capability)||!Array.isArray(value.materials)||!value.limits)throw new RuntimeError('WORKER_BOOTSTRAP_INVALID','Private capability and limits required');
   if(value.checkOnly!==undefined&&(value.checkOnly!==true||value.role!=='check'))throw new RuntimeError('WORKER_BOOTSTRAP_INVALID','Check-only bootstrap requires the bounded check role');
   if(value.shellEnabled!==undefined&&typeof value.shellEnabled!=='boolean')throw new RuntimeError('WORKER_BOOTSTRAP_INVALID','Invalid locked shell capability');
+  if(value.workspaceCapability!==undefined){const cap=value.workspaceCapability;if(!cap||typeof cap!=='object'||cap.version!==1||cap.kind!=='native-pinned-workspace'||cap.path!==value.workspace||cap.generation!==generation||Object.keys(cap).sort().join(',')!=='generation,kind,path,version')throw new RuntimeError('WORKER_BOOTSTRAP_INVALID','Native workspace capability does not match the private run');}
   for(const key of ['maxFileBytes','commandTimeoutMs','maxOutputBytes'] as const){const limit=value.limits[key];if(!Number.isSafeInteger(limit)||limit<1)throw new RuntimeError('FINITE_POLICY_REQUIRED','Worker limits must be finite');}return value;
 }
 /** Actual Worker bootstrap. The executable wrapper only invokes this on native Windows.
@@ -62,7 +66,7 @@ export async function runWorkerFromStreams(input:Readable,output:Writable,expect
       const reply=new Promise((resolve,reject)=>{pending.set(requestId,{resolve,reject});});
       send({version:1,type:'worker.report',runtimeRunId:boot.runId,generation:boot.generation,capability:boot.capability,report:bound});return reply;
     };
-    const tools=controlledTools({workspace:boot.workspace,scratch:boot.scratch,role:boot.role,...boot.limits,report,
+    const tools=controlledTools({workspace:boot.workspace,scratch:boot.scratch,role:boot.role,generation:boot.generation,workspaceCapability:boot.workspaceCapability,...boot.limits,report,
       shell:boot.shellEnabled?async(toolCallId,command,signal)=>{
         signal?.throwIfAborted();const requestId=randomUUID(),reply=new Promise<unknown>((resolve,reject)=>{pending.set(requestId,{resolve,reject});});
         const abort=()=>{pending.get(requestId)?.reject(new RuntimeError('CHECK_ABORTED','Shell check canceled; Host retains its actual receipt and lease'));pending.delete(requestId);send({version:1,type:'worker.stop-required',runId:boot.runId,generation:boot.generation,capability:boot.capability,reason:'shell-check-aborted'});};signal?.addEventListener('abort',abort,{once:true});

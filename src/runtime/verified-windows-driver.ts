@@ -104,7 +104,10 @@ export class VerifiedWindowsDriver implements RuntimeDriver {
       policyEvidence:config.policySha256,aclEvidence:boot.aclEvidence,privateChannelEvidence:boot.privateChannelEvidence,timeoutMs:run.timeoutMs,processLimit:boot.processLimit,memoryLimitBytes:boot.memoryLimitBytes,outputLimitBytes:run.maxOutputBytes,resourceAuthorizationId:boot.resourceAuthorizationId,readonlyRuntimeRoots:[...new Set([...boot.readonlyRuntimeRoots,...(shell?.files.map(file=>file.path)??[])])],shellExecutable:config.shell?.path??'',shellRootPath:shell?.rootPath??'',shellSha256:config.shell?.sha256??'',shellFiles:shell?.files??[],diskLimitBytes:boot.diskLimitBytes,fileLimit:boot.fileLimit,minimumFreeBytes:boot.minimumFreeBytes,diskPollMs:boot.diskPollMs});
     await this.wait(control,()=>!!control.identity||!!control.observation,10000);
     if(!control.identity||!control.resources.provisioned)throw new RuntimeError('NATIVE_LAUNCH_UNCONFIRMED',control.observation?.proof??'Native launch has no confirmed process identity');
-    this.sendWorkerFrame(run.runId,boot.workerInit);return control.identity;
+    // This assertion is emitted by the verified driver only after the native
+    // identity, policy-access proof and exact resource provisioning match. Never
+    // trust a caller-provided capability or fall back after a Worker path error.
+    this.sendWorkerFrame(run.runId,{...boot.workerInit,workspace:run.workspace,generation:run.generation,workspaceCapability:{version:1,kind:'native-pinned-workspace',path:run.workspace,generation:run.generation}});return control.identity;
     }catch(error){
       // The exact helper may still finish a delayed launch. Queue stop and close
       // only its authenticated control pipe; native EOF owns zero/revoke proof.

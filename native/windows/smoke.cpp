@@ -137,6 +137,8 @@ int ProbeChild() {
     }
     closesocket(socket_value);
   }
+  const bool socket_denied=sockets_ok&&socket_value==INVALID_SOCKET&&network_error==WSAEACCES;
+  const bool network_denied=sockets_ok&&(socket_denied||(network_completed&&network_error==WSAEACCES));
   if (sockets_ok) WSACleanup();
   std::wstring command = L"\"" + Self() + L"\" --descendant \"" + (root/L"scratch"/L"child-heartbeat.txt").wstring() + L"\"";
   STARTUPINFOW startup{}; startup.cb=sizeof(startup); PROCESS_INFORMATION spawned{};
@@ -146,10 +148,10 @@ int ProbeChild() {
   PROCESS_INFORMATION escape{};const bool escaped=!!CreateProcessW(Self().c_str(),command.data(),nullptr,nullptr,FALSE,CREATE_NO_WINDOW|CREATE_BREAKAWAY_FROM_JOB,nullptr,nullptr,&startup,&escape);
   const DWORD breakaway_error=escaped?0:GetLastError();
   if(escaped){TerminateProcess(escape.hProcess,1);CloseHandle(escape.hThread);CloseHandle(escape.hProcess);}
-  const bool expected=own_read&&(own_write==(role==L"implementation"))&&!other_read&&!db_read&&!git_read&&!env_leak&&!registry_leak&&(policy==L"strict"||(sockets_ok&&network_completed&&network_error==WSAEACCES))&&!network&&!escaped;
+  const bool expected=own_read&&(own_write==(role==L"implementation"))&&!other_read&&!db_read&&!git_read&&!env_leak&&!registry_leak&&(policy==L"strict"||network_denied)&&!network&&!escaped;
   std::ostringstream report;report<<"{\"phase\":\"native-child-probes\",\"role\":\""<<(role==L"implementation"?"implementation":"review")<<"\",\"ownRead\":"<<own_read<<",\"ownWrite\":"<<own_write
     <<",\"otherRead\":"<<other_read<<",\"hostDbRead\":"<<db_read<<",\"sharedGitRead\":"<<git_read<<",\"hostRegistryRead\":"<<registry_leak<<",\"hostRegistryStatus\":"<<registry_status<<",\"environmentLeak\":"<<env_leak<<",\"loopbackConnected\":"<<network
-    <<",\"networkCompleted\":"<<network_completed<<",\"networkSelectStatus\":"<<network_select_status<<",\"networkError\":"<<network_error<<",\"policy\":\""<<(policy==L"registry-read"?"registry-read":policy==L"appcontainer"?"appcontainer":"strict")<<"\",\"networkDenialProven\":"<<(sockets_ok&&network_completed&&!network&&network_error==WSAEACCES)<<",\"wsaStartupError\":"<<wsa_startup_error<<",\"childSpawned\":"<<spawned_child<<",\"childSpawnError\":"<<child_spawn_error<<",\"breakawaySucceeded\":"<<escaped<<",\"breakawayError\":"<<breakaway_error<<",\"readError\":"<<e_read<<",\"writeError\":"<<e_write<<",\"crossReadError\":"<<e_other<<",\"passed\":"<<expected<<"}\n";
+    <<",\"socketCreationDenied\":"<<socket_denied<<",\"networkCompleted\":"<<network_completed<<",\"networkSelectStatus\":"<<network_select_status<<",\"networkError\":"<<network_error<<",\"policy\":\""<<(policy==L"registry-read"?"registry-read":policy==L"appcontainer"?"appcontainer":"strict")<<"\",\"networkDenialProven\":"<<(!network&&network_denied)<<",\"wsaStartupError\":"<<wsa_startup_error<<",\"childSpawned\":"<<spawned_child<<",\"childSpawnError\":"<<child_spawn_error<<",\"breakawaySucceeded\":"<<escaped<<",\"breakawayError\":"<<breakaway_error<<",\"readError\":"<<e_read<<",\"writeError\":"<<e_write<<",\"crossReadError\":"<<e_other<<",\"passed\":"<<expected<<"}\n";
   const auto text=report.str();DWORD written=0;Require(!!WriteFile(GetStdHandle(STD_OUTPUT_HANDLE),text.data(),static_cast<DWORD>(text.size()),&written,nullptr),"private report");
   Heartbeat(root/L"scratch"/L"parent-heartbeat.txt"); return 0;
 }

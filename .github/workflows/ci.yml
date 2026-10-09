@@ -56,9 +56,9 @@ jobs:
         run: cmake --build build/native --config Release
       - name: Run real Win32 smoke probes
         run: ctest --test-dir build/native -C Release --output-on-failure
-      - name: Exercise explicit AppContainer no-network candidate with real Node and bundled Pi
+      - name: Exercise explicit registry-read LPAC candidate with real Node and bundled Pi
         if: ${{ !cancelled() && steps.bundle.outcome == 'success' && steps.native-build.outcome == 'success' }}
-        run: node native/windows/probe-worker.mjs --helper build/native/Release/pi_kanban_native_helper.exe --worker dist/worker/main.mjs --policy appcontainer-no-network-v3 --git-bash "C:\Program Files\Git" --output artifacts/windows-worker
+        run: node native/windows/probe-worker.mjs --helper build/native/Release/pi_kanban_native_helper.exe --worker dist/worker/main.mjs --policy lpac-registry-read-no-network-v2 --git-bash "C:\Program Files\Git" --output artifacts/windows-worker
       - uses: actions/upload-artifact@v4
         if: always()
         with:

@@ -23,7 +23,7 @@ const policyVariant = options.get('--policy') ?? 'lpac-strict-v1';
 assert.ok(['lpac-strict-v1', 'lpac-registry-read-no-network-v2', 'appcontainer-no-network-v3'].includes(policyVariant));
 const outputDirectory = options.get('--output') ?? resolve('artifacts/windows-worker');
 mkdirSync(outputDirectory, { recursive: true });
-const root = realpathSync(mkdtempSync(join(tmpdir(), 'pi-kanban-worker-')));
+const root = realpathSync.native(mkdtempSync(join(tmpdir(), 'pi-kanban-worker-')));
 const nodeRoot = join(root, 'runtime-node'), workerRoot = join(root, 'runtime-worker');
 const nodePath = join(nodeRoot, 'node.exe'), bundledWorker = join(workerRoot, 'main.mjs');
 for (const folder of [nodeRoot, workerRoot, join(root, 'other'), join(root, 'host')]) mkdirSync(folder);
@@ -108,7 +108,7 @@ async function runPiRole(role, workspaceOverride) {
   assert.equal(run.event('native.started').policyAccessVerified, true); assert.equal(run.event('native.started').allApplicationPackagesReadable, policyVariant === 'appcontainer-no-network-v3');
   const capability = randomBytes(32).toString('hex'), sessionId = `session-${randomUUID()}`, runId = `runtime-${randomUUID()}`;
   const args = ['-e', accessProgram(run, role)];
-  const init = { version: 1, type: 'worker.init', runId, generation: run.generation, demandId: 'probe', domainRunId: 'domain-probe', domainGeneration: 1, role, workspace: run.workspace, scratch: run.scratch, sessionDir: run.sessionDir, sessionId, capability, prompt: 'Execute only deterministic fixture instructions through the private Host channel.', materials: [],
+  const init = { version: 1, type: 'worker.init', runId, generation: run.generation, demandId: 'probe', domainRunId: 'domain-probe', domainGeneration: 1, role, workspace: run.workspace, workspaceCapability: { version: 1, kind: 'native-pinned-workspace', path: run.workspace, generation: run.generation }, scratch: run.scratch, sessionDir: run.sessionDir, sessionId, capability, prompt: 'Execute only deterministic fixture instructions through the private Host channel.', materials: [],
     model: { provider: 'fixture', id: 'deterministic', contextWindow: 32768, maxTokens: 128 }, compaction: { enabled: false, reserveTokens: 1024, keepRecentTokens: 64 }, retry: { enabled: false, maxRetries: 0, baseDelayMs: 1 }, limits: { maxFileBytes: 65536, commandTimeoutMs: 10000, maxOutputBytes: 65536 } };
   run.send({ type: 'worker-input', payload: init });
   let cursor = 0, models = 0, reports = 0, checkReceipt, checkRequest, ready = false, settled = false;

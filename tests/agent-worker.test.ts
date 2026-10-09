@@ -97,3 +97,19 @@ test('native workspace canonicalization keeps real file reads scoped and rejects
   await assert.rejects(write.execute('denied-write',{path:'escape/new.txt',content:'denied'},undefined,undefined,{} as never),{code:'TOOL_PATH_DENIED'});
   assert.equal(writes,0);assert.equal(existsSync(join(outside,'new.txt')),false);assert.equal(readFileSync(join(outside,'private.txt'),'utf8'),'private sibling');
 });
+
+
+test('private native workspace capability binds exact path and generation without a path-error fallback',async t=>{
+  const f=fixture();t.after(()=>rmSync(f.root,{recursive:true,force:true}));const workspace=realpathSync.native(f.workspace),generation='synthetic-native-generation';
+  writeFileSync(join(workspace,'allowed.txt'),'explicit pinned fixture');symlinkSync(f.root,join(workspace,'escape'),'junction');
+  const capability={version:1 as const,kind:'native-pinned-workspace' as const,path:workspace,generation};
+  const options={workspace,scratch:f.scratch,role:'review' as const,generation,workspaceCapability:capability,maxFileBytes:1024,commandTimeoutMs:1000,maxOutputBytes:1024,report:async()=>({}),stopRequired:()=>{}};
+  const read=controlledTools(options).find(tool=>tool.name==='controlled_read')!;
+  assert.equal((await read.execute('read',{path:'allowed.txt'},undefined,undefined,{} as never)).content[0]?.type,'text');
+  await assert.rejects(read.execute('escape',{path:'escape/outside'},undefined,undefined,{} as never),{code:'TOOL_PATH_DENIED'});
+  for(const bad of [{...capability,path:f.scratch},{...capability,generation:'different'},{...capability,version:2},{...capability,kind:'asserted-by-model'},{...capability,unchecked:true},null])
+    assert.throws(()=>controlledTools({...options,workspaceCapability:bad as never}),{code:'WORKSPACE_CAPABILITY_INVALID'});
+  const init={...boot(),workspace,generation,workspaceCapability:capability};assert.equal(validateWorkerInit(init,generation).workspaceCapability,capability);
+  for(const bad of [{...capability,path:f.scratch},{...capability,generation:'different'},{...capability,kind:'asserted-by-model'},{...capability,unchecked:true},null])
+    assert.throws(()=>validateWorkerInit({...init,workspaceCapability:bad},generation),{code:'WORKER_BOOTSTRAP_INVALID'});
+});

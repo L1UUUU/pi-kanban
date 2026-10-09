@@ -5,16 +5,22 @@ import { resolve,relative,isAbsolute,dirname } from 'node:path';
 import type { RuntimeRole } from '../runtime/types.ts';
 import { RuntimeError } from '../runtime/types.ts';
 import { controlledReportParameters } from './report-contract.ts';
+export interface NativePinnedWorkspace { version:1;kind:'native-pinned-workspace';path:string;generation:string }
 /** Defense-in-depth tool paths; the external AppContainer/Job is the security boundary. */
 export function controlledTools(options:{workspace:string;scratch:string;role:RuntimeRole;maxFileBytes:number;commandTimeoutMs:number;maxOutputBytes:number;
+  generation?:string;workspaceCapability?:NativePinnedWorkspace;
   report:(body:Record<string,unknown>)=>Promise<unknown>;stopRequired:(reason:string)=>void;
   write?:(toolCallId:string,path:string,content:string,perform:()=>void)=>Promise<void>;
   delete?:(toolCallId:string,path:string,perform:()=>void)=>Promise<void>;
   shell?:(toolCallId:string,command:string,signal:AbortSignal|undefined)=>Promise<{output:string;exitCode:number|null;[key:string]:unknown}>;
   check?:(toolCallId:string,args:string[],signal:AbortSignal|undefined)=>Promise<{output:string;exitCode:number|null;[key:string]:unknown}>}):ToolDefinition[]{
-  // Native canonicalization opens the selected path directly on Windows rather
-  // than requiring metadata permission on every volume-root ancestor. No fallback.
-  const root=realpathSync.native(options.workspace);
+  // The private Host may provide this only after native exact-path pinning and
+  // launch proof. It is an explicit alternative contract, never an error fallback.
+  const capability=options.workspaceCapability;
+  if(capability!==undefined&&(!capability||typeof capability!=='object'||Array.isArray(capability)||typeof options.generation!=='string'||!options.generation||capability.version!==1||capability.kind!=='native-pinned-workspace'||capability.path!==options.workspace||capability.generation!==options.generation||!isAbsolute(capability.path)||resolve(capability.path)!==capability.path||Object.keys(capability).sort().join(',')!=='generation,kind,path,version'))
+    throw new RuntimeError('WORKSPACE_CAPABILITY_INVALID','Exact native-pinned workspace and generation are required');
+  const root=capability?capability.path:realpathSync.native(options.workspace);
+  const rootStat=lstatSync(root);if(!rootStat.isDirectory()||rootStat.isSymbolicLink())throw new RuntimeError('TOOL_PATH_DENIED','Selected workspace must remain the pinned ordinary directory');
   function path(input:string,write=false){
     if(typeof input!=='string'||!input||isAbsolute(input)||input.split(/[\\/]/).some(x=>x==='..'||x==='.git'||x==='.local'))throw new RuntimeError('TOOL_PATH_DENIED','Only approved relative source paths are allowed');
     const target=resolve(root,input),rel=relative(root,target);if(rel.startsWith('..')||isAbsolute(rel))throw new RuntimeError('TOOL_PATH_DENIED','Outside source workspace');

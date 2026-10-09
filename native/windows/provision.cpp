@@ -111,19 +111,15 @@ DWORD ScopedResources::Provision(const LaunchDescriptor& d,const std::vector<std
   if((error=grant(d.scratch,FILE_ALL_ACCESS,GRANT_ACCESS,true)))return error;
   for(const auto* name:{L".git",L".local"}){const auto internal=(fs::path(d.workspace)/name).wstring();if(GetFileAttributesW(internal.c_str())!=INVALID_FILE_ATTRIBUTES&&
       (error=grant(internal,FILE_ALL_ACCESS,DENY_ACCESS,true)))return error;}
-  // Ordinary AppContainer v3 relies on the OS's existing metadata/traverse policy.
-  // Do not edit ancestors or the volume root, request elevation, or fall back.
-  if(d.policy_variant==L"appcontainer-no-network-v3")return ERROR_SUCCESS;
-  // Node realpath requires metadata on exact ancestor directories, including the
-  // drive root. This is explicit candidate-v2 policy only: no listing, contents,
-  // inheritance or writes. Strict-v1 keeps its previous traverse-only scope.
-  const bool ancestor_metadata=d.policy_variant==L"lpac-registry-read-no-network-v2";
-  const DWORD ancestor_rights=FILE_TRAVERSE|(ancestor_metadata?FILE_READ_ATTRIBUTES:0);
+  // Revised v2 and ordinary v3 do not edit existing ancestors or volume roots.
+  // Native pins + fixed Node module flags + explicit private workspace capability
+  // replace the failed metadata-grant experiment; there is no policy fallback.
+  if(d.policy_variant!=L"lpac-strict-v1")return ERROR_SUCCESS;
+  // Legacy strict scope is unchanged: traverse only, excluding the drive root.
   std::vector<std::wstring> roots=readonly_roots;roots.push_back(d.workspace);roots.push_back(d.scratch);
-  for(const auto& root:roots){auto parent=fs::path(root).parent_path();while(!parent.empty()){
-    if(parent==parent.root_path()&&!ancestor_metadata)break;
-    if(std::find(changed_.begin(),changed_.end(),parent.wstring())==changed_.end()&&(error=grant(parent.wstring(),ancestor_rights,GRANT_ACCESS,false))){RecordFailure("ancestor-grant",parent.wstring(),error);return error;}
-    if(parent==parent.root_path())break;parent=parent.parent_path();}}
+  for(const auto& root:roots){auto parent=fs::path(root).parent_path();while(parent!=parent.root_path()&&!parent.empty()){
+    if(std::find(changed_.begin(),changed_.end(),parent.wstring())==changed_.end()&&(error=grant(parent.wstring(),FILE_TRAVERSE,GRANT_ACCESS,false))){RecordFailure("ancestor-grant",parent.wstring(),error);return error;}
+    parent=parent.parent_path();}}
   return ERROR_SUCCESS;
 }
 DWORD ScopedResources::Revoke(){

@@ -237,20 +237,13 @@ separate `neverCreated` state when CreateProcess never succeeded and scoped perm
 were revoked. A missing PID does not imply either state. Late native launch before Host
 registration and pre-creation reparse rejection both have explicit recovery probes.
 
-The explicit registry-only diagnostic candidate also grants only READ_ATTRIBUTES and
-TRAVERSE to exact runtime/source/scratch ancestor directories, including their volume
-roots, with no inheritance, directory listing, file content or write rights. Node 24
-otherwise failed during entry-point realpath with `EPERM lstat C:\`. Strict-v1 keeps its
-original traverse-only grants. The recorder requires metadata lookup to succeed while
-listing those ancestors, adjacent file reads and all existing private-resource reads
-remain denied. Every grant is generation-specific and revoked under the shared mutex;
-bounded native cleanup failures report their precise phase, path and Win32 status.
-
-This metadata diagnostic can require WRITE_DAC on existing ancestors/volume roots, which
-ordinary desktop users may not possess. An unavailable grant is a recorded startup failure;
-there is no elevation, broad-principal ACL change or silent policy fallback. Until this is
-validated on supported non-elevated Windows 11 accounts, it is not a usable production
-profile. The expanded CI is an explicitly selected synthetic compatibility experiment.
+A previous registry-only metadata experiment granted READ_ATTRIBUTES/TRAVERSE to exact
+ancestors and a volume root. It timed out during Windows ACL propagation and required
+WRITE_DAC that ordinary users may not have. Those grants have been removed from v2;
+revised v2 and ordinary v3 perform no ancestor or volume-root ACL edits. The failed
+experiment remains evidence of incompatibility, never authorization for the revised
+artifact. Strict-v1 retains only its original traverse-only scope. Bounded native cleanup
+failures continue to report precise phase, path and Win32 status.
 
 Revocation filters only this generated SID's allow/deny ACEs from the current ACL,
 copying all unrelated entries, order and flags unchanged. It does not rely on Win32
@@ -334,7 +327,36 @@ Both primary Worker and native-mediated Node commands now use fixed Node 24
 `--preserve-symlinks --preserve-symlinks-main` flags after native component pinning and
 reparse rejection. This avoids the module loader's redundant volume-root realpath walk;
 it grants no filesystem permission and introduces no path fallback. Controlled tools use
-`fs.realpathSync.native` for actual selected-workspace canonicalization. Per-ancestor
+`fs.realpathSync.native` for direct/in-process assembly, or the explicit private native
+workspace capability described below for actual contained Workers. Per-ancestor
 metadata availability is recorded rather than assuming the rejected v2 root grant exists;
 all ancestor-directory listing, adjacent/private file, Git and Host denials remain mandatory.
 https://github.com/nodejs/node/blob/v24.x/doc/api/cli.md#--preserve-symlinks-main
+
+
+## Explicit pinned workspace handoff and bounded final candidate attempt
+
+The verified Host driver supplies `{version:1,kind:"native-pinned-workspace",path,generation}`
+only after matching native process/policy/provisioning proof. It overwrites any caller
+capability with the exact launched path and generation. The helper has already rejected
+reparse components and keeps no-write/no-delete-share directory handles open. The Worker
+checks the exact capability shape/path/generation and ordinary directory status, then
+uses that path with unchanged lexical containment, role checks, and per-component junction
+rejection. There is no catch-and-use-raw-path fallback after failed canonicalization.
+Workers without this private assertion still require actual native realpath canonicalization.
+The assertion does not grant OS permissions, permit a model to select roots, or attest its
+own origin; its provenance is the existing private Host/helper bootstrap channel.
+
+The independent recorder resolves its Host-side temporary root with realpathSync.native
+to eliminate Windows 8.3 aliases before constructing native descriptors. It supplies the
+same capability only after verified native startup. Real-file/junction tests cover both
+assembly paths and malformed/mismatched assertions.
+
+After successful WSAStartup, socket creation returning WSAEACCES is explicit socket-stage
+network denial. A completed connect returning WSAEACCES is a separate supported outcome;
+failed WSA initialization, ioctl/select/getsockopt errors, pending connections and timeouts
+are never treated as denial. Ordinary v3 continued to time out even with correct exceptfds
+handling and remains an unsupported diagnostic result, with its negative test unchanged.
+The final disposable compatibility attempt explicitly selects revised v2, retains the
+strict user default, and uses no root grants. A further Node/Pi/Bash failure remains a
+blocked candidate rather than justification for broader policies or another backend.
