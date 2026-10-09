@@ -267,6 +267,25 @@ stop/revoke finalizer. Source and scratch must not overlap. Files are retained, 
 silently deleted to regain space. Native diagnostics record thresholds, sampled counts,
 status, and whether available-space values were actually sampled.
 
+An enumerated child can disappear during an atomic rename. Only a missing-file or
+missing-path error at a child metadata/size/iterator boundary permits a complete
+rescan, after both roots are revalidated. There are at most three total attempts,
+with fresh source and scratch counters each time. No entry is silently skipped;
+a successful result requires one complete traversal and both free-space checks.
+Missing roots, unreadable paths, reparse points, quota/overflow errors and free-space
+failures remain immediate failures. Persistent churn fails at the attempt cap.
+Diagnostics include sample attempts, transient retries/status and final failure
+phase/path. This does not change the command completion window or access policy.
+
+[Run 23](https://github.com/L1UUUU/pi-kanban/actions/runs/37915956969) retained a real
+failure after 14 Node-native probes: sampled file-not-found cancelled a descendant
+fixture's Job (command exit 1223). Its raw challenge files implicate an atomic rename;
+the old recorder did not retain the exact failed path. The bounded rescan repair has
+`native_disk_accounting` coverage for real file/directory renames, fresh recounting,
+persistent churn and retained policy errors, selected in required Windows CI. Exact
+commit CI must pass that test and all unchanged native recorder assertions before a
+new native pass is claimed.
+
 This is explicitly a polling monitor, **not a hard quota**. Writes can overshoot between
 samples, during traversal, or while termination completes; hard exhaustion prevention is
 not established. The Windows recorder writes a real 2 MiB scratch file under a 1 MiB
@@ -409,8 +428,8 @@ being mislabeled never-created.
 
 The same exact-token differential runs before every native-mediated Node/Bash command,
 not only the primary Worker. A shared native mutex keeps these short-lived trusted
-fixtures out of concurrent disk traversal without weakening any missing/permission/reparse
-failure rule. A check-policy failure terminates the entire Job before returning failure.
+fixtures out of concurrent disk traversal without weakening permission/reparse
+failure rules; disappearing ordinary child entries follow the bounded rescan policy above. A check-policy failure terminates the entire Job before returning failure.
 If reverting impersonation itself fails, the helper exits immediately and writes no clean
 receipt; kernel Job-handle closure kills descendants and recovery remains explicitly unknown.
 
