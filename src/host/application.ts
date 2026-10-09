@@ -3,7 +3,7 @@ import { lstatSync, realpathSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { createHash } from 'node:crypto';
 import { WorkflowService, WorkbenchStore } from '../domain/index.ts';
-import type { Demand, UserCommand } from '../domain/types.ts';
+import type { Demand, UserCommand, Stage } from '../domain/types.ts';
 import type { ViewState, DemandView } from '../desktop/renderer/types.ts';
 import { COMMANDS, ProtocolError, id, record, revision, text } from './protocol.ts';
 import { ModelBudgetLedger } from '../runtime/budget.ts';
@@ -87,8 +87,9 @@ export class HostApplication {
     const run = runs.at(-1);
     return {
       id: d.id, projectId: d.projectId, title: d.title, description: d.description, version: d.revision, phase: d.phase, control: d.control,
-      plan: plan ? { id: plan.id, scope: plan.scope, ready: plan.ready, confirmed: d.confirmedPlanId === plan.id, specPath: plan.spec.location, requiredChecks: plan.requiredChecks.map(c => c.name) } : undefined,
+      plan: plan ? { id: plan.id, scope: plan.scope, ready: plan.ready, confirmed: d.confirmedPlanId === plan.id, specPath: plan.spec.location, requiredChecks: plan.requiredChecks.map(c => c.name), unresolvedQuestions: [...plan.unresolvedQuestions] } : undefined,
       result: result ? { id: result.id, contentId: result.contentId, notes: result.notes, createdAt: result.createdAt, codeRef: result.K.location, knowledgeRefs: result.N.map(n => n.id), accepted: d.acceptances.some(a => a.resultId === result.id && a.decision === 'accepted') } : undefined,
+      activeContentId: d.activeContentId, methodSnapshot: structuredClone(d.methodSnapshot), findings: structuredClone(d.findings), workflowBlockers: [...d.blockedReasons],
       blockers: [...d.blockedReasons, ...(d.planningStarted && d.control === 'active' && !result ? this.production.diagnostics(d.id).blockers : [])],
       activities: this.store.history(d.id).slice(-200).map((h, index) => ({ id: `${d.id}-${index}`, kind: 'workflow', title: h.kind, timestamp: h.createdAt, status: 'complete' })),
       messages: d.messages.map(m => ({ id: m.id, role: 'user', text: m.text, state: m.state })),
@@ -123,7 +124,7 @@ export class HostApplication {
         break;
       }
       case 'importConfiguration': {
-        if (this.store.listRuns().some(run => run.status !== 'stopped')) throw new ProtocolError('RUN_ACTIVE', 'Stop and verify existing runs before importing execution settings.');
+        if (this.store.listRuns().some(run => run.status !== 'stopped') || this.coordinator.supervisor.list().some(run => run.state !== 'stopped') || !this.production.auxiliaryStatus().safe) throw new ProtocolError('RUN_ACTIVE', 'Stop and verify all execution trees and native resource revocations before importing execution settings.');
         const config = this.configuration.importFromFile(text(params.filePath, 'configuration file', 4096));
         const methods = this.production.captureMethods(config);
         for (const project of this.store.listProjects()) this.workflow.updateProjectMethods(project.id, methods, this.#user);
@@ -184,7 +185,28 @@ export class HostApplication {
         if (kind === 'confirm-plan' || kind === 'authorize-implementation') command = { ...common, type: kind, planId: id(params.planId, 'plan version') };
         else if (kind === 'accept-result') command = { ...common, type: kind, resultId: id(params.resultId, 'result version') };
         else if (kind === 'return-result') command = { ...common, type: kind, resultId: id(params.resultId, 'result version'), reason: text(params.text, 'return reason') };
+        else if (kind === 'revise-plan') command = { ...common, type: kind, previousPlanId: id(params.previousPlanId, 'previous plan version'), reason: text(params.text, 'revision reason') };
+        else if (kind === 'resolve-blocker') command = { ...common, type: kind, reason: text(params.text, 'resolution and evidence') };
+        else if (kind === 'decide-finding') {
+          const demand = this.store.getDemand(common.demandId), findingId = id(params.findingId, 'finding identifier'), contentId = id(params.contentId, 'content version');
+          const finding = demand.findings.find(item => item.id === findingId);
+          if (demand.activeContentId !== contentId || finding?.contentId !== contentId || finding.severity !== 'decision') throw new ProtocolError('STALE_FINDING', 'Decide only a user-decision finding on the exact current content.');
+          command = { ...common, type: kind, findingId, reason: text(params.text, 'decision and reason') };
+        } else if (kind === 'switch-method') {
+          const stage = text(params.stage, 'method stage', 30) as Stage;
+          if (!['planning', 'implementation', 'review'].includes(stage)) throw new ProtocolError('INVALID_STAGE', 'Select a supported stage.');
+          const config = this.configuration.load();
+          if (params.configurationDigest !== configurationDigest(config)) throw new ProtocolError('STALE_CONFIGURATION', 'Method configuration changed; review the current exact source.');
+          const method = this.production.captureMethods(config)[stage];
+          if (!method || method.id !== params.methodId || method.version !== params.methodVersion || method.digest !== params.methodDigest) throw new ProtocolError('METHOD_CHANGED', 'The configured method or dependency snapshot changed.');
+          if (params.impactReviewed !== true) throw new ProtocolError('IMPACT_UNREVIEWED', 'Review the impact of replacing the frozen stage method.');
+          command = { ...common, type: kind, stage, method, impactReviewed: true, reason: text(params.text, 'method change reason') };
+        }
         else command = { ...common, type: kind as 'start-planning' | 'pause' | 'resume' | 'cancel' };
+        if (['revise-plan', 'resolve-blocker', 'switch-method', 'decide-finding'].includes(kind)) {
+          if (this.coordinator.supervisor.list().some(run => run.demandId === common.demandId && run.state !== 'stopped')) throw new ProtocolError('RUNTIME_OCCUPIED', 'Verify the complete native execution tree has stopped before this decision.');
+          if (this.store.getDemand(common.demandId).activeResultId) throw new ProtocolError('RESULT_PROTECTED', 'Return the exact submitted result before changing its decisions.');
+        }
         if (kind === 'accept-result') {
           const demand = this.store.getDemand(common.demandId), result = demand.results.find(result => result.id === params.resultId);
           if (result && (!this.production.evidence.stable(demand.id, result.K) || result.N.some(ref => { try { this.production.evidence.read(demand.id, ref); return false; } catch { return true; } }))) {

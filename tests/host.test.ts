@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -105,4 +106,62 @@ test('Host shutdown remains unsafe for durable orphan auxiliary execution after 
     assert.equal(app.coordinator.supervisor.list()[0].state, 'stop_requested');
     assert.equal(app.coordinator.supervisor.list()[0].stopReason, 'synthetic interruption');
   } finally { app.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('trusted desktop decisions target current findings and preserve submitted results', () => {
+  const app = new HostApplication();
+  try {
+    const p = app.workflow.createProject({ name: 'synthetic decisions', rootPath: tmpdir() });
+    const d = app.workflow.createDemand({ projectId: p.id, title: 'synthetic', description: '' });
+    d.activeContentId = 'content-current'; d.findings = [
+      { id: 'current', contentId: 'content-current', reviewRunId: 'synthetic-review', severity: 'decision', status: 'open', location: 'scope', basis: 'user choice needed', impact: 'requires decision', verification: 'record exact choice' },
+      { id: 'historical', contentId: 'content-old', reviewRunId: 'old-review', severity: 'decision', status: 'open', location: 'old', basis: 'old', impact: 'old', verification: 'old' },
+    ];
+    d.blockedReasons = ['User decision required: current']; app.store.saveDemand(d);
+    const base = { kind: 'decide-finding', demandId: d.id, expectedVersion: d.revision, contentId: 'content-current', text: 'Use the explicitly selected bounded scope.' };
+    assert.throws(() => app.handle('command', { ...base, requestId: 'bad', findingId: 'historical' }), /exact current content/);
+    let state = app.handle('command', { ...base, requestId: 'decide-once', findingId: 'current' });
+    assert.equal(state.demands[0].findings!.find(f => f.id === 'current')!.status, 'closed');
+    assert.equal(state.demands[0].findings!.find(f => f.id === 'historical')!.status, 'open');
+    assert.deepEqual(app.handle('command', { ...base, requestId: 'decide-once', findingId: 'current' }).demands[0].version, state.demands[0].version);
+    const protectedDemand = app.store.getDemand(d.id); protectedDemand.activeResultId = 'immutable-result'; app.store.saveDemand(protectedDemand);
+    assert.throws(() => app.handle('command', { kind: 'resolve-blocker', requestId: 'unsafe', demandId: d.id, expectedVersion: protectedDemand.revision, text: 'clear' }), /Return the exact submitted result/);
+  } finally { app.close(); }
+});
+
+test('blocker decisions require stopped native execution and cannot fabricate runtime prerequisites', () => {
+  const app = new HostApplication();
+  try {
+    const p = app.workflow.createProject({ name: 'synthetic recovery', rootPath: tmpdir() });
+    const d = app.workflow.createDemand({ projectId: p.id, title: 'synthetic', description: '' });
+    app.workflow.blockDemand(d.id, 'USER_INPUT', 'Choose a scope.');
+    const current = app.store.getDemand(d.id);
+    const request = { demandId: d.id, role: 'boundary-review', writes: false, grantId: 'synthetic', workspace: tmpdir(), profileId: 'synthetic', timeoutMs: 1000, maxOutputBytes: 1000 };
+    app.store.db.prepare('INSERT INTO runtime_runs VALUES(?,?,?,?,?,?,?,?,?,?,?,?)').run('synthetic-aux', d.id, 'synthetic-generation', 'unknown', 0, 0, JSON.stringify(request), null, null, new Date().toISOString(), new Date().toISOString(), null);
+    const command = { kind: 'resolve-blocker', requestId: 'clear', demandId: d.id, expectedVersion: current.revision, text: 'Explicitly selected bounded scope.' };
+    assert.throws(() => app.handle('command', command), /complete native execution tree/);
+    app.store.db.prepare("UPDATE runtime_runs SET state='stopped' WHERE run_id='synthetic-aux'").run();
+    const state = app.handle('command', command);
+    assert.deepEqual(app.store.getDemand(d.id).blockedReasons, []);
+    assert.equal(state.runtime.executionEnabled, false);
+    assert.equal(app.store.listRuns().length, 0);
+  } finally { app.close(); }
+});
+
+test('desktop method replacement resolves a frozen configured source and rejects forged or changed selection', () => {
+  const app = new HostApplication(), root = mkdtempSync(join(tmpdir(), 'pi-method-decision-'));
+  try {
+    const p = app.workflow.createProject({ name: 'synthetic methods', rootPath: root });
+    const d = app.workflow.createDemand({ projectId: p.id, title: 'synthetic', description: '' });
+    const path = join(root, 'method.txt'), content = 'Synthetic method source'; writeFileSync(path, content);
+    const config = emptyConfiguration();
+    config.methods.review = { id: 'explicit-review', logicalName: 'review', path, sha256: createHash('sha256').update(content).digest('hex'), version: '1.0.0', adapter: 'explicit-text-v1', dependencies: [] };
+    app.configuration.save(config); const summary = app.configuration.inspect(), selected = summary.methods.find(m => m.stage === 'review')!.snapshot!;
+    const input = { kind: 'switch-method', requestId: 'switch', demandId: d.id, expectedVersion: d.revision, stage: 'review', methodId: selected.id, methodVersion: selected.version, methodDigest: selected.digest, configurationDigest: summary.configurationDigest, impactReviewed: true, text: 'Reviewed changed independent review procedure.' };
+    assert.throws(() => app.handle('command', { ...input, methodDigest: 'f'.repeat(64) }), /snapshot changed/);
+    assert.throws(() => app.handle('command', { ...input, impactReviewed: false }), /impact/);
+    const result = app.handle('command', input); assert.equal(result.demands[0].methodSnapshot!.review!.digest, selected.digest);
+    writeFileSync(path, 'Changed after user review');
+    assert.throws(() => app.handle('command', { ...input, requestId: 'changed', expectedVersion: result.demands[0].version }), /snapshot changed/);
+  } finally { app.close(); rmSync(root, { recursive: true, force: true }); }
 });

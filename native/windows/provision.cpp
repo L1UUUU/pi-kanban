@@ -28,16 +28,16 @@ bool Contains(const std::wstring& root,const std::wstring& path){auto r=root,p=p
 }
 DWORD ScopedResources::Provision(const LaunchDescriptor& d,const std::vector<std::wstring>& readonly_roots,const std::wstring& authorization){
   std::lock_guard lock(mutex_);
-  if(sid_||authorization.empty()||authorization.size()>200||readonly_roots.empty()||readonly_roots.size()>16)return ERROR_ACCESS_DENIED;
+  if(sid_||authorization.empty()||authorization.size()>200||readonly_roots.size()!=2)return ERROR_ACCESS_DENIED;
   DWORD error=ValidateDescriptor(d);if(error)return error;
   if((error=SafeTree(d.workspace))||(error=SafeTree(d.scratch)))return error;
   bool node_covered=false,worker_covered=false;
-  for(const auto& root:readonly_roots){if((error=SafeTree(root)))return error;if(Contains(root,d.workspace)||Contains(root,d.scratch)||Contains(d.workspace,root)||Contains(d.scratch,root))return ERROR_ACCESS_DENIED;node_covered|=Contains(root,d.node_executable);worker_covered|=Contains(root,d.worker_entry);}
+  for(const auto& root:readonly_roots){if((error=SafeTree(root)))return error;if(!fs::is_regular_file(root)||(root!=d.node_executable&&root!=d.worker_entry))return ERROR_ACCESS_DENIED;if(Contains(root,d.workspace)||Contains(root,d.scratch)||Contains(d.workspace,root)||Contains(d.scratch,root))return ERROR_ACCESS_DENIED;node_covered|=root==d.node_executable;worker_covered|=root==d.worker_entry;}
   if(!node_covered||!worker_covered)return ERROR_ACCESS_DENIED;
   profile_=d.profile_name;const HRESULT created=CreateAppContainerProfile(profile_.c_str(),profile_.c_str(),L"pi-kanban generation-scoped Worker",nullptr,0,&sid_);
   if(FAILED(created))return HRESULT_CODE(created); // Never reuse an old identity or its mutable grants.
   const auto grant=[&](const std::wstring& path,DWORD rights,ACCESS_MODE mode,bool inherit){const DWORD result=Edit(path,sid_,rights,mode,inherit);if(!result){changed_.push_back(path);if(inherit)recursive_.insert(path);}return result;};
-  for(const auto& root:readonly_roots)if((error=grant(root,FILE_GENERIC_READ|FILE_GENERIC_EXECUTE,GRANT_ACCESS,true)))return error;
+  for(const auto& root:readonly_roots)if((error=grant(root,FILE_GENERIC_READ|FILE_GENERIC_EXECUTE,GRANT_ACCESS,false)))return error;
   if((error=grant(d.workspace,FILE_GENERIC_READ|(d.role==L"implementation"?FILE_GENERIC_WRITE:0),GRANT_ACCESS,true)))return error;
   if((error=grant(d.scratch,FILE_ALL_ACCESS,GRANT_ACCESS,true)))return error;
   for(const auto* name:{L".git",L".local"}){const auto internal=(fs::path(d.workspace)/name).wstring();if(GetFileAttributesW(internal.c_str())!=INVALID_FILE_ATTRIBUTES&&

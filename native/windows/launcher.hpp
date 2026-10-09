@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <string>
 #include <thread>
+#include <mutex>
 #include <vector>
 namespace pi_kanban {
 struct LaunchDescriptor {
@@ -52,6 +53,10 @@ class ControlledJob {
   ProcessIdentity identity_;
   std::jthread watchdog_;
   const char* stage_ = "not-started";
+  // Serialize child creation with terminal stop. Once stopped no new process may
+  // enter this generation, including a command already queued on the Host pipe.
+  std::mutex spawn_stop_mutex_;
+  bool stopping_ = false;
 };
 DWORD ValidateDescriptor(const LaunchDescriptor&);
 }  // namespace pi_kanban

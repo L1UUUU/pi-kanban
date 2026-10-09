@@ -1,0 +1,43 @@
+import { useState } from 'react';
+import type { Stage } from '../../domain/types.ts';
+import type { Demand, ViewState } from './types.ts';
+import { currentDecisions, DECISION_LABELS, decisionUnavailable, STAGE_NAMES } from './decision-model.ts';
+import type { DecisionInput, DecisionReview } from './decision-model.ts';
+
+const Fact = ({ label, value }: { label: string; value: string }) => <div className="metadata"><span>{label}</span><code>{value}</code></div>;
+export function DecisionsPanel({ state, demand, offline, pending, onReview, diagnostics }: { state: ViewState; demand: Demand; offline: boolean; pending: boolean; onReview: (review: DecisionReview) => void; diagnostics: () => void }) {
+  const action = (review: DecisionReview, label = DECISION_LABELS[review.kind]) => {
+    const unavailable = decisionUnavailable(review, state);
+    return <><button className="button compact" disabled={offline || pending || !!unavailable} onClick={() => onReview(structuredClone(review))}>{label}</button>{unavailable && <p className="decision-unavailable">{unavailable}</p>}</>;
+  };
+  const findings = demand.findings ?? [];
+  return <section className="decision-panel" aria-label="方案与待决定事项">
+    <h2>方案与待决定事项</h2><p className="detail-muted">每项操作都绑定当前需求版本。会话文字不会代替明确的用户决定。</p>
+    <article className="decision-card"><h3>方案修订</h3>{demand.plan ? <><Fact label="当前方案" value={demand.plan.id} /><p className="safe-text">{demand.plan.scope}</p>{!!demand.plan.unresolvedQuestions?.length && <><h4>规划待明确的问题</h4><ul className="blocker-list">{demand.plan.unresolvedQuestions.map((question, index) => <li key={index}>{question}</li>)}</ul></>}<p>把问题答案或范围调整写入修订说明，形成新方案后重新确认和授权实施。</p>{action({ kind: 'revise-plan', demand })}</> : <p>当前尚无可修订的方案。</p>}</article>
+    <article className="decision-card"><h3>Review 决定 · {currentDecisions(demand).length} 项待处理</h3>{!findings.length && <p>尚无 Review 决定或发现。</p>}{findings.map(finding => <section className="finding-card" key={finding.id} aria-label={`发现 ${finding.id}`}><div className="finding-heading"><strong>{finding.severity === 'decision' ? '用户决定' : finding.severity === 'blocking' ? '阻塞发现' : '建议'}</strong><span>{finding.status === 'closed' ? '已关闭' : finding.status === 'disputed' ? '有争议' : '待处理'}{finding.contentId !== demand.activeContentId ? ' · 历史内容' : ''}</span></div><Fact label="发现对象" value={finding.id} /><Fact label="内容版本" value={finding.contentId} /><Fact label="Review 运行" value={finding.reviewRunId} /><Fact label="位置" value={finding.location} /><p className="safe-text"><strong>依据：</strong>{finding.basis}</p><p className="safe-text"><strong>影响：</strong>{finding.impact}</p><p className="safe-text"><strong>验证方式：</strong>{finding.verification}</p>{finding.severity === 'decision' && finding.status !== 'closed' && finding.contentId === demand.activeContentId && action({ kind: 'decide-finding', demand, findingId: finding.id, contentId: finding.contentId })}</section>)}</article>
+    <article className="decision-card"><h3>需求级阻塞</h3>{demand.workflowBlockers?.length ? <><ul className="blocker-list">{demand.workflowBlockers.map((blocker, index) => <li key={index}>{blocker}</li>)}</ul><p>只有已处理的需求级阻塞可提交解除说明。运行条件、必要检查和有限额度会继续由 Host 核验。</p>{action({ kind: 'resolve-blocker', demand })}</> : <p>没有记录的需求级阻塞。其他运行限制请查看诊断。</p>}</article>
+    <article className="decision-card"><h3>冻结方法</h3>{(['planning', 'implementation', 'review'] as const).map(stage => <Fact key={stage} label={STAGE_NAMES[stage]} value={demand.methodSnapshot?.[stage] ? `${demand.methodSnapshot[stage]!.id} @ ${demand.methodSnapshot[stage]!.version}` : '尚未冻结'} />)}<p>仅可切换为已导入、已核验来源的精确方法。切换前需审阅影响。</p>{state.configuration ? action({ kind: 'switch-method', demand, configuration: state.configuration }) : <p className="decision-unavailable">请先导入方法来源。</p>}<button className="button compact" onClick={diagnostics}>查看运行配置</button></article>
+  </section>;
+}
+export function DecisionForm({ review, state, offline, pending, error, onSubmit, close }: { review: DecisionReview; state: ViewState; offline: boolean; pending: boolean; error: string | null; onSubmit: (input: DecisionInput) => void; close: () => void }) {
+  const [reason, setReason] = useState('');
+  const [stage, setStage] = useState<Stage | ''>('');
+  const [impactReviewed, setImpactReviewed] = useState(false);
+  const unavailable = decisionUnavailable(review, state);
+  const methods = review.kind === 'switch-method' ? review.configuration.methods.filter(method => method.status === 'configured' && method.snapshot) : [];
+  const chosen = methods.find(method => method.stage === stage);
+  const current = stage ? review.demand.methodSnapshot?.[stage] : undefined;
+  const finding = review.kind === 'decide-finding' ? review.demand.findings?.find(finding => finding.id === review.findingId) : undefined;
+  const sameMethod = !!chosen?.snapshot && !!current && current.id === chosen.snapshot.id && current.version === chosen.snapshot.version && current.digest === chosen.snapshot.digest;
+  const disabled = offline || pending || !!unavailable || !reason.trim() || (review.kind === 'switch-method' && (!chosen || !impactReviewed || sameMethod));
+  return <form className="decision-form" onSubmit={event => { event.preventDefault(); if (!disabled) onSubmit({ reason, stage: stage || undefined, impactReviewed }); }}>
+    <div className="dialog-object"><Fact label="需求对象" value={review.demand.id} /><Fact label="需求版本" value={String(review.demand.version)} />{review.kind === 'revise-plan' && review.demand.plan && <Fact label="被修订方案" value={review.demand.plan.id} />}{review.kind === 'decide-finding' && <><Fact label="发现对象" value={review.findingId} /><Fact label="内容版本" value={review.contentId} /></>}</div>
+    {review.kind === 'revise-plan' && <><p className="dialog-note">本操作将保留原方案历史，撤销该方案的确认和实施授权，并请求新一轮规划。新方案必须重新确认，再单独授权实施。</p>{!!review.demand.plan?.unresolvedQuestions?.length && <ul className="blocker-list">{review.demand.plan.unresolvedQuestions.map((question, index) => <li key={index}>{question}</li>)}</ul>}</>}
+    {finding && <div className="decision-card"><p className="safe-text">{finding.basis}</p><p className="safe-text">影响：{finding.impact}</p><p className="safe-text">验证：{finding.verification}</p><p>明确记录对此项的处理决定并关闭该决定项。必要检查、阻塞发现和最终成果验收仍分别处理。</p></div>}
+    {review.kind === 'resolve-blocker' && <><ul className="blocker-list">{review.demand.workflowBlockers?.map((blocker, index) => <li key={index}>{blocker}</li>)}</ul><p className="dialog-note">请逐项核实上列阻塞已经处理。此决定不会关闭 Review 发现、通过缺失检查、增加额度、授予实施权限或绕过运行核验。</p></>}
+    {review.kind === 'switch-method' && <><label className="form-field">切换阶段<select required value={stage} onChange={event => { setStage(event.target.value as Stage | ''); setImpactReviewed(false); }}><option value="">请选择阶段与已核验方法</option>{methods.map(method => <option key={method.stage} value={method.stage}>{STAGE_NAMES[method.stage]} · {method.snapshot!.id} @ {method.snapshot!.version}</option>)}</select></label><Fact label="配置摘要" value={review.configuration.configurationDigest} />{chosen?.snapshot && <div className="dialog-object"><Fact label="原方法" value={current ? `${current.id} @ ${current.version}` : '未配置'} /><Fact label="原摘要" value={current?.digest ?? '未配置'} /><Fact label="新方法" value={`${chosen.snapshot.id} @ ${chosen.snapshot.version}`} /><Fact label="新摘要" value={chosen.snapshot.digest} /><Fact label="适配器" value={chosen.snapshot.adapter} /><Fact label="来源文件" value={chosen.source?.path ?? '未提供'} /><Fact label="依赖数" value={String(chosen.dependencyCount)} /></div>}<p className="dialog-note">更改此需求的冻结方法会开始新的执行周期。请核对新方法对当前方案、资料与检查的影响。此操作不增加模型额度、资料传输范围或实施权限；Host 会重新核验后续执行。</p>{sameMethod && <p className="stale-warning">所选方法与已冻结版本相同，无需切换。</p>}</>}
+    <label className="form-field">{review.kind === 'revise-plan' ? '问题答案与修订要求' : review.kind === 'decide-finding' ? '决定与理由' : review.kind === 'switch-method' ? '切换原因与影响' : '阻塞处理情况与证据'}<textarea required rows={5} maxLength={20000} value={reason} onChange={event => setReason(event.target.value)} placeholder="请写明具体决定、依据及需要保留的限制。" /></label>
+    {review.kind === 'switch-method' && <label className="authorization-consent"><input type="checkbox" checked={impactReviewed} disabled={!chosen || sameMethod} onChange={event => setImpactReviewed(event.target.checked)} /><span>我已审阅此精确方法版本与摘要，以及对当前需求的影响。</span></label>}
+    {unavailable && <p className="stale-warning" role="alert">{unavailable}</p>}{error && <p className="stale-warning" role="alert">{error}</p>}<div className="modal-actions"><button type="button" className="button" onClick={close}>返回</button><button className="button primary" type="submit" disabled={disabled}>{pending ? '正在保存…' : DECISION_LABELS[review.kind]}</button></div>
+  </form>;
+}

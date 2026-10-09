@@ -39,6 +39,7 @@ export function primaryAction(demand: Demand): { kind: CommandKind; label: strin
   return null;
 }
 export function makeCommand(kind: CommandKind, demand: Demand, requestId: string, text?: string): Command {
+  if (['revise-plan', 'decide-finding', 'resolve-blocker', 'switch-method'].includes(kind)) throw new Error('此决定需要专用表单与精确对象绑定。');
   const command: Command = { kind, demandId: demand.id, expectedVersion: demand.version, requestId };
   if (kind === 'confirm-plan' || kind === 'authorize-implementation') {
     if (!demand.plan) throw new Error('方案尚未就绪，请刷新后重试。');

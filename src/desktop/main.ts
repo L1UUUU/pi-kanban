@@ -33,8 +33,8 @@ async function startHost(): Promise<void> {
   if (!/^v24\./.test(version)) throw new Error(`Expected Node.js 24, received ${version}.`);
   const environment: NodeJS.ProcessEnv = { PI_KANBAN_DATA_DIR: join(app.getPath('userData'), 'host'), NODE_NO_WARNINGS: '1' };
   if (process.env.PI_KANBAN_GIT && isAbsolute(process.env.PI_KANBAN_GIT)) environment.PI_KANBAN_GIT = process.env.PI_KANBAN_GIT;
-  // Native OS loader/temp settings only. No API tokens, shell config, proxy, or HOME.
-  for (const key of ['SystemRoot', 'WINDIR', 'TEMP', 'TMP', 'TMPDIR', 'LANG']) if (process.env[key]) environment[key] = process.env[key];
+  // Explicit OS loader/profile/temp paths required by the trusted native helper only. No API tokens, shell config, proxy, or HOME.
+  for (const key of ['SystemRoot', 'SystemDrive', 'WINDIR', 'USERPROFILE', 'LOCALAPPDATA', 'APPDATA', 'TEMP', 'TMP', 'TMPDIR', 'LANG']) if (process.env[key]) environment[key] = process.env[key];
   // A configured reference selects at most one credential for the trusted Host.
   // The native Worker environment never inherits it. Importing settings alone
   // does not grant a request; the Host ledger requires separate finite consent.

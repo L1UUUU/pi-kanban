@@ -241,3 +241,48 @@ test('renderer: stale or incomplete preparation cannot open an apparently ready 
   const disconnected = { ...prepared, runtime: { ...prepared.runtime, connection: 'disconnected' as const } };
   assert.throws(() => preparedModelReview(disconnected, prepared, 'synthetic-demand'), /断开/);
 });
+
+import { currentDecisions, decisionUnavailable, makeDecisionCommand } from '../src/desktop/renderer/decision-model.ts';
+import type { Finding } from '../src/domain/types.ts';
+const decisionFinding = (patch: Partial<Finding> = {}): Finding => ({ id: 'synthetic-f1', contentId: 'synthetic-c1', reviewRunId: 'synthetic-r1', severity: 'decision', status: 'open', location: 'synthetic://location', basis: 'Synthetic choice', impact: 'Synthetic impact', verification: 'Synthetic verification', ...patch });
+test('renderer: actionable decisions bind exact plan, finding and content without inferred authority', () => {
+  const target = demand({ runState: 'stopped', activeContentId: 'synthetic-c1', findings: [decisionFinding()], plan: { id: 'synthetic-p1', scope: '', ready: false, confirmed: false, unresolvedQuestions: ['Synthetic question'] } });
+  const revise = makeDecisionCommand({ kind: 'revise-plan', demand: target }, { reason: '  Synthetic answer  ' }, 'request');
+  assert.deepEqual(revise, { kind: 'revise-plan', demandId: target.id, expectedVersion: 7, requestId: 'request', text: 'Synthetic answer', previousPlanId: 'synthetic-p1' });
+  const decide = makeDecisionCommand({ kind: 'decide-finding', demand: target, findingId: 'synthetic-f1', contentId: 'synthetic-c1' }, { reason: 'Keep specified behavior' }, 'request');
+  assert.equal(decide.findingId, 'synthetic-f1'); assert.equal(decide.contentId, 'synthetic-c1');
+  assert.equal('confirmDesign' in decide, false); assert.equal('localCommit' in revise, false);
+  assert.throws(() => makeDecisionCommand({ kind: 'revise-plan', demand: target }, { reason: ' ' }, 'request'), /填写/);
+  assert.throws(() => makeCommand('revise-plan', target, 'request'), /专用表单/);
+});
+test('renderer: historical, closed and blocking findings never gain user-decision controls', () => {
+  const target = demand({ activeContentId: 'synthetic-c1', findings: [decisionFinding(), decisionFinding({ id: 'old', contentId: 'old' }), decisionFinding({ id: 'closed', status: 'closed' }), decisionFinding({ id: 'blocking', severity: 'blocking' })] });
+  assert.deepEqual(currentDecisions(target).map(finding => finding.id), ['synthetic-f1']);
+  for (const findingId of ['old', 'closed', 'blocking']) assert.throws(() => makeDecisionCommand({ kind: 'decide-finding', demand: target, findingId, contentId: 'synthetic-c1' }, { reason: 'Synthetic reason' }, 'request'), /未关闭决定项/);
+});
+test('renderer: blocker resolution cannot substitute for missing configuration or unresolved decisions', () => {
+  const target = demand({ runState: 'stopped', blockers: ['Runtime diagnostic'] });
+  assert.match(decisionUnavailable({ kind: 'resolve-blocker', demand: target }, state({ demands: [target] }))!, /没有可解除/);
+  const decisions = { ...target, workflowBlockers: ['User decision required'], activeContentId: 'synthetic-c1', findings: [decisionFinding()] };
+  assert.match(decisionUnavailable({ kind: 'resolve-blocker', demand: decisions }, state({ demands: [decisions] }))!, /逐项记录/);
+  const questions = { ...target, workflowBlockers: ['Question'], plan: { id: 'p1', scope: '', ready: false, confirmed: false, unresolvedQuestions: ['Question'] } };
+  assert.match(decisionUnavailable({ kind: 'resolve-blocker', demand: questions }, state({ demands: [questions] }))!, /重新规划/);
+  const ready = { ...target, workflowBlockers: ['Synthetic environment repaired'] };
+  assert.equal(decisionUnavailable({ kind: 'resolve-blocker', demand: ready }, state({ demands: [ready] })), null);
+});
+test('renderer: decision guard rejects stale revision, protected result, active or unknown execution', () => {
+  const target = demand({ runState: 'stopped', plan: { id: 'p1', scope: '', ready: true, confirmed: true } });
+  const review = { kind: 'revise-plan' as const, demand: target };
+  assert.match(decisionUnavailable(review, state({ demands: [{ ...target, version: 8 }] }))!, /版本已变化/);
+  for (const runState of ['running', 'stopping', 'unknown', 'queued', undefined] as const) assert.match(decisionUnavailable(review, state({ demands: [{ ...target, runState }] }))!, /停止/);
+  assert.match(decisionUnavailable(review, state({ demands: [{ ...target, result: { id: 'result', contentId: 'c1', notes: '', createdAt: '' } }] }))!, /退回/);
+});
+test('renderer: method switch binds only an imported exact snapshot, requires reviewed impact and rejects configuration races', () => {
+  const config = configuration(); config.methods = [{ stage: 'planning', logicalName: 'Synthetic planning', status: 'configured', source: { id: 'method', path: '/synthetic/method.md', sha256: 'c'.repeat(64) }, snapshot: { id: 'method', version: 'v2', digest: 'd'.repeat(64), adapter: 'synthetic-only' }, dependencyCount: 0, blockers: [] }];
+  const target = demand({ runState: 'stopped' }); const review = { kind: 'switch-method' as const, demand: target, configuration: config };
+  assert.throws(() => makeDecisionCommand(review, { reason: 'Need boundary review', stage: 'planning' }, 'request'), /审阅/);
+  assert.throws(() => makeDecisionCommand(review, { reason: 'Need boundary review', stage: 'review', impactReviewed: true }, 'request'), /已核验/);
+  assert.deepEqual(makeDecisionCommand(review, { reason: 'Need boundary review', stage: 'planning', impactReviewed: true }, 'request'), { kind: 'switch-method', demandId: target.id, expectedVersion: 7, requestId: 'request', text: 'Need boundary review', stage: 'planning', methodId: 'method', methodVersion: 'v2', methodDigest: 'd'.repeat(64), configurationDigest: config.configurationDigest, impactReviewed: true });
+  assert.equal(decisionUnavailable(review, state({ demands: [target], configuration: config })), null);
+  assert.match(decisionUnavailable(review, state({ demands: [target], configuration: { ...config, configurationDigest: 'e'.repeat(64) } }))!, /配置版本已变化/);
+});

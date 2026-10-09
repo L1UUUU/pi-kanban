@@ -1,3 +1,4 @@
+import type { Finding, Methods, Stage } from '../../domain/types.ts';
 import type { ConfigurationSummary } from '../../host/configuration.ts';
 export type { ConfigurationSummary, ProviderConfiguration } from '../../host/configuration.ts';
 /** Display-only Host snapshot. This is not an authorization boundary or a second workflow engine. */
@@ -22,7 +23,7 @@ export interface Message {
 }
 export interface Check { id: string; name: string; status: 'passed' | 'failed' | 'unavailable' | 'pending'; evidence?: string; contentId?: string }
 export interface Knowledge { id: string; title: string; status: 'candidate' | 'verified' | 'ineligible'; detail?: string; source?: string }
-export interface Plan { id: string; scope: string; ready: boolean; confirmed: boolean; specPath?: string; requiredChecks?: string[] }
+export interface Plan { id: string; scope: string; ready: boolean; confirmed: boolean; specPath?: string; requiredChecks?: string[]; unresolvedQuestions?: string[] }
 export interface Result { id: string; contentId: string; notes: string; createdAt: string; codeRef?: string; knowledgeRefs?: string[]; accepted?: boolean }
 export interface Demand {
   id: string;
@@ -35,6 +36,11 @@ export interface Demand {
   plan?: Plan;
   result?: Result;
   blockers: string[];
+  /** Persisted workflow blockers, excluding runtime diagnostic prerequisites. */
+  workflowBlockers?: string[];
+  findings?: Finding[];
+  activeContentId?: string;
+  methodSnapshot?: Methods;
   activities: Activity[];
   messages: Message[];
   checks?: Check[];
@@ -61,13 +67,22 @@ export interface ViewState {
   /** Only set by the isolated synthetic preview entry; never inferred from a missing bridge. */
   preview?: boolean;
 }
-export type CommandKind = 'start-planning' | 'confirm-plan' | 'authorize-implementation' | 'pause' | 'resume' | 'cancel' | 'accept-result' | 'return-result';
+export type CommandKind = 'start-planning' | 'confirm-plan' | 'authorize-implementation' | 'pause' | 'resume' | 'cancel' | 'accept-result' | 'return-result' | 'revise-plan' | 'decide-finding' | 'resolve-blocker' | 'switch-method';
 export interface Command {
   kind: CommandKind;
   demandId: string;
   expectedVersion: number;
   planId?: string;
   resultId?: string;
+  previousPlanId?: string;
+  findingId?: string;
+  contentId?: string;
+  stage?: Stage;
+  methodId?: string;
+  methodVersion?: string;
+  methodDigest?: string;
+  configurationDigest?: string;
+  impactReviewed?: boolean;
   text?: string;
   requestId: string;
 }

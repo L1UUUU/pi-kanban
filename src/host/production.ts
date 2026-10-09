@@ -18,7 +18,7 @@ import { ModelBroker } from '../runtime/model-broker.ts';
 import type { BoundedProviderTransport, BoundedTransportRequest, ProviderResponse, BrokerMaterial } from '../runtime/model-broker.ts';
 import { HostPiBrokerEndpoint, parsePiModelFrame } from '../runtime/pi-channel.ts';
 import { verifyWindowsRuntimeProfile } from '../runtime/profile.ts';
-import type { VerifiedRuntimeProfile, LockedRuntimeProfile } from '../runtime/profile.ts';
+import type { VerifiedRuntimeProfile, LockedRuntimeProfile, WindowsEvidenceTrustAnchor } from '../runtime/profile.ts';
 import { VerifiedWindowsDriver } from '../runtime/verified-windows-driver.ts';
 import type { WindowsRunBootstrap, NativeCheckResult } from '../runtime/verified-windows-driver.ts';
 import { RuntimeError } from '../runtime/types.ts';
@@ -28,7 +28,7 @@ import type { WorkbenchConfiguration, ProviderConfiguration } from './configurat
 import type { ExecutionPrerequisites } from './coordinator.ts';
 import { ExecutionCoordinator } from './coordinator.ts';
 import { RuntimeSupervisor } from '../runtime/supervisor.ts';
-import { ProductionEvidence, hash } from './evidence.ts';
+import { ProductionEvidence, hash, planMaterial } from './evidence.ts';
 
 function insist(value: unknown, code: string, message: string): asserts value { if (!value) throw new RuntimeError(code, message); }
 function reason(error: unknown): string { return error instanceof RuntimeError ? `${error.code}: ${error.message}` : 'HOST_RESOURCE_UNAVAILABLE: A required local resource could not be verified.'; }
@@ -106,10 +106,12 @@ export interface ProductionOptions {
   workspace: () => WorkspaceService; knowledge: KnowledgeService; budget: ModelBudgetLedger;
   /** Host-owned directory, never a configuration/Worker-selected path. */
   stateDirectory: string; trustedEvidenceRoot?: string;
+  /** Separately provisioned installation trust, never a renderer/configuration value. */
+  evidenceTrustAnchor?: WindowsEvidenceTrustAnchor;
   resolveCredential?: (reference: string) => string;
 }
 export interface ProductionDiagnostics { executionEnabled: boolean; blockers: string[]; profileVerified: boolean; budgetAvailable: boolean; workspaceVerified: boolean }
-interface ActiveChannel { run: RunAttempt; runtime: RunRecord; init: WorkerInit; endpoint: HostPiBrokerEndpoint; abort: AbortController; ready: boolean; settled: boolean; modelObserved: boolean; pending: WorkerReport[]; handoffs: string[]; grantId: string; boundary: boolean; contextId: string; checks: Map<string, { args: unknown; result?: unknown }>; }
+interface ActiveChannel { run: RunAttempt; runtime: RunRecord; init: WorkerInit; endpoint: HostPiBrokerEndpoint; abort: AbortController; ready: boolean; settled: boolean; modelObserved: boolean; pending: WorkerReport[]; handoffs: string[]; grantId: string; boundary: boolean; contextId: string; }
 
 /** Executable composition, with an intentionally denied state whenever a real prerequisite
  * is missing. This factory never manufactures an executable profile or model grant. */
@@ -149,7 +151,7 @@ function composeProductionServices(options: ProductionOptions, synthetic?: Synth
     return loaded.methods;
   }
   function makeNative(): NativeDriverPort {
-    const candidate = synthetic ? synthetic.createDriver(bootstrap) : new VerifiedWindowsDriver(profile!, bootstrap);
+    const candidate = synthetic ? synthetic.createDriver(bootstrap) : new VerifiedWindowsDriver(profile!, bootstrap, join(stateDirectory, 'native-recovery'));
     insist(!synthetic || candidate.isolation === 'synthetic-process-supervision-only', 'SYNTHETIC_DRIVER_REQUIRED', 'Synthetic composition cannot launch a real native driver.'); return candidate;
   }
   function makeTransport(configuration: ProviderConfiguration) {
@@ -162,8 +164,11 @@ function composeProductionServices(options: ProductionOptions, synthetic?: Synth
   function refreshNative(): NativeDriverPort {
     const configuration = config(), digest = hash(canonicalJson(configuration.runtime));
     if (native && digest === profileDigest) return native;
-    insist(!native || ![...channels.values()].some(channel => !channel.settled), 'RUNTIME_CONFIGURATION_BUSY', 'Stop and verify existing runs before replacing their exact runtime binding.');
-    profile = synthetic ? { config: synthetic.profile, evidenceDigests: ['SYNTHETIC-NOT-ISOLATION-EVIDENCE'] } as unknown as VerifiedRuntimeProfile : verifyWindowsRuntimeProfile(runtimeProfileInput(configuration), trustedEvidenceRoot);
+    insist(!native || (![...channels.values()].some(channel => !channel.settled) && (coordinator?.supervisor.list() ?? []).every(run => run.state === 'stopped' && !!options.store.db.prepare('SELECT 1 FROM host_native_revocations WHERE run_id=?').get(run.runId))), 'RUNTIME_CONFIGURATION_BUSY', 'Stop and verify every durable primary and boundary run before replacing their exact runtime binding.');
+    profile = synthetic ? { config: synthetic.profile, evidenceDigests: ['SYNTHETIC-NOT-ISOLATION-EVIDENCE'] } as unknown as VerifiedRuntimeProfile : verifyWindowsRuntimeProfile(runtimeProfileInput(configuration), trustedEvidenceRoot, options.evidenceTrustAnchor);
+    // Auxiliary drivers lock the same exact profile as the primary driver. They
+    // may be replaced only after durable Job stop and ACL revocation above.
+    boundaryNative = undefined; boundarySupervisor = undefined;
     native = makeNative();
     native.setWorkerFrameHandler(handleFrame); if (stopHandler) native.setStopHandler(stopHandler);
     profileDigest = digest; return native;
@@ -173,9 +178,10 @@ function composeProductionServices(options: ProductionOptions, synthetic?: Synth
     setStopHandler(handler) { stopHandler = async (id, reason) => { channels.get(id)?.abort.abort(new RuntimeError('RUN_STOPPED', 'Run stopped.')); await handler(id, reason); }; native?.setStopHandler(stopHandler); },
     preflight(request) { refreshNative().preflight(request); },
     async launch(run) { return refreshNative().launch(run); },
-    async stop(run) { channels.get(run.runId)?.abort.abort(new RuntimeError('RUN_STOPPED', 'Run stopped.')); const result = native ? await native.stop(run) : unknown(run); retainRevocation(run.runId, native); return result; },
-    async observe(run) { const result = run.role === 'boundary-review' ? boundaryNative ? await boundaryNative.observe(run) : unknown(run) : native ? await native.observe(run) : unknown(run); retainRevocation(run.runId, run.role === 'boundary-review' ? boundaryNative : native); return result; },
+    async stop(run) { channels.get(run.runId)?.abort.abort(new RuntimeError('RUN_STOPPED', 'Run stopped.')); const target = recoveryDriver(run); const result = target ? await target.stop(run) : unknown(run); retainRevocation(run.runId, target); return result; },
+    async observe(run) { const target = recoveryDriver(run), result = target ? await target.observe(run) : unknown(run); retainRevocation(run.runId, target); return result; },
   };
+  function recoveryDriver(run: RunRecord): NativeDriverPort | undefined { try { return (run.role === 'boundary-review' ? boundaryNative : native) ?? refreshNative(); } catch { return undefined; } }
   function retainRevocation(id: string, driver: NativeDriverPort | undefined): void { const resource = driver?.getResourceEvidence(id); if (resource?.provisioned && resource.revoked && resource.status === 0) { options.store.db.prepare('INSERT OR IGNORE INTO host_native_revocations VALUES(?,?)').run(id, canonicalJson(resource)); options.store.db.prepare('DELETE FROM host_native_check_lease WHERE runtime_run_id=?').run(id); } }
   function unknown(run: RunRecord): Observation { return { state: 'unknown', generation: run.generation, activePids: [], proof: 'No matching verified native controller; absence is not process-tree evidence.' }; }
   function selectGrant(demandId: string, role: string): ModelGrant {
@@ -187,18 +193,52 @@ function composeProductionServices(options: ProductionOptions, synthetic?: Synth
     return grant;
   }
   function stageFor(demand: Demand): Stage { const active = options.store.listRuns(demand.id).find(run => run.status !== 'stopped'); const requested = options.workflow.nextRequestedStage(demand.id); insist(requested || active || !demand.planningStarted, 'STAGE_AWAITS_USER', 'No next stage is authorized by the workflow.'); return requested ?? active?.stage ?? 'planning'; }
+  function contentMaterial(content: Demand['contents'][number]): AgentMaterial {
+    const body = canonicalJson({ id: content.id, planId: content.planId, code: content.code, knowledge: content.knowledge, maintenance: content.maintenance, deliveryNotes: content.deliveryNotes, cycle: content.cycle });
+    return { id: `content-scope:${content.id}`, kind: 'plan', sha256: hash(body), content: body };
+  }
+  function reworkMaterial(demand: Demand): AgentMaterial {
+    const body = canonicalJson({ demandId: demand.id, planId: demand.activePlanId ?? null, contentId: demand.activeContentId ?? null, cycle: demand.cycle,
+      findings: demand.findings, checks: demand.checks.filter(check => check.contentId === demand.activeContentId),
+      returns: demand.acceptances.filter(acceptance => acceptance.decision === 'returned').map(({ resultId, reason }) => ({ resultId, reason })) });
+    return { id: `rework-scope:${demand.id}:${demand.cycle}`, kind: 'plan', sha256: hash(body), content: body };
+  }
+  function decisionMaterials(demand: Demand): AgentMaterial[] {
+    const commands = options.store.history(demand.id).filter(event => event.kind === 'user-command').map(event => (event.data as { command: Record<string, unknown> }).command)
+      .filter(command => ['revise-plan', 'decide-finding', 'resolve-blocker', 'switch-method', 'return-result'].includes(String(command.type)))
+      .map(command => Object.fromEntries(['type', 'requestId', 'reason', 'previousPlanId', 'findingId', 'stage', 'method', 'resultId'].filter(key => command[key] !== undefined).map(key => [key, command[key]])));
+    if (!commands.length) return [];
+    const body = canonicalJson({ demandId: demand.id, decisions: commands }), materials: AgentMaterial[] = [{ id: `user-decisions:${demand.id}`, kind: 'plan', sha256: hash(body), content: body }];
+    const lastRevision = commands.findLast(command => command.type === 'revise-plan'), previous = demand.plans.find(plan => plan.id === lastRevision?.previousPlanId);
+    if (!demand.activePlanId && previous) materials.push(planMaterial(previous), evidence.read(demand.id, previous.spec), evidence.read(demand.id, previous.tickets));
+    const lastReturn = commands.findLast(command => command.type === 'return-result'), result = demand.results.find(result => result.id === lastReturn?.resultId);
+    if (!demand.activeContentId && result) materials.push(evidence.read(demand.id, result.K), ...result.N.map(ref => evidence.read(demand.id, ref)), ...result.E.map(check => evidence.read(demand.id, check.evidence)), evidence.read(demand.id, result.review.evidence));
+    return materials;
+  }
+  function authorizeDerived(channel: ActiveChannel, materials: AgentMaterial[]): void {
+    const grant = options.budget.getGrant(channel.grantId);
+    insist(channel.modelObserved && grant.contextPolicy === 'approved-run-derived-v1', 'DERIVED_CONTEXT_DENIED', 'Only observed generated work covered by explicit derived-run permission may enter a later session.');
+    for (const material of materials) options.budget.authorizeData({ grantId: grant.id, decisionId: grant.decisionId, material: { id: material.id, sha256: material.sha256 } }, () => {});
+  }
   function materialSet(demand: Demand, stage: Stage, runId?: string, boundary = false): AgentMaterial[] {
     const method = demand.methodSnapshot[stage]; insist(method, 'METHOD_MISSING', `Configure and explicitly select a ${stage} method for this demand.`);
     insist(method.adapter === 'explicit-text-v1', 'METHOD_ADAPTER_UNSUPPORTED', 'This production assembly supports only the explicit-text-v1 method adapter.');
     const materials = evidence.method(method);
     const input = canonicalJson({ title: demand.title, description: demand.description, messages: demand.messages.map(message => ({ id: message.id, text: message.text, kind: message.kind })) });
     materials.push({ id: `demand-input:${demand.id}`, kind: 'plan', sha256: hash(input), content: input });
+    materials.push(...decisionMaterials(demand));
     const source = evidence.sourceMaterial(demand.id); materials.push(source);
     const plan = demand.plans.find(plan => plan.id === demand.activePlanId);
-    if (plan) materials.push(evidence.read(demand.id, plan.spec), evidence.read(demand.id, plan.tickets));
-    if (stage === 'review' && !boundary) {
-      const content = demand.contents.find(content => content.id === demand.activeContentId); insist(content && evidence.stable(demand.id, content.code), 'CONTENT_CHANGED', 'Review requires the exact immutable current code snapshot.');
-      materials.push(evidence.read(demand.id, content.code), ...content.knowledge.map(ref => evidence.read(demand.id, ref)), ...demand.checks.filter(check => check.contentId === content.id).map(check => evidence.read(demand.id, check.evidence)));
+    if (plan) materials.push(planMaterial(plan), evidence.read(demand.id, plan.spec), evidence.read(demand.id, plan.tickets));
+    if (stage !== 'planning' && !boundary) {
+      const content = demand.contents.find(content => content.id === demand.activeContentId);
+      if (stage === 'review') insist(content && evidence.stable(demand.id, content.code), 'CONTENT_CHANGED', 'Review requires the exact immutable current code snapshot.');
+      if (content) materials.push(contentMaterial(content), evidence.read(demand.id, content.code), ...content.knowledge.map(ref => evidence.read(demand.id, ref)), ...demand.checks.filter(check => check.contentId === content.id).map(check => evidence.read(demand.id, check.evidence)));
+      if (demand.findings.length || demand.checks.length || demand.acceptances.some(item => item.decision === 'returned')) {
+        materials.push(reworkMaterial(demand));
+        for (const finding of demand.findings) for (const ref of [finding.dispute, finding.resolution]) if (ref && !ref.location.startsWith('user-command:')) materials.push(evidence.read(demand.id, ref));
+        for (const review of demand.reviews.filter(review => review.contentId === content?.id || demand.findings.some(finding => finding.reviewRunId === review.runId))) materials.push(evidence.read(demand.id, review.evidence));
+      }
     }
     // K chooses versions and filters permissions before any body is read. Only
     // explicit granted revision IDs can enter the candidate allowlist.
@@ -207,7 +247,7 @@ function composeProductionServices(options: ProductionOptions, synthetic?: Synth
       const project = options.workspace().getProject(demand.projectId);
       const grant = selectGrant(demand.id, boundary ? 'boundary-review' : stage);
       const role: KnowledgeRole = stage === 'planning' ? 'planner' : stage === 'review' ? 'reviewer' : 'implementer';
-      const manifest = options.knowledge.createContext({ runId, projectId: demand.projectId, demandId: demand.id, role, baseline: binding.currentBaseline, formalTarget: project.formalTarget, environment: config().runtime!.profileId,
+      const manifest = options.knowledge.createContext({ runId, projectId: demand.projectId, demandId: demand.id, role, baseline: binding.currentBaseline, formalTarget: project.formalTarget, environment: currentKnowledgeEnvironment(),
         allowedRevisionIds: grant.data.filter(data => data.id.startsWith('knowledge:')).map(data => data.id.slice('knowledge:'.length)), purpose: `Controlled ${stage} context` });
       for (const id of manifest.revisionIds) { const item = options.knowledge.read(manifest.contextId, id); materials.push({ id: `knowledge:${id}`, kind: 'knowledge', sha256: item.object.sha256, content: item.body }); }
     }
@@ -215,7 +255,23 @@ function composeProductionServices(options: ProductionOptions, synthetic?: Synth
     for (const material of materials) { const old = deduplicated.get(material.id); insist(!old || canonicalJson(old) === canonicalJson(material), 'MATERIAL_CONFLICT', 'Context contains conflicting immutable identities.'); deduplicated.set(material.id, material); }
     return [...deduplicated.values()];
   }
-  function requiredModelData(demandId: string): { id: string; sha256: string }[] { const demand = options.store.getDemand(demandId), stage = stageFor(demand); const materials = materialSet(demand, stage); if (stage === 'planning') { insist(demand.methodSnapshot.review, 'BOUNDARY_METHOD_MISSING', 'Planning also requires the frozen independent review method.'); materials.push(...evidence.method(demand.methodSnapshot.review)); } return [...new Map(materials.map(({ id, sha256 }) => [id, { id, sha256 }])).values()]; }
+  function requiredModelData(demandId: string): { id: string; sha256: string }[] {
+    const demand = options.store.getDemand(demandId), stage = stageFor(demand), configuration = config(), materials = materialSet(demand, stage);
+    if (stage !== 'review') { insist(demand.methodSnapshot.review, 'BOUNDARY_METHOD_MISSING', 'The next independent review also requires the frozen review method.'); materials.push(...evidence.method(demand.methodSnapshot.review)); }
+    // Preserve only explicitly selected revisions after K has filtered project,
+    // role, baseline, target, environment and invalidation, before any body read.
+    const selected = (configuration.provider?.data ?? []).filter(material => material.id.startsWith('knowledge:')).map(material => material.id.slice('knowledge:'.length));
+    if (selected.length) {
+      const binding = options.workspace().getBinding(demandId)!, project = options.workspace().getProject(demand.projectId);
+      insist(configuration.runtime, 'RUNTIME_CONFIGURATION_MISSING', 'Knowledge applicability requires the exact runtime profile.');
+      const roles: KnowledgeRole[] = stage === 'planning' ? ['planner', 'reviewer'] : stage === 'implementation' ? ['implementer', 'reviewer'] : ['reviewer'];
+      for (const role of roles) {
+        const manifest = options.knowledge.createContext({ runId: `approval-${randomUUID()}`, projectId: demand.projectId, demandId, role, baseline: binding.currentBaseline, formalTarget: project.formalTarget, environment: currentKnowledgeEnvironment(), allowedRevisionIds: selected, purpose: 'Prepare exact user-selected knowledge data approval' });
+        for (const id of manifest.revisionIds) { const item = options.knowledge.read(manifest.contextId, id); materials.push({ id: `knowledge:${id}`, kind: 'knowledge', sha256: item.object.sha256, content: item.body }); }
+      }
+    }
+    return [...new Map(materials.map(({ id, sha256 }) => [id, { id, sha256 }])).values()];
+  }
   function approvedMaterials(grant: ModelGrant, materials: AgentMaterial[]): void { insist(materials.every(material => grant.data.some(data => data.id === material.id && data.sha256 === material.sha256)), 'MODEL_DATA_APPROVAL_MISSING', 'The current demand text, source scope, frozen method, and selected artifact versions must all be covered by the explicit data approval.'); }
   function diagnostics(demandId?: string): ProductionDiagnostics {
     const blockers: string[] = []; let profileVerified = false, budgetAvailable = false, workspaceVerified = false;
@@ -267,15 +323,19 @@ function composeProductionServices(options: ProductionOptions, synthetic?: Synth
         assertRun(channel); insist(channel.ready && profile && (boundary ? boundaryNative : native)?.getResourceEvidence(runtime.runId)?.provisioned === true, 'WORKER_NOT_READY', 'Native private Worker context has not been observed ready.');
         const current = selectGrant(run.demandId, runtime.role); insist(current.id === grant.id, 'MODEL_GRANT_CHANGED', 'The bound grant cannot be silently replaced.'); approvedMaterials(current, materials);
         insist((current as ModelGrant & { contextPolicy?: string }).contextPolicy === 'approved-run-derived-v1', 'CONTEXT_PERMISSION_MISSING', 'Generated run context was not explicitly approved.');
+        const currentSource = evidence.sourceMaterial(run.demandId);
+        insist(runtime.writes || currentSource.sha256 === materials.find(input => input.id === currentSource.id)?.sha256, 'READ_ONLY_SOURCE_CHANGED', 'Source changed outside the exact approved read-only session.');
         insist(Buffer.byteLength(material.text) <= MAX_CONTEXT_BYTES, 'CONTEXT_TOO_LARGE', 'Generated context exceeds the bounded data channel.');
         return { decisionId: current.decisionId };
       } });
     if (boundary) init.prompt = `Artifact references may use {id,digest:'pending',location:'host-artifact'} matching artifactBodies. Independently review the exact current plan ${run.planId} against the supplied source, scope and review method. You have a new empty read-only session with context ${contextId}; planning context is ${run.contextId}. No planner conversation or summaries are supplied. Report plan-ready only after checking boundary, tickets, acceptance/check coverage, scope, and unresolved questions, with boundaryReview:{contextId:'${contextId}',planningContextId:'${run.contextId}',evidence:<registered artifact ref>,unresolvedBlockingFindings:[]}. Include artifactBodies:[{id,kind:'check-evidence',text}] with concrete review observations and references. Report blocked if any unresolved blocker exists. Never claim to have run a check without an observed controlled_node result.`;
-    channel = { run, runtime, init, endpoint, abort: new AbortController(), ready: false, settled: false, modelObserved: false, pending: [], handoffs: [], grantId: grant.id, boundary, contextId, checks: new Map() }; channels.set(runtime.runId, channel);
+    channel = { run, runtime, init, endpoint, abort: new AbortController(), ready: false, settled: false, modelObserved: false, pending: [], handoffs: [], grantId: grant.id, boundary, contextId }; channels.set(runtime.runId, channel);
     evidence.recordRun(boundary ? { ...run, id: `boundary-${runtime.runId}`, stage: 'review', contextId } : run, { materials, source: materials.find(m => m.id === `source-scope:${run.demandId}`)!, role: runtime.role, sessionId: init.sessionId, runtimeRunId: runtime.runId, generation: runtime.generation });
     if (boundary) options.store.db.prepare('UPDATE host_boundary_runs SET runtime_run_id=?,body=? WHERE domain_run_id=?').run(runtime.runId, canonicalJson({ materials, source: materials.find(m => m.kind === 'source'), sessionId: init.sessionId }), run.id);
-    const roots = [...new Set([profile.config.node.path, profile.config.worker.path].map(file => canonicalDirectory(dirname(file))))];
-    for (const root of roots) { for (const protectedPath of [stateDirectory, dirname(stateDirectory), ...options.store.listProjects().map(project => project.rootPath)]) { const rel = relative(root, protectedPath); insist(rel.startsWith('..') || isAbsolute(rel), 'RUNTIME_ROOT_UNSAFE', 'A runtime dependency root cannot include Host state, project anchors or private sessions.'); } }
+    // Compatibility field name: these are exact pinned files, never parent
+    // directories. Native ACLs grant only these files and ancestor traversal.
+    const roots = [...new Set([profile.config.node.path, profile.config.worker.path])];
+    for (const file of roots) { noLinks(file); for (const protectedPath of [stateDirectory, ...options.store.listProjects().map(project => project.rootPath)]) { const rel = relative(protectedPath, file); insist(rel.startsWith('..') || isAbsolute(rel), 'RUNTIME_ROOT_UNSAFE', 'Pinned runtime files must remain outside mutable project source and Host state.'); } }
     return { profileName: `pi-kanban-${runtime.demandId}-${runtime.role}-${runtime.generation}`, scratch,
       aclEvidence: profile.evidenceDigests.join(','), privateChannelEvidence: profile.evidenceDigests.join(','), processLimit: 8, memoryLimitBytes: 1024 * 1024 * 1024, workerInit: init as unknown as Record<string, unknown>,
       resourceAuthorizationId: grant.decisionId, readonlyRuntimeRoots: roots } as WindowsRunBootstrap;
@@ -290,21 +350,26 @@ function composeProductionServices(options: ProductionOptions, synthetic?: Synth
       for (const item of artifactBodies) {
         const artifact = item as { id: string; kind: AgentMaterial['kind']; text: string };
         insist(artifact && ['plan', 'knowledge', 'check-evidence'].includes(artifact.kind), 'ARTIFACT_KIND_DENIED', 'Only plan, knowledge and check-evidence bodies are accepted from reports.');
-        const ref = evidence.save({ ...artifact, projectId: demand.projectId, demandId: demand.id, runId: channel.run.id });
+        const ref = evidence.save({ ...artifact, projectId: demand.projectId, demandId: demand.id, runId: channel.boundary ? `boundary-${channel.runtime.runId}` : channel.run.id });
         const grant = options.budget.getGrant(channel.grantId);
         insist(channel.modelObserved && grant.contextPolicy === 'approved-run-derived-v1', 'DERIVED_ARTIFACT_DENIED', 'Only model-observed artifacts from the explicitly approved generated context can enter later model input.');
         options.budget.authorizeData({ grantId: grant.id, decisionId: grant.decisionId, material: { id: ref.id, sha256: ref.digest } }, () => {});
       }
     }
     const substitute = (item: unknown): unknown => { if (Array.isArray(item)) return item.map(substitute); if (item && typeof item === 'object') { const object = item as Record<string, unknown>; if (object.location === 'host-artifact' && typeof object.id === 'string') return evidence.reference(channel.run.demandId, object.id); return Object.fromEntries(Object.entries(object).map(([key, child]) => [key, substitute(child)])); } return item; };
-    return substitute(value) as WorkerReport;
+    const report = substitute(value) as WorkerReport;
+    if (report.type === 'check') report.check.environment = nativeEnvironment(channel.runtime);
+    return report;
   }
-  async function settle(channel: ActiveChannel): Promise<void> {
+  function nativeEnvironment(runtime: RunRecord): string { return canonicalJson({ profileId: runtime.profileId, profileDigest, evidenceDigests: profile?.evidenceDigests, synthetic: !!synthetic }); }
+  function currentKnowledgeEnvironment(): string { refreshNative(); return nativeEnvironment({ profileId: profile!.config.profileId } as RunRecord); }
+  async function settle(channel: ActiveChannel, aborted = false): Promise<void> {
     insist(coordinator, 'HOST_CHANNEL_UNBOUND', 'Coordinator is unavailable.');
     channel.settled = true; channel.abort.abort();
     const stopped = await (channel.boundary ? boundarySupervisor! : coordinator.supervisor).stop(channel.runtime.runId, 'worker-terminal-handoff');
     if (stopped.state !== 'stopped' || (channel.boundary ? boundaryNative : native)?.getResourceEvidence(channel.runtime.runId)?.revoked !== true) { options.workflow.markInterrupted(channel.run.id, 'Worker handoff has no verified complete native Job stop.'); return; }
     retainRevocation(channel.runtime.runId, channel.boundary ? boundaryNative : native);
+    if (aborted) { channel.pending.length = 0; channel.handoffs.length = 0; options.workflow.blockDemand(channel.run.demandId, 'WORKER_ABORTED', 'An aborted session cannot establish a completed stage handoff.'); return; }
     for (const queued of channel.pending) {
       if (queued.type === 'content-ready' && queued.content.code.location === 'current-worktree') {
         const demand = options.store.getDemand(channel.run.demandId);
@@ -314,13 +379,19 @@ function composeProductionServices(options: ProductionOptions, synthetic?: Synth
       }
       if (channel.boundary && queued.type === 'plan-ready') {
         insist(channel.modelObserved && channel.ready && channel.init.role === 'boundary-review' && channel.contextId !== channel.run.contextId && evidence.sourceMaterial(channel.run.demandId).sha256 === channel.init.materials.find(m => m.id === `source-scope:${channel.run.demandId}`)?.sha256, 'BOUNDARY_REVIEW_UNVERIFIED', 'The independent review did not retain its exact read-only source/context.');
-        evidence.read(channel.run.demandId, queued.boundaryReview.evidence);
+        const demand = options.store.getDemand(channel.run.demandId), plan = demand.plans.find(plan => plan.id === queued.planId);
+        insist(plan && channel.init.materials.some(material => canonicalJson(material) === canonicalJson(planMaterial(plan))), 'BOUNDARY_PLAN_CHANGED', 'Boundary review must cover the exact immutable scope and required checks.');
+        evidence.requireOrigin(channel.run.demandId, queued.boundaryReview.evidence, `boundary-${channel.runtime.runId}`);
         options.store.db.prepare("UPDATE host_boundary_runs SET status='observed',body=? WHERE domain_run_id=?").run(canonicalJson({ runId: channel.runtime.runId, contextId: channel.contextId, planningRunId: channel.run.id, planId: queued.planId, evidenceDigest: queued.boundaryReview.evidence.digest, actualReviewObserved: true, isolatedInputsVerified: true }), channel.run.id);
       }
       const receipt = coordinator.report(channel.run.id, queued);
       if (channel.boundary && receipt.status === 'applied') options.store.db.prepare("UPDATE host_boundary_runs SET status='complete' WHERE domain_run_id=?").run(channel.run.id); if (receipt.status === 'applied') channel.handoffs.push(queued.type);
     }
     channel.pending.length = 0;
+    if (channel.modelObserved && !channel.boundary) {
+      const demand = options.store.getDemand(channel.run.demandId), content = demand.contents.find(content => content.id === demand.activeContentId);
+      authorizeDerived(channel, [...(content ? [contentMaterial(content)] : []), reworkMaterial(demand)]);
+    }
     if (channel.boundary && !channel.handoffs.includes('plan-ready')) { options.store.db.prepare("UPDATE host_boundary_runs SET status='failed' WHERE domain_run_id=?").run(channel.run.id); const current = options.store.getDemand(channel.run.demandId); if (current.activePlanId === channel.run.planId && current.cycle === channel.run.cycle && current.control === 'active') options.workflow.blockDemand(channel.run.demandId, 'BOUNDARY_REVIEW_FAILED', 'The independent reviewer stopped without a verified ready handoff.'); }
     if (!channel.boundary && channel.run.stage === 'planning' && channel.handoffs.includes('plan-draft')) await launchBoundary(channel);
   }
@@ -362,21 +433,26 @@ function composeProductionServices(options: ProductionOptions, synthetic?: Synth
     insist(value.generation === runtime.generation && (value.runId === runtime.runId || value.runtimeRunId === runtime.runId), 'CHANNEL_IDENTITY_DENIED', 'Worker event identity mismatch.');
     if (value.type === 'worker.ready') { insist(value.sessionId === channel.init.sessionId && !channel.ready, 'SESSION_IDENTITY_DENIED', 'Worker session identity mismatch or replay.'); channel.ready = true; return; }
     if (value.type === 'worker.event') return; // Worker telemetry never proves subprocess completion.
-    if (value.type === 'worker.settled') { insist(value.sessionId === channel.init.sessionId && !channel.settled, 'SESSION_IDENTITY_DENIED', 'Unknown or replayed terminal event.'); await settle(channel); return; }
+    if (value.type === 'worker.settled') { insist(value.sessionId === channel.init.sessionId && !channel.settled && typeof value.aborted === 'boolean', 'SESSION_IDENTITY_DENIED', 'Unknown or replayed terminal event.'); await settle(channel, value.aborted); return; }
     insist(equal(value.capability, channel.init.capability), 'CHANNEL_CAPABILITY_DENIED', 'Private capability mismatch.');
     if (value.type === 'worker.check-request') {
       assertRun(channel);
+      insist(channel.ready && channel.modelObserved, 'MODEL_OBSERVATION_REQUIRED', 'Native tools require an observed model operation in this exact session.');
       insist(typeof value.requestId === 'string' && /^[a-zA-Z0-9-]{1,200}$/.test(value.requestId) && typeof value.toolCallId === 'string' && value.toolCallId.length <= 200 && Array.isArray(value.args) && value.args.length > 0 && value.args.length <= 64 && value.args.every(arg => typeof arg === 'string' && !arg.includes('\0') && arg.length <= 8192) && value.args.join('').length <= 32768, 'CHECK_SCOPE_DENIED', 'Only a bounded Node argument vector is accepted.');
       const requestId = value.requestId, args = value.args as string[];
       let leased = false;
       try {
         insist(!options.store.db.prepare('SELECT 1 FROM host_native_check_lease').get(), 'CHECK_CAPACITY', 'Another native check owns the single global check slot; wait for its observed completion.');
         insist(!options.store.db.prepare('SELECT 1 FROM host_native_checks WHERE request_id=?').get(requestId), 'CHECK_REPLAY', 'A native command request ID cannot execute twice.');
+        const sourceBefore = evidence.sourceMaterial(channel.run.demandId);
+        if (!runtime.writes) insist(channel.init.materials.some(material => material.id === sourceBefore.id && material.sha256 === sourceBefore.sha256), 'CHECK_CONTENT_CHANGED', 'Read-only checks require the exact initial source scope.');
         options.store.db.prepare('INSERT INTO host_native_check_lease VALUES(1,?,?)').run(runtime.runId, requestId); leased = true;
         const observation = await targetDriver.runNodeCheck(runtime.runId, args, { timeoutMs: 120_000, maxOutputBytes: 524_288 }, requestId);
         insist(observation.requestId === requestId && ['exited', 'timeout', 'output-limit', 'descendants-survived', 'launch-failed'].includes(observation.reason), 'NATIVE_CHECK_INVALID', 'Native receipt does not match the requested operation.');
         const { outputBase64: _duplicateOutput, ...nativeEvidence } = observation.nativeEvidence;
-        const record = { provenance: synthetic ? 'synthetic-native-receipt' : 'native-helper-command-observation', runtimeRunId: runtime.runId, generation: runtime.generation, toolCallId: value.toolCallId, args, requestId, exitCode: observation.exitCode, reason: observation.reason, output: observation.output, nativeEvidence: { ...nativeEvidence, outputSha256: hash(observation.output) } };
+        const sourceAfter = evidence.sourceMaterial(channel.run.demandId);
+        insist(runtime.writes || sourceBefore.sha256 === sourceAfter.sha256, 'CHECK_CONTENT_CHANGED', 'Source changed during the read-only native check.');
+        const record = { provenance: synthetic ? 'synthetic-native-receipt' : 'native-helper-command-observation', runtimeRunId: runtime.runId, generation: runtime.generation, environment: nativeEnvironment(runtime), sourceBefore: sourceBefore.sha256, sourceAfter: sourceAfter.sha256, toolCallId: value.toolCallId, args, requestId, exitCode: observation.exitCode, reason: observation.reason, output: observation.output, nativeEvidence: { ...nativeEvidence, outputSha256: hash(observation.output) } };
         const demand = options.store.getDemand(channel.run.demandId);
         const ref = evidence.save({ id: `native-check-${requestId}`, projectId: demand.projectId, demandId: demand.id, runId: channel.run.id, kind: 'check-evidence', text: canonicalJson(record) });
         options.store.db.prepare('INSERT INTO host_native_checks VALUES(?,?,?,?,?)').run(requestId, runtime.runId, channel.run.id, ref.id, canonicalJson(record));
@@ -393,36 +469,56 @@ function composeProductionServices(options: ProductionOptions, synthetic?: Synth
       return;
     }
     if (value.type === 'worker.stop-required') { if (channel.boundary) { channel.abort.abort(); await boundarySupervisor!.stop(runtime.runId, 'worker-tool-stop-required'); } else await coordinator!.stopDomainRun(channel.run.id, 'worker-tool-stop-required'); return; }
-    insist(value.type === 'worker.report' && channel.ready, 'FRAME_TYPE_DENIED', 'Unknown Worker frame.');
+    insist(value.type === 'worker.report' && channel.ready && !channel.settled, 'FRAME_TYPE_DENIED', 'Unknown Worker frame or already settled session.');
+    const reportType = (value.report as { type?: string } | undefined)?.type;
+    insist(channel.modelObserved || reportType === 'blocked', 'MODEL_OBSERVATION_REQUIRED', 'Artifacts and Worker self-report alone cannot establish stage progress.');
     const report = ingestReport(channel, value.report);
     try {
-      if (report.type === 'content-ready' || (channel.boundary && report.type === 'plan-ready')) { insist(channel.pending.length === 0, 'REPORT_PENDING', 'One immutable terminal content report is already queued.'); channel.pending.push(report); targetDriver.sendWorkerFrame(runtime.runId, { type: 'worker.receipt', requestId: report.requestId, ok: true, value: { status: 'pending-stop-verification' } }); }
+      if (report.type === 'content-ready' || ['check', 'review', 'resolve-finding'].includes(report.type) || (channel.boundary && report.type === 'plan-ready')) { insist(channel.pending.length < 128 && (!(report.type === 'content-ready' || report.type === 'plan-ready') || channel.pending.length === 0), 'REPORT_PENDING', 'Terminal evidence exceeds the bounded pending-report scope.'); channel.pending.push(report); targetDriver.sendWorkerFrame(runtime.runId, { type: 'worker.receipt', requestId: report.requestId, ok: true, value: { status: 'pending-stop-verification' } }); }
       else { insist(!channel.boundary || report.type === 'blocked', 'BOUNDARY_REPORT_DENIED', 'A boundary reviewer can only submit its ready evidence or a blocker.'); const receipt = coordinator!.report(channel.run.id, report);
-        if (report.type === 'plan-draft') options.store.db.prepare("INSERT INTO host_boundary_runs VALUES(?,?,?,NULL,'pending',NULL) ON CONFLICT(domain_run_id) DO NOTHING").run(channel.run.id, report.plan.id, `boundary-context-${randomUUID()}`); if ((receipt.status === 'applied' || (receipt.status === 'noop' && report.type === 'plan-draft')) && ['plan-draft', 'review', 'check', 'resolve-finding', 'blocked'].includes(report.type)) channel.handoffs.push(report.type); targetDriver.sendWorkerFrame(runtime.runId, { type: 'worker.receipt', requestId: report.requestId, ok: true, value: receipt }); }
+        if (report.type === 'plan-draft' && ['applied', 'noop'].includes(receipt.status)) { options.store.db.prepare("INSERT INTO host_boundary_runs VALUES(?,?,?,NULL,'pending',NULL) ON CONFLICT(domain_run_id) DO NOTHING").run(channel.run.id, report.plan.id, `boundary-context-${randomUUID()}`); authorizeDerived(channel, [planMaterial(report.plan)]); } if ((receipt.status === 'applied' || (receipt.status === 'noop' && report.type === 'plan-draft')) && ['plan-draft', 'review', 'check', 'resolve-finding', 'blocked'].includes(report.type)) channel.handoffs.push(report.type); targetDriver.sendWorkerFrame(runtime.runId, { type: 'worker.receipt', requestId: report.requestId, ok: true, value: receipt }); }
     } catch (error) { targetDriver.sendWorkerFrame(runtime.runId, { type: 'worker.receipt', requestId: report.requestId, ok: false, error: error instanceof RuntimeError ? error.code : 'REPORT_REJECTED' }); }
   }
   const prerequisites: ExecutionPrerequisites = {
     inspect: diagnostics,
     launchFor(run) { const facts = diagnostics(run.demandId); insist(facts.executionEnabled && profile, 'EXECUTION_BLOCKED', facts.blockers.join('; ')); return { workspace: options.workspace().getBinding(run.demandId)!.worktreePath, profileId: profile.config.profileId, timeoutMs: 30 * 60_000, maxOutputBytes: 16 * 1024 * 1024 }; },
-    verifyWorkspaceAfterStop(demandId) { try { evidence.source(demandId); const runs = coordinator?.supervisor.list().filter(run => run.demandId === demandId && run.state === 'stopped') ?? []; return runs.length > 0 && runs.every(run => !!options.store.db.prepare('SELECT 1 FROM host_native_revocations WHERE run_id=?').get(run.runId) || (run.role === 'boundary-review' ? boundaryNative : native)?.getResourceEvidence(run.runId)?.revoked === true); } catch { return false; } },
+    verifyWorkspaceAfterStop(demandId) { try { evidence.source(demandId); const demand = options.store.getDemand(demandId), latest = options.store.listRuns(demandId).sort((a, b) => b.generation - a.generation)[0];
+      if (latest?.stage === 'review') { const content = demand.contents.find(content => content.id === latest.contentId); if (!content || !evidence.stable(demandId, content.code)) return false; for (const ref of content.knowledge) evidence.read(demandId, ref); }
+      const runs = coordinator?.supervisor.list().filter(run => run.demandId === demandId && run.state === 'stopped') ?? []; return runs.length > 0 && runs.every(run => !!options.store.db.prepare('SELECT 1 FROM host_native_revocations WHERE run_id=?').get(run.runId) || (run.role === 'boundary-review' ? boundaryNative : native)?.getResourceEvidence(run.runId)?.revoked === true); } catch { return false; } },
     verifyReport(report, run) {
-      const runtime = coordinator?.supervisor.list().find(runtime => runtime.grantId === run.id);
+      const runtime = coordinator?.supervisor.list().find(runtime => runtime.grantId === run.id && runtime.role === run.stage);
       if (report.type === 'plan-ready') {
         const row = options.store.db.prepare("SELECT * FROM host_boundary_runs WHERE domain_run_id=? AND status IN ('observed','complete')").get(run.id);
         insist(row?.body && row.plan_id === report.planId, 'BOUNDARY_REVIEW_UNAVAILABLE', 'No independently observed read-only boundary review covers this exact plan.');
         const demand = options.store.getDemand(run.demandId), plan = demand.plans.find(plan => plan.id === report.planId);
         insist(plan, 'PLAN_MISSING', 'The reviewed plan is unavailable.');
+        const boundary = coordinator?.supervisor.list().find(candidate => candidate.runId === row.runtime_run_id && candidate.role === 'boundary-review');
+        const boundEvidence = options.store.db.prepare('SELECT body FROM host_run_evidence WHERE run_id=?').get(`boundary-${row.runtime_run_id}`);
+        insist(boundary?.state === 'stopped' && !!options.store.db.prepare('SELECT 1 FROM host_native_revocations WHERE run_id=?').get(boundary.runId) && boundEvidence, 'BOUNDARY_STOP_UNVERIFIED', 'Independent review requires durable complete native stop and exact input evidence.');
+        const context = JSON.parse(String(boundEvidence.body)) as { materials: AgentMaterial[]; source: AgentMaterial };
+        insist(context.source.sha256 === evidence.sourceMaterial(run.demandId).sha256 && context.materials.some(material => canonicalJson(material) === canonicalJson(planMaterial(plan))) && evidence.method(demand.methodSnapshot.review!).every(method => context.materials.some(material => canonicalJson(material) === canonicalJson(method))), 'BOUNDARY_INPUTS_CHANGED', 'The exact source, scope and frozen review method must match the independent session.');
+        evidence.requireOrigin(run.demandId, report.boundaryReview.evidence, `boundary-${boundary.runId}`);
         for (const ref of [plan.spec, plan.tickets, report.boundaryReview.evidence]) evidence.read(run.demandId, ref);
         return { artifactsVerified: true, boundaryReview: JSON.parse(String(row.body)) };
       }
       if (report.type === 'check') {
         const row = options.store.db.prepare('SELECT body FROM host_native_checks WHERE domain_run_id=? AND artifact_id=?').get(run.id, report.check.evidence.id);
         insist(run.stage === 'review' && row, 'CHECK_EXECUTION_UNVERIFIED', 'Check evidence requires an actually observed native subprocess receipt from this independent review run.');
-        const observed = JSON.parse(String(row.body)) as { reason: string; exitCode: number | null; generation: string; runtimeRunId: string };
+        const observed = JSON.parse(String(row.body)) as { reason: string; exitCode: number | null; generation: string; runtimeRunId: string; sourceBefore: string; sourceAfter: string; environment: string };
         insist(runtime && observed.runtimeRunId === runtime.runId && observed.generation === runtime.generation, 'CHECK_GENERATION_MISMATCH', 'Native command receipt belongs to another execution generation.');
         insist(report.check.status !== 'passed' || (observed.reason === 'exited' && observed.exitCode === 0), 'CHECK_NOT_PASSED', 'Only an observed clean native exit may support a passed check.');
         const content = options.store.getDemand(run.demandId).contents.find(content => content.id === report.check.contentId);
-        insist(content && evidence.stable(run.demandId, content.code), 'CHECK_CONTENT_CHANGED', 'Native check does not cover the current exact source snapshot.');
+        insist(content && evidence.stable(run.demandId, content.code) && observed.sourceBefore === content.code.digest && observed.sourceAfter === content.code.digest, 'CHECK_CONTENT_CHANGED', 'Native check does not cover the current exact source snapshot.');
+        insist(report.check.environment === observed.environment && observed.environment === nativeEnvironment(runtime), 'CHECK_ENVIRONMENT_CHANGED', 'Only the exact Host-observed native environment can label a check.');
+      }
+      if (!['blocked', 'runtime-ended', 'message-delivered', 'message-applied'].includes(report.type)) {
+        const channel = runtime ? channels.get(runtime.runId) : undefined;
+        insist(channel?.ready && channel.modelObserved, 'MODEL_OBSERVATION_REQUIRED', 'An observed model session is required for a stage evidence handoff.');
+      }
+      if (report.type === 'review' || report.type === 'resolve-finding') {
+        const demand = options.store.getDemand(run.demandId), content = demand.contents.find(content => content.id === report.contentId), plan = demand.plans.find(plan => plan.id === run.planId), channel = channels.get(runtime!.runId)!;
+        insist(plan && content && [...evidence.method(run.method), planMaterial(plan), contentMaterial(content), evidence.read(demand.id, content.code), ...content.knowledge.map(ref => evidence.read(demand.id, ref))].every(expected => channel.init.materials.some(material => canonicalJson(material) === canonicalJson(expected))), 'REVIEW_INPUTS_CHANGED', 'Review must bind the exact frozen method, plan, code and local knowledge versions.');
+        evidence.requireOrigin(run.demandId, report.evidence, run.id);
       }
       return evidence.verification(report, run, runtime?.state === 'stopped');
     },
@@ -452,6 +548,6 @@ function composeProductionServices(options: ProductionOptions, synthetic?: Synth
     }
     await coordinator?.tick();
   }
-  return { synthetic: !!synthetic, driver, prerequisites, evidence, prepareDemand, tick, stopAllAuxiliary, auxiliaryStatus, diagnostics, captureMethods, requiredModelData, bindCoordinator(value: ExecutionCoordinator) { insist(!coordinator || coordinator === value, 'COORDINATOR_CONFLICT', 'Production services are already bound.'); coordinator = value; } };
+  return { synthetic: !!synthetic, driver, prerequisites, evidence, prepareDemand, tick, stopAllAuxiliary, auxiliaryStatus, diagnostics, captureMethods, requiredModelData, currentKnowledgeEnvironment, bindCoordinator(value: ExecutionCoordinator) { insist(!coordinator || coordinator === value, 'COORDINATOR_CONFLICT', 'Production services are already bound.'); coordinator = value; } };
 }
 export type ProductionServices = ReturnType<typeof createProductionServices>;

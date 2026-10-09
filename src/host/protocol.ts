@@ -1,6 +1,6 @@
 /** The desktop control protocol is deliberately separate from Worker reports. */
 export const MAX_FRAME_BYTES = 128 * 1024;
-export const COMMANDS = new Set(['start-planning', 'confirm-plan', 'authorize-implementation', 'pause', 'resume', 'cancel', 'accept-result', 'return-result']);
+export const COMMANDS = new Set(['start-planning', 'confirm-plan', 'authorize-implementation', 'pause', 'resume', 'cancel', 'accept-result', 'return-result', 'revise-plan', 'decide-finding', 'resolve-blocker', 'switch-method']);
 export class ProtocolError extends Error {
   code: string;
   constructor(code: string, message: string) { super(message); this.code = code; }

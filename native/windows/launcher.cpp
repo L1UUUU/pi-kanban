@@ -199,14 +199,16 @@ DWORD ControlledJob::Launch(const LaunchDescriptor& d, const PrivateHandles& cha
   watchdog_ = std::jthread([this, timeout = d.timeout_ms](std::stop_token stop) {
     const ULONGLONG deadline = GetTickCount64() + timeout;
     while (!stop.stop_requested() && GetTickCount64() < deadline) Sleep(10);
-    if (!stop.stop_requested()) TerminateJobObject(job_, ERROR_TIMEOUT);
+    if (!stop.stop_requested()) Stop(ERROR_TIMEOUT);
   });
   return ERROR_SUCCESS;
 }
 DWORD ControlledJob::SpawnNodeCheck(const LaunchDescriptor& d, const std::vector<std::wstring>& args, HANDLE input, HANDLE output, PROCESS_INFORMATION* result) {
+  std::lock_guard lock(spawn_stop_mutex_);
+  if (stopping_) return ERROR_OPERATION_ABORTED;
   if (!job_ || !result || args.empty() || args.size() > 64 || d.generation != identity_.generation) return ERROR_INVALID_PARAMETER;
   DWORD error = ValidateDescriptor(d); if (error) return error;
-  size_t total = 0; for (const auto& argument : args) { total += argument.size(); if (argument.find(L'\0') != std::wstring::npos) return ERROR_INVALID_PARAMETER; }
+  size_t total = 0; for (const auto& argument : args) { total += argument.size(); if (argument.size() > 8192 || argument.find(L'\0') != std::wstring::npos) return ERROR_INVALID_PARAMETER; }
   if (total > 32768) return ERROR_INVALID_PARAMETER;
   Sid sid; const HRESULT sid_result = DeriveAppContainerSidFromAppContainerName(d.profile_name.c_str(), &sid.value); if (FAILED(sid_result)) return HRESULT_CODE(sid_result);
   SECURITY_CAPABILITIES security{}; security.AppContainerSid = sid.value; // Same identity, no capabilities.
@@ -255,6 +257,8 @@ DWORD ControlledJob::ProcessIds(std::vector<DWORD>& ids) const {
   return ERROR_SUCCESS;
 }
 DWORD ControlledJob::Stop(DWORD exit_code) {
+  std::lock_guard lock(spawn_stop_mutex_);
+  stopping_ = true;
   if (!job_) return ERROR_INVALID_HANDLE;
   if (!TerminateJobObject(job_, exit_code)) return GetLastError();
   const ULONGLONG deadline = GetTickCount64() + 10000;

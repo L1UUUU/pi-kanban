@@ -118,7 +118,8 @@ export class RuntimeSupervisor {
   async observe(runId: string): Promise<RunRecord> {
     const run = this.get(runId);
     if (run.state === 'stopped') return run;
-    if (!run.identity) return run;
+    // A native recovery receipt can prove a launch that completed before the
+    // Host registered its PID. The trusted driver must still fail closed without proof.
     try {
       const observation = await this.driver.observe(run);
       if (observation.state === 'stopped') this.applyObservation(runId, observation);
@@ -130,7 +131,6 @@ export class RuntimeSupervisor {
   /** Observation only. Recovery never starts/resumes work or clears usage. */
   async recover(): Promise<RunRecord[]> {
     for (const run of this.list().filter(x => x.state !== 'stopped')) {
-      if (!run.identity) { this.transaction(() => this.setState(run.runId,'unknown','Launch may have occurred before registration')); continue; }
       try {
         const observation = await this.driver.observe(run);
         if (observation.state === 'stopped') this.applyObservation(run.runId,observation);

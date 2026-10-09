@@ -60,10 +60,32 @@ const syntheticConfiguration = (): ConfigurationSummary => {
 };
 const params = new URLSearchParams(location.search);
 let state: ViewState = params.get('view') === 'empty' ? { ...syntheticPreview, projects: [], demands: [], selected: undefined } : params.get('view') === 'onboarding' ? { ...syntheticPreview, selected: undefined } : structuredClone(syntheticPreview);
+// Isolated synthetic control fixtures; no production entry imports this module.
+if (params.has('decisions')) {
+  const target = state.demands[0]!;
+  target.result = undefined; target.phase = 'blocked'; target.runState = 'stopped';
+  target.activeContentId = 'synthetic-current-content'; target.workflowBlockers = [];
+  target.methodSnapshot = { planning: { id: 'synthetic-old-planning', version: 'synthetic-v0', digest: 'f'.repeat(64), adapter: 'synthetic-only' } };
+  if (params.get('decisions') === 'plan') {
+    target.plan = { id: 'synthetic-unresolved-plan', scope: '合成待明确方案', ready: false, confirmed: false, unresolvedQuestions: ['合成问题：日期边界使用哪个时区？'] };
+    target.workflowBlockers = ['合成阻塞：需要明确时区'];
+  } else if (params.get('decisions') === 'finding') {
+    target.findings = [
+      { id: 'synthetic-decision-f1', severity: 'decision', status: 'open', contentId: target.activeContentId, reviewRunId: 'synthetic-review-1', location: 'synthetic://export/date', basis: '合成：请选择日期边界行为。', impact: '合成：影响跨时区导出。', verification: '合成：核对边界测试。' },
+      { id: 'synthetic-blocking-f2', severity: 'blocking', status: 'open', contentId: target.activeContentId, reviewRunId: 'synthetic-review-1', location: 'synthetic://export/date', basis: '合成：必要边界检查未通过。', impact: '合成：错误范围。', verification: '合成：修复后重跑检查。' },
+      { id: 'synthetic-historical-f3', severity: 'decision', status: 'open', contentId: 'synthetic-old-content', reviewRunId: 'synthetic-review-old', location: 'synthetic://old', basis: '合成历史决定。', impact: '历史内容。', verification: '不适用于当前内容。' },
+    ];
+    target.workflowBlockers = ['User decision required: synthetic-decision-f1'];
+  } else if (params.get('decisions') === 'blocker') target.workflowBlockers = ['合成：等待补齐检查环境'];
+  else if (params.get('decisions') === 'method') state.configuration = syntheticConfiguration();
+  target.blockers = [...target.workflowBlockers];
+}
 const latency = Math.min(1000, Math.max(0, Number(params.get('latency')) || 0));
 const waitForSyntheticResponse = () => new Promise<void>(resolve => setTimeout(resolve, latency));
 const listeners = new Set<(next: ViewState) => void>();
 const publish = () => { state = { ...state, sequence: state.sequence + 1 }; for (const listener of listeners) listener(structuredClone(state)); return structuredClone(state); };
+window.addEventListener('pi-kanban:synthetic-change-version', () => { state.demands[0]!.version += 1; publish(); });
+window.addEventListener('pi-kanban:synthetic-change-configuration', () => { if (state.configuration) state.configuration.configurationDigest = '9'.repeat(64); publish(); });
 const previewBridge: WorkbenchBridge = {
   snapshot: async () => structuredClone(state),
   subscribe: listener => { listeners.add(listener); return () => listeners.delete(listener); },
