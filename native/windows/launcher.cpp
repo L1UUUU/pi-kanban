@@ -316,6 +316,11 @@ DWORD ControlledJob::ProcessIds(std::vector<DWORD>& ids) const {
   ids.clear(); for (DWORD i = 0; i < list->NumberOfProcessIdsInList; ++i) ids.push_back(static_cast<DWORD>(list->ProcessIdList[i]));
   return ERROR_SUCCESS;
 }
+DWORD ControlledJob::ContainsProcess(HANDLE process, BOOL* member) const {
+  if (!job_ || !process || !member) return ERROR_INVALID_HANDLE;
+  if (!IsProcessInJob(process, job_, member)) return GetLastError();
+  return ERROR_SUCCESS;
+}
 DWORD ControlledJob::Stop(DWORD exit_code) {
   std::lock_guard lock(spawn_stop_mutex_);
   stopping_ = true;

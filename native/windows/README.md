@@ -171,6 +171,15 @@ exercise command completion and receipt-to-next-command handoff without extendin
 existing helper deadline. Both launch failure and normal completion release their single
 check slot before publishing the receipt; the prior command never clears a newer slot.
 
+Baseline and unexpected-process diagnostics additionally attempt read-only handle queries
+for image path, birth/exit time, zero-time wait, exit code and membership in this exact Job.
+Each list records at most eight processes and 512 image-path characters per process, with
+omitted counts and API errors explicit. Handles are non-inheritable and request only
+limited query/synchronize access, without enabling privileges. An observed system image,
+apparently exited process or failed query never exempts the unexpected PID from the
+existing Job-wide stop or turns that failed command into success. The observations are
+sequential snapshots, not permission to terminate or trust a process by bare PID.
+
 The report identifies `toolScope: "node-native-tools-only"`; adding `--git-bash` produces
 the separately labeled `node-and-git-bash-diagnostic` report. The recorder always emits
 `releaseAuthorized: false`: it is partial real-runtime

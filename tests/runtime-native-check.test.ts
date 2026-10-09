@@ -7,7 +7,7 @@ test('native receipt codec binds command identity, process birth, OS result and 
 test('native launch failure cannot masquerade as a successful check',()=>{const failure={...receipt,reason:'launch-failed',status:5,pid:0,exitCode:null,outputBase64:''};assert.equal(validateNativeCheckReceipt(failure,expected).reason,'launch-failed');assert.throws(()=>validateNativeCheckReceipt({...failure,status:0},expected),{code:'NATIVE_CHECK_INVALID'});});
 test('native completion diagnostics remain raw evidence and do not upgrade a failed zero-exit check',()=>{
   for(const completion of [
-    {waitStatus:0,exitConfirmed:true,censusStatus:0,baselinePids:[100],afterPids:[100,456],unexpectedPids:[456],outputDrainTimedOut:false,outputDrainWaitMs:0,outputReadStatus:109},
+    {waitStatus:0,exitConfirmed:true,censusStatus:0,baselinePids:[100],afterPids:[100,456],unexpectedPids:[456],baselineProcesses:{limit:8,imageCharacterLimit:512,omitted:0,processes:[{pid:100,openStatus:5}]},unexpectedProcesses:{limit:8,imageCharacterLimit:512,omitted:0,processes:[{pid:456,openStatus:0,imageStatus:0,imagePath:'C:\\Windows\\System32\\conhost.exe',timesStatus:0,birth:'123456789',exitTime:'123456999',waitStatus:0,waitError:0,exitCodeStatus:0,exitCode:0,membershipStatus:0,inJob:true}]},outputDrainTimedOut:false,outputDrainWaitMs:0,outputReadStatus:109},
     {waitStatus:0,exitConfirmed:true,censusStatus:0,baselinePids:[100],afterPids:[100],unexpectedPids:[],outputDrainTimedOut:true,outputDrainWaitMs:250,outputReadStatus:109},
   ]){
     const observed=validateNativeCheckReceipt({...receipt,reason:'descendants-survived',completion},expected);

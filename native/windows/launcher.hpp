@@ -54,6 +54,8 @@ class ControlledJob {
   DWORD SpawnShellCheck(const LaunchDescriptor&, const std::vector<std::wstring>& args, HANDLE input, HANDLE output, PROCESS_INFORMATION* process);
   DWORD ActiveProcesses(DWORD* count) const;
   DWORD ProcessIds(std::vector<DWORD>& ids) const;
+  // Read-only membership query for a caller-pinned process handle, never a PID.
+  DWORD ContainsProcess(HANDLE process, BOOL* member) const;
   bool EverCreated() const {return ever_created_;}
   bool PolicyAccessVerified() const {return policy_access_verified_;}
   bool AllPackagesReadable() const {return all_packages_readable_;}
