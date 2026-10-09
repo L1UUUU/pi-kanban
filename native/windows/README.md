@@ -227,11 +227,12 @@ closed, without a normal-user shell fallback. Execution of these expanded probes
 separate CI result; implementing them is not a passing release claim.
 
 Implementation source ACLs include scoped DELETE on inherited source objects but never
-parent FILE_DELETE_CHILD. Every existing `.git` and `.local` object receives an explicit
-generated-SID full-access deny, verified before launch; directory inheritance also protects
-future descendants. The explicit walk rejects reparses and is bounded by the descriptor
-file count and a ten-second sampled deadline (individual Windows ACL calls can block).
-The real Node/Bash
+parent FILE_DELETE_CHILD. Before source rights are granted, existing `.git` and `.local`
+roots have DACL inheritance protected while their unrelated ACEs are preserved. The fresh
+generation's source grant must be absent from every protected descendant. Traversal rejects
+reparses and is bounded by the descriptor file count and a ten-second sampled deadline
+(individual Windows ACL calls can block). Exact-token read and DELETE-open attempts on every
+protected object must return ACCESS_DENIED before Worker or check process resume. The real Node/Bash
 probes check that implementation can unlink its fixture while review cannot and protected
 Git metadata remains denied.
 
@@ -253,14 +254,16 @@ Revocation filters only this generated SID's allow/deny ACEs from the current AC
 copying all unrelated entries, order and flags unchanged. It does not rely on Win32
 REVOKE_ACCESS to remove deny entries (that mode does not do so), and still independently
 verifies SID absence before accepting cleanup. Role-transition and HMAC recovery probes
-must observe successful removal of the protected `.git` deny entries too.
+must observe generated-SID absence after restoring the original metadata inheritance flags too.
 
 The native CTest includes a real-token protected-deletion/cleanup regression for both a
 `.git` directory (including nested objects) and an ordinary worktree-pointer file. The
 contained process must delete an ordinary source fixture while actual read/delete opens
 on protected Git and `.local` objects return ACCESS_DENIED. It then revokes the generated
-SID, checks descendant/runtime SID absence, and compares an unrelated identity's ACE
-bytes before and after. Object/callback
+SID, checks descendant/runtime SID absence, restores and verifies both originally protected
+and unprotected metadata roots, and compares an unrelated identity's ACE bytes before and
+after. Exact, ancestor-first and descendant-first overlapping workspace generations are rejected
+before mutation, including protected nested source DACLs. Object/callback
 allow/deny ACEs are parsed with their optional GUID offsets; unknown DACL ACE forms retain
 a cleanup blocker instead of being skipped or falsely certified clean.
 
@@ -371,9 +374,24 @@ blocked candidate rather than justification for broader policies or another back
 
 The revised-v2 expanded Windows run reached the real bundled Pi session and its native
 Node command, but exposed a security failure: an implementation check deleted a protected
-Git fixture despite a root-level inherited deny. That run remains failed evidence. The
-subsequent explicit per-object deny fix and actual-token deletion regression strengthen
-protection without adding source permissions. Their Windows execution is a separate
-required result; source inspection alone does not establish that the failure is closed.
+Git fixture despite a root-level inherited deny. A subsequent actual-token regression also
+read and deleted protected objects despite explicit per-object package-SID denies. Both runs
+remain failed evidence. The implementation therefore excludes the fresh package grant from
+reserved trees instead of relying on those denies. Cleanup first removes and independently
+verifies inheritable parent grants, then restores only the original DACL-protection flags
+using current unrelated ACEs, followed by another tree-wide SID-absence check. A tracked,
+non-inheriting READ_ATTRIBUTES ownership marker (a subset of every role's existing source
+rights) precedes metadata mutation and remains until all restoration checks succeed.
+Existing specific package source grants on the workspace, ancestors or ordinary descendants
+reject overlapping or unsupported ownership under the cross-helper ACL mutex; strict
+traverse-only ancestor ACEs and excluded metadata trees are not mistaken for source grants. A helper crash before restoration remains an unknown cleanup blocker.
+
+Microsoft documents the AppContainer user/package intersection and protected-DACL inheritance:
+https://learn.microsoft.com/en-us/windows/win32/secauthz/implementing-an-appcontainer
+https://learn.microsoft.com/en-us/windows/win32/secauthz/automatic-propagation-of-inheritable-aces
+https://learn.microsoft.com/en-us/windows/win32/secauthz/security-descriptor-control
+
+The exclusion correction's Windows execution is a separate required result; source inspection
+alone does not establish that the failure is closed.
 Failed Node checks now print bounded native-captured child diagnostics in CI logs, while
 the complete bounded receipt remains in the retained diagnostic artifact.

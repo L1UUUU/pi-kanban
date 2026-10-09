@@ -16,8 +16,9 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
-    # Full Git/worktree fixtures take 12–15 minutes on hosted Windows before build.
-    timeout-minutes: 20
+    # The unchanged Git-heavy suite took 12.5 minutes on one Windows runner;
+    # a later runner was 1.63x slower. Keep a finite margin for the full suite.
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

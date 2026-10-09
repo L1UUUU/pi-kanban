@@ -66,29 +66,39 @@ std::vector<unsigned char> SidAces(const fs::path& path,PSID sid,BYTE type=255){
       const auto* bytes=static_cast<unsigned char*>(raw);result.insert(result.end(),bytes,bytes+header->AceSize);}}
   if(descriptor)LocalFree(descriptor);return result;
 }
+bool DaclProtected(const fs::path& path){
+  PSECURITY_DESCRIPTOR descriptor=nullptr;Require(GetNamedSecurityInfoW(path.c_str(),SE_FILE_OBJECT,DACL_SECURITY_INFORMATION,nullptr,nullptr,nullptr,nullptr,&descriptor)==ERROR_SUCCESS,"read protection state");
+  SECURITY_DESCRIPTOR_CONTROL control=0;DWORD revision=0;const bool valid=!!GetSecurityDescriptorControl(descriptor,&control,&revision);LocalFree(descriptor);Require(valid,"read protection bits");return !!(control&SE_DACL_PROTECTED);
+}
 void ScopedRevokeRegression(const fs::path& root){
   for(const bool directory:{true,false}){
     const auto suffix=directory?L"directory":L"file";
     const auto base=root/(std::wstring(L"revoke-regression-")+suffix),source=base/L"source",scratch=base/L"scratch",bin=base/L"bin";
-    fs::create_directories(source);fs::create_directories(source/L".local");fs::create_directories(scratch);fs::create_directories(bin);
+    fs::create_directories(source);fs::create_directories(source/L"nested");Acl(source/L"nested",nullptr,0,true);fs::create_directories(source/L".local");fs::create_directories(scratch);fs::create_directories(bin);
     if(directory){fs::create_directories(source/L".git"/L"objects"/L"nested");Write(source/L".git"/L"object","protected Git object");Write(source/L".git"/L"objects"/L"nested"/L"object","nested protected Git object");}else Write(source/L".git","protected worktree pointer");
     Write(source/L".local"/L"hidden","protected knowledge");Write(source/L"ordinary.txt","allowed deletion");fs::copy_file(Self(),bin/L"node.fixture");Write(bin/L"protected-worker.fixture","synthetic protected-access worker");
     const auto generation=L"revoke-"+std::to_wstring(GetTickCount64())+L"-"+suffix;
     Profile unrelated(AppContainerProfileName(L"unrelated",L"review",generation));
     Acl(source/L".git",unrelated.sid,FILE_GENERIC_READ,directory);
-    // Preserve inheritance here: a protected DACL would hide the inherited-allow
-    // versus inherited-deny ordering bug that this real-token regression covers.
+    // Begin unprotected so this fixture exercises exclusion before the source
+    // allow, plus exact restoration of the original inheritance state.
     PACL fixture_acl=nullptr;PSECURITY_DESCRIPTOR fixture_descriptor=nullptr;const auto git_root=source/L".git";
     Require(GetNamedSecurityInfoW(git_root.c_str(),SE_FILE_OBJECT,DACL_SECURITY_INFORMATION,nullptr,nullptr,&fixture_acl,nullptr,&fixture_descriptor)==ERROR_SUCCESS,"read fixture inheritance");
     const DWORD inheritance_status=SetNamedSecurityInfoW(const_cast<LPWSTR>(git_root.c_str()),SE_FILE_OBJECT,DACL_SECURITY_INFORMATION|UNPROTECTED_DACL_SECURITY_INFORMATION,nullptr,nullptr,fixture_acl,nullptr);LocalFree(fixture_descriptor);Require(inheritance_status==ERROR_SUCCESS,"enable fixture inheritance");
+    Acl(source/L".local",nullptr,0,true);
+    const bool original_git_protection=DaclProtected(source/L".git"),original_local_protection=DaclProtected(source/L".local");Require(!original_git_protection&&original_local_protection,"both original inheritance states covered");
     const auto unrelated_before=SidAces(source/L".git",unrelated.sid);Require(!unrelated_before.empty(),"unrelated ACE fixture exists");
     LaunchDescriptor d;d.policy_variant=SelectedPolicy();d.demand=L"revoke";d.role=L"implementation";d.generation=generation;d.profile_name=AppContainerProfileName(d.demand,d.role,generation);
     d.node_executable=(bin/L"node.fixture").wstring();d.worker_entry=(bin/L"protected-worker.fixture").wstring();d.workspace=source.wstring();d.scratch=scratch.wstring();d.node_sha256=Sha256(d.node_executable);d.worker_sha256=Sha256(d.worker_entry);
     d.policy_evidence=L"synthetic-revoke-regression";d.acl_evidence=L"disposable-resources";d.private_channel_evidence=L"native-private-protection-probe";d.timeout_ms=10000;d.process_limit=4;d.memory_limit_bytes=128ull*1024*1024;d.output_limit_bytes=16384;
     ScopedResources scoped;Require(scoped.Provision(d,{d.node_executable,d.worker_entry},L"disposable-revoke-regression")==ERROR_SUCCESS,"provision revoke regression");
     PSID generated=nullptr;Require(SUCCEEDED(DeriveAppContainerSidFromAppContainerName(d.profile_name.c_str(),&generated)),"derive regression SID");
-    Require(!SidAces(source/L".git",generated,ACCESS_DENIED_ACE_TYPE).empty(),"protected deny ACE must exist before revoke");
-    if(directory)for(const auto& path:{source/L".git"/L"object",source/L".git"/L"objects"/L"nested"/L"object"})Require(!SidAces(path,generated,ACCESS_DENIED_ACE_TYPE).empty(),"protected descendant deny must exist");
+    Require(SidAces(source/L".git",generated).empty()&&DaclProtected(source/L".git"),"protected root excludes generated SID and inheritance");
+    if(directory)for(const auto& path:{source/L".git"/L"object",source/L".git"/L"objects"/L"nested"/L"object"})Require(SidAces(path,generated).empty(),"protected descendants exclude generated SID");
+    auto overlapping=d;overlapping.generation+=L"-overlap";overlapping.profile_name=AppContainerProfileName(overlapping.demand,overlapping.role,overlapping.generation);ScopedResources competitor;
+    Require(competitor.Provision(overlapping,{d.node_executable,d.worker_entry},L"overlap-rejection")==ERROR_BUSY,"overlapping workspace cannot own inheritance state");Require(competitor.Revoke()==ERROR_SUCCESS,"rejected overlap has no mutable resource claim");
+    auto nested=d;nested.workspace=(source/L"nested").wstring();nested.generation+=L"-nested";nested.profile_name=AppContainerProfileName(nested.demand,nested.role,nested.generation);ScopedResources nested_competitor;
+    Require(nested_competitor.Provision(nested,{d.node_executable,d.worker_entry},L"nested-overlap-rejection")==ERROR_BUSY,"ancestor ownership visible through a protected nested DACL");Require(nested_competitor.Revoke()==ERROR_SUCCESS,"nested rejection has no resource claim");
     SECURITY_ATTRIBUTES sa{sizeof(sa),nullptr,TRUE};HANDLE in_read=nullptr,in_write=nullptr,out_read=nullptr,out_write=nullptr,log_read=nullptr,log_write=nullptr;
     Require(!!CreatePipe(&in_read,&in_write,&sa,0)&&!!CreatePipe(&out_read,&out_write,&sa,0)&&!!CreatePipe(&log_read,&log_write,&sa,0),"protected probe pipes");
     SetHandleInformation(in_write,HANDLE_FLAG_INHERIT,0);SetHandleInformation(out_read,HANDLE_FLAG_INHERIT,0);SetHandleInformation(log_read,HANDLE_FLAG_INHERIT,0);
@@ -96,12 +106,20 @@ void ScopedRevokeRegression(const fs::path& root){
     ControlledJob job;Require(job.Launch(d,{in_read,out_write,log_write})==ERROR_SUCCESS,"launch actual protected deletion probe");CloseHandle(in_read);CloseHandle(out_write);CloseHandle(log_write);
     DWORD available=0;const ULONGLONG until=GetTickCount64()+5000;while(GetTickCount64()<until){if(PeekNamedPipe(out_read,nullptr,0,nullptr,&available,nullptr)&&available)break;Sleep(10);}
     Require(available>0&&available<16384,"bounded protected probe result");std::vector<char> bytes(available);DWORD got=0;Require(!!ReadFile(out_read,bytes.data(),available,&got,nullptr),"read protected probe result");const std::string report(bytes.data(),got);std::cout<<report<<std::flush;Require(report.find("\"passed\":1")!=std::string::npos,"protected read/delete must be denied while ordinary delete works");
-    Require(job.Stop()==ERROR_SUCCESS,"stop actual protected probe");Require(scoped.Revoke()==ERROR_SUCCESS,"all generated allow AND deny ACEs must revoke");
+    Require(job.Stop()==ERROR_SUCCESS,"stop actual protected probe");
+    // A concrete restoration failure must retain the non-inheriting ownership
+    // marker, so another generation cannot adopt temporary inheritance state.
+    fs::rename(source/L".local",base/L"held-local");Require(scoped.Revoke()!=ERROR_SUCCESS,"missing metadata blocks clean restoration");
+    ScopedResources after_failed_cleanup;Require(after_failed_cleanup.Provision(overlapping,{d.node_executable,d.worker_entry},L"failed-cleanup-overlap")==ERROR_BUSY,"failed restoration retains source ownership");Require(after_failed_cleanup.Revoke()==ERROR_SUCCESS,"blocked cleanup competitor has no resources");
+    fs::rename(base/L"held-local",source/L".local");Require(scoped.Revoke()==ERROR_SUCCESS,"all generated grants and original protection state must cleanly restore");
     for(const auto& path:{source,source/L".git",source/L".local",source/L".local"/L"hidden",scratch,bin/L"node.fixture",bin/L"protected-worker.fixture"})Require(SidAces(path,generated).empty(),"generated SID absent after revoke");
     if(directory)for(const auto& path:{source/L".git"/L"object",source/L".git"/L"objects"/L"nested"/L"object"})Require(SidAces(path,generated).empty(),"protected descendant SID absent after revoke");
+    Require(DaclProtected(source/L".git")==original_git_protection&&DaclProtected(source/L".local")==original_local_protection,"original inheritance protection states restored");
     Require(SidAces(source/L".git",unrelated.sid)==unrelated_before,"unrelated ACE bytes/order preserved");FreeSid(generated);
+    ScopedResources nested_first;Require(nested_first.Provision(nested,{d.node_executable,d.worker_entry},L"nested-first-regression")==ERROR_SUCCESS,"nested workspace can own after prior cleanup");
+    ScopedResources ancestor_second;Require(ancestor_second.Provision(overlapping,{d.node_executable,d.worker_entry},L"ancestor-overlap-rejection")==ERROR_BUSY,"descendant ownership blocks later ancestor grant");Require(ancestor_second.Revoke()==ERROR_SUCCESS,"ancestor rejection has no resource claim");Require(nested_first.Revoke()==ERROR_SUCCESS,"nested-first cleanup");
     CloseHandle(in_write);CloseHandle(out_read);CloseHandle(log_read);
-    std::cout<<"{\"phase\":\"native-revoke-regression\",\"protectedDenyRemoved\":true,\"unrelatedAceBytesPreserved\":true}"<<std::endl;
+    std::cout<<"{\"phase\":\"native-revoke-regression\",\"protectedSidExcluded\":true,\"originalInheritanceRestored\":true,\"overlappingWorkspaceRejected\":true,\"unrelatedAceBytesPreserved\":true}"<<std::endl;
   }
 }
 bool CanRead(const fs::path& path, DWORD* error) {
@@ -261,7 +279,7 @@ int wmain(int argc,wchar_t** argv) {
     WSADATA sockets{};Require(WSAStartup(MAKEWORD(2,2),&sockets)==0,"listener sockets");SOCKET listener=socket(AF_INET,SOCK_STREAM,IPPROTO_TCP);
     sockaddr_in bind_to{};bind_to.sin_family=AF_INET;bind_to.sin_addr.s_addr=htonl(INADDR_LOOPBACK);
     Require(bind(listener,reinterpret_cast<sockaddr*>(&bind_to),sizeof(bind_to))==0&&listen(listener,4)==0,"trusted loopback listener");
-    RunRole(root,L"implementation",listener);RunRole(root,L"review",listener);ScopedRevokeRegression(root);
+    ScopedRevokeRegression(root);RunRole(root,L"implementation",listener);RunRole(root,L"review",listener);
     closesocket(listener);WSACleanup();SetEnvironmentVariableW(L"FORBIDDEN_HOST_CREDENTIAL",nullptr);
     // Keep synthetic artifacts on failure; remove only this freshly generated root after success.
     Require(RegDeleteTreeW(HKEY_CURRENT_USER,registry_path.c_str())==ERROR_SUCCESS,"delete only own synthetic registry fixture");

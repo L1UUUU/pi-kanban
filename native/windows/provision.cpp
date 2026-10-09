@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cwctype>
 #include <cstddef>
+#include <iterator>
 namespace pi_kanban {
 namespace {
 namespace fs=std::filesystem;
@@ -59,7 +60,7 @@ DWORD DaclAceSid(LPVOID raw,PSID* sid){
   if(offset+8+static_cast<size_t>(bytes[1])*sizeof(DWORD)>header->AceSize||!IsValidSid(bytes))return ERROR_INVALID_ACL;
   *sid=bytes;return ERROR_SUCCESS;
 }
-DWORD Edit(const std::wstring& path,PSID sid,DWORD rights,ACCESS_MODE mode,bool inherit){
+DWORD Edit(const std::wstring& path,PSID sid,DWORD rights,ACCESS_MODE mode,bool inherit,bool keep_marker=false){
   PACL previous=nullptr,next=nullptr;PSECURITY_DESCRIPTOR descriptor=nullptr;
   DWORD error=GetNamedSecurityInfoW(path.c_str(),SE_FILE_OBJECT,DACL_SECURITY_INFORMATION,nullptr,nullptr,&previous,nullptr,&descriptor);if(error)return error;
   EXPLICIT_ACCESSW entry{};entry.grfAccessPermissions=rights;entry.grfAccessMode=mode;entry.grfInheritance=inherit?SUB_CONTAINERS_AND_OBJECTS_INHERIT:NO_INHERITANCE;
@@ -70,9 +71,12 @@ DWORD Edit(const std::wstring& path,PSID sid,DWORD rights,ACCESS_MODE mode,bool 
     // allow/deny entries, preserving unrelated principals, flags and ACE order.
     if(!previous||!IsValidAcl(previous))error=ERROR_INVALID_ACL;
     else{
-      next=static_cast<PACL>(LocalAlloc(LPTR,previous->AclSize));
+      const DWORD capacity=previous->AclSize+(keep_marker?static_cast<DWORD>(sizeof(ACCESS_ALLOWED_ACE))+GetLengthSid(sid):0);
+      if(capacity>MAXWORD){LocalFree(descriptor);return ERROR_ALLOTTED_SPACE_EXCEEDED;}
+      next=static_cast<PACL>(LocalAlloc(LPTR,capacity));
       if(!next)error=ERROR_NOT_ENOUGH_MEMORY;
-      else if(!InitializeAcl(next,previous->AclSize,previous->AclRevision))error=GetLastError();
+      else if(!InitializeAcl(next,capacity,previous->AclRevision))error=GetLastError();
+      else if(keep_marker&&!AddAccessAllowedAceEx(next,previous->AclRevision,0,FILE_READ_ATTRIBUTES,sid))error=GetLastError();
       else for(DWORD i=0;i<previous->AceCount;i++){
         LPVOID raw=nullptr;if(!GetAce(previous,i,&raw)){error=GetLastError();break;}
         const auto* header=static_cast<ACE_HEADER*>(raw);PSID trustee=nullptr;
@@ -92,15 +96,54 @@ DWORD VerifyNoSid(const std::wstring& path,PSID sid){
     PSID trustee=nullptr;error=DaclAceSid(raw,&trustee);if(error)break;if(EqualSid(trustee,sid)){error=ERROR_ACCESS_DENIED;break;}}
   if(descriptor)LocalFree(descriptor);return error;
 }
-DWORD VerifyExplicitDeny(const std::wstring& path,PSID sid){
+DWORD VerifyWorkspaceMarker(const std::wstring& path,PSID sid){
   PACL acl=nullptr;PSECURITY_DESCRIPTOR descriptor=nullptr;DWORD error=GetNamedSecurityInfoW(path.c_str(),SE_FILE_OBJECT,DACL_SECURITY_INFORMATION,nullptr,nullptr,&acl,nullptr,&descriptor);if(error)return error;
-  bool denied=false;if(!acl||!IsValidAcl(acl))error=ERROR_INVALID_ACL;else for(DWORD i=0;i<acl->AceCount;i++){LPVOID raw=nullptr;if(!GetAce(acl,i,&raw)){error=GetLastError();break;}const auto* header=static_cast<ACE_HEADER*>(raw);PSID trustee=nullptr;
-    error=DaclAceSid(raw,&trustee);if(error)break;if(!EqualSid(trustee,sid))continue;
-    if(header->AceType==ACCESS_DENIED_ACE_TYPE&&!(header->AceFlags&INHERITED_ACE)&&(static_cast<ACCESS_DENIED_ACE*>(raw)->Mask&FILE_ALL_ACCESS)==FILE_ALL_ACCESS){denied=true;break;}
-    // A matching allow before the explicit deny is not accepted as canonical protection.
-    if(header->AceType==ACCESS_ALLOWED_ACE_TYPE){error=ERROR_ACCESS_DENIED;break;}
+  bool found=false;if(!acl||!IsValidAcl(acl))error=ERROR_INVALID_ACL;
+  else for(DWORD i=0;i<acl->AceCount;i++){LPVOID raw=nullptr;if(!GetAce(acl,i,&raw)){error=GetLastError();break;}PSID trustee=nullptr;error=DaclAceSid(raw,&trustee);if(error)break;if(!EqualSid(trustee,sid))continue;
+    const auto* ace=static_cast<ACCESS_ALLOWED_ACE*>(raw);if(found||ace->Header.AceType!=ACCESS_ALLOWED_ACE_TYPE||ace->Header.AceFlags!=0||ace->Mask!=FILE_READ_ATTRIBUTES){error=ERROR_ACCESS_DENIED;break;}found=true;
   }
-  if(descriptor)LocalFree(descriptor);return error?error:denied?ERROR_SUCCESS:ERROR_ACCESS_DENIED;
+  if(descriptor)LocalFree(descriptor);return error?error:found?ERROR_SUCCESS:ERROR_ACCESS_DENIED;
+}
+DWORD Protection(const std::wstring& path,bool* value,bool set=false){
+  PACL acl=nullptr;PSECURITY_DESCRIPTOR descriptor=nullptr;DWORD error=GetNamedSecurityInfoW(path.c_str(),SE_FILE_OBJECT,DACL_SECURITY_INFORMATION,nullptr,nullptr,&acl,nullptr,&descriptor);if(error)return error;
+  SECURITY_DESCRIPTOR_CONTROL control=0;DWORD revision=0;
+  if(!acl||!IsValidAcl(acl))error=ERROR_INVALID_ACL;
+  else if(!GetSecurityDescriptorControl(descriptor,&control,&revision))error=GetLastError();
+  else if(set)error=SetNamedSecurityInfoW(const_cast<LPWSTR>(path.c_str()),SE_FILE_OBJECT,DACL_SECURITY_INFORMATION|(*value?PROTECTED_DACL_SECURITY_INFORMATION:UNPROTECTED_DACL_SECURITY_INFORMATION),nullptr,nullptr,acl,nullptr);
+  else *value=!!(control&SE_DACL_PROTECTED);
+  if(descriptor)LocalFree(descriptor);return error;
+}
+DWORD NoWorkspaceAppGrant(const std::wstring& path){
+  PACL acl=nullptr;PSECURITY_DESCRIPTOR descriptor=nullptr;DWORD error=GetNamedSecurityInfoW(path.c_str(),SE_FILE_OBJECT,DACL_SECURITY_INFORMATION,nullptr,nullptr,&acl,nullptr,&descriptor);if(error)return error;
+  if(!acl||!IsValidAcl(acl))error=ERROR_INVALID_ACL;
+  else for(DWORD i=0;i<acl->AceCount;i++){LPVOID raw=nullptr;if(!GetAce(acl,i,&raw)){error=GetLastError();break;}PSID sid=nullptr;error=DaclAceSid(raw,&sid);if(error)break;
+    // A specific package SID on this root is either another live generation's
+    // ownership marker or unsupported preexisting authority. Reject both under
+    // the cross-helper mutex; no helper may restore another's inheritance state.
+    const SID_IDENTIFIER_AUTHORITY package=SECURITY_APP_PACKAGE_AUTHORITY;
+    const auto* header=static_cast<ACE_HEADER*>(raw);const bool allow=header->AceType==ACCESS_ALLOWED_ACE_TYPE||header->AceType==ACCESS_ALLOWED_OBJECT_ACE_TYPE||header->AceType==ACCESS_ALLOWED_CALLBACK_ACE_TYPE||header->AceType==ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE;
+    const DWORD mask=static_cast<ACCESS_ALLOWED_ACE*>(raw)->Mask;
+    if(allow&&(mask&~static_cast<DWORD>(FILE_TRAVERSE))&&*GetSidSubAuthorityCount(sid)==8&&std::equal(std::begin(package.Value),std::end(package.Value),std::begin(GetSidIdentifierAuthority(sid)->Value))&&*GetSidSubAuthority(sid,0)==SECURITY_APP_PACKAGE_BASE_RID){error=ERROR_BUSY;break;}
+  }
+  if(descriptor)LocalFree(descriptor);return error;
+}
+DWORD NoOverlappingWorkspace(const LaunchDescriptor& d){
+  const fs::path root(d.workspace);const ULONGLONG deadline=GetTickCount64()+10000;size_t count=0;
+  try{
+    for(auto parent=root;parent!=parent.root_path()&&!parent.empty();parent=parent.parent_path()){
+      if(GetTickCount64()>=deadline)return ERROR_TIMEOUT;const DWORD status=NoWorkspaceAppGrant(parent.wstring());if(status)return status;
+    }
+    for(fs::recursive_directory_iterator cursor(root),end;cursor!=end;++cursor){
+      if(++count>d.file_limit)return ERROR_DISK_FULL;if(GetTickCount64()>=deadline)return ERROR_TIMEOUT;
+      auto name=cursor->path().filename().wstring();std::transform(name.begin(),name.end(),name.begin(),towlower);
+      // Reserved trees are excluded from this source grant, not overlapping
+      // mutable source. Preserve unrelated package ACEs already present there.
+      if(cursor->path().parent_path()==root&&(name==L".git"||name==L".local")){cursor.disable_recursion_pending();continue;}
+      const DWORD attrs=GetFileAttributesW(cursor->path().c_str());if(attrs==INVALID_FILE_ATTRIBUTES)return GetLastError();if(attrs&FILE_ATTRIBUTE_REPARSE_POINT)return ERROR_REPARSE_TAG_INVALID;
+      const DWORD status=NoWorkspaceAppGrant(cursor->path().wstring());if(status)return status;
+    }
+  }catch(...){return ERROR_ACCESS_DENIED;}
+  return ERROR_SUCCESS;
 }
 bool Contains(const std::wstring& root,const std::wstring& path){auto r=root,p=path;std::transform(r.begin(),r.end(),r.begin(),towlower);std::transform(p.begin(),p.end(),p.begin(),towlower);return p==r||(p.size()>r.size()&&p.compare(0,r.size(),r)==0&&p[r.size()]==L'\\');}
 }
@@ -109,32 +152,40 @@ DWORD ScopedResources::Provision(const LaunchDescriptor& d,const std::vector<std
   if(sid_||authorization.empty()||authorization.size()>200||readonly_roots.size()!=2+d.shell_files.size())return ERROR_ACCESS_DENIED;
   DWORD error=ValidateDescriptor(d);if(error)return error;
   if(Contains(d.workspace,d.scratch)||Contains(d.scratch,d.workspace))return ERROR_ACCESS_DENIED;
-  if((error=SafeTree(d.workspace))||(error=SafeTree(d.scratch)))return error;
+  if((error=SafeTree(d.workspace))||(error=SafeTree(d.scratch))||(error=NoOverlappingWorkspace(d)))return error;
   bool node_covered=false,worker_covered=false;
   for(const auto& root:readonly_roots){if((error=SafeTree(root)))return error;if(!fs::is_regular_file(root)||(root!=d.node_executable&&root!=d.worker_entry&&std::none_of(d.shell_files.begin(),d.shell_files.end(),[&](const auto& file){return file.path==root;})))return ERROR_ACCESS_DENIED;if(Contains(root,d.workspace)||Contains(root,d.scratch)||Contains(d.workspace,root)||Contains(d.scratch,root))return ERROR_ACCESS_DENIED;node_covered|=root==d.node_executable;worker_covered|=root==d.worker_entry;}
   if(!node_covered||!worker_covered)return ERROR_ACCESS_DENIED;
   profile_=d.profile_name;const HRESULT created=CreateAppContainerProfile(profile_.c_str(),profile_.c_str(),L"pi-kanban generation-scoped Worker",nullptr,0,&sid_);
   if(FAILED(created))return HRESULT_CODE(created); // Never reuse an old identity or its mutable grants.
-  const auto grant=[&](const std::wstring& path,DWORD rights,ACCESS_MODE mode,bool inherit){const DWORD result=Edit(path,sid_,rights,mode,inherit);if(!result){changed_.push_back(path);if(inherit)recursive_.insert(path);}return result;};
-  for(const auto& root:readonly_roots)if((error=grant(root,FILE_GENERIC_READ|FILE_GENERIC_EXECUTE,GRANT_ACCESS,false)))return error;
-  if((error=grant(d.workspace,FILE_GENERIC_READ|(d.role==L"implementation"?(FILE_GENERIC_WRITE|DELETE):0),GRANT_ACCESS,true)))return error;
-  if((error=grant(d.scratch,FILE_ALL_ACCESS,GRANT_ACCESS,true)))return error;
-  // DELETE can be authorized on the object itself. Do not rely on inherited
-  // deny ordering under the source's inherited DELETE allow: explicitly deny
-  // every existing protected object, including ordinary .git worktree files.
+  const auto grant=[&](const std::wstring& path,DWORD rights,ACCESS_MODE mode,bool inherit){changed_.push_back(path);if(inherit)recursive_.insert(path);return Edit(path,sid_,rights,mode,inherit);};
+  // Non-inheriting subset of every role's final source rights. This marker
+  // precedes any temporary metadata protection, including failed provisioning.
+  workspace_=d.workspace;if((error=grant(workspace_,FILE_READ_ATTRIBUTES,GRANT_ACCESS,false)))return error;
+  // AppContainer package DENY ACEs did not override inherited package allows
+  // in actual Windows tests. Exclude protected roots BEFORE granting source.
+  // Preserve every unrelated ACE and the original inheritance-protection bit.
   const ULONGLONG protection_deadline=GetTickCount64()+10000;size_t protected_count=0;
+  std::vector<fs::path> protected_paths;
   for(const auto* name:{L".git",L".local"}){
     const fs::path internal=fs::path(d.workspace)/name;const DWORD attributes=GetFileAttributesW(internal.c_str());if(attributes==INVALID_FILE_ATTRIBUTES){const DWORD status=GetLastError();if(status==ERROR_FILE_NOT_FOUND||status==ERROR_PATH_NOT_FOUND)continue;return status;}
-    std::vector<fs::path> protected_paths={internal};if(++protected_count>d.file_limit)return ERROR_DISK_FULL;
+    if(attributes&FILE_ATTRIBUTE_REPARSE_POINT)return ERROR_REPARSE_TAG_INVALID;
+    if(++protected_count>d.file_limit)return ERROR_DISK_FULL;protected_paths.push_back(internal);
     if(attributes&FILE_ATTRIBUTE_DIRECTORY)for(const auto& entry:fs::recursive_directory_iterator(internal)){
       if(++protected_count>d.file_limit)return ERROR_DISK_FULL;if(GetTickCount64()>=protection_deadline)return ERROR_TIMEOUT;
       const DWORD attrs=GetFileAttributesW(entry.path().c_str());if(attrs==INVALID_FILE_ATTRIBUTES)return GetLastError();if(attrs&FILE_ATTRIBUTE_REPARSE_POINT)return ERROR_REPARSE_TAG_INVALID;protected_paths.push_back(entry.path());
     }
-    for(const auto& path:protected_paths){if(GetTickCount64()>=protection_deadline)return ERROR_TIMEOUT;const DWORD attrs=GetFileAttributesW(path.c_str());if(attrs==INVALID_FILE_ATTRIBUTES)return GetLastError();if(attrs&FILE_ATTRIBUTE_REPARSE_POINT)return ERROR_REPARSE_TAG_INVALID;
-      if((error=grant(path.wstring(),FILE_ALL_ACCESS,DENY_ACCESS,!!(attrs&FILE_ATTRIBUTE_DIRECTORY))))return error;
-      if((error=VerifyExplicitDeny(path.wstring(),sid_))){RecordFailure("protected-explicit-deny",path.wstring(),error);return error;}
-    }
+    bool original=false;if((error=Protection(internal.wstring(),&original)))return error;
+    protected_roots_.push_back({internal.wstring(),original});bool protect=true;
+    if((error=Protection(internal.wstring(),&protect,true))){RecordFailure("protect-metadata",internal.wstring(),error);return error;}
   }
+  for(const auto& root:readonly_roots)if((error=grant(root,FILE_GENERIC_READ|FILE_GENERIC_EXECUTE,GRANT_ACCESS,false)))return error;
+  if((error=grant(d.workspace,FILE_GENERIC_READ|(d.role==L"implementation"?(FILE_GENERIC_WRITE|DELETE):0),GRANT_ACCESS,true)))return error;
+  if((error=grant(d.scratch,FILE_ALL_ACCESS,GRANT_ACCESS,true)))return error;
+  for(const auto& path:protected_paths){if(GetTickCount64()>=protection_deadline)return ERROR_TIMEOUT;
+    if((error=VerifyNoSid(path.wstring(),sid_))){RecordFailure("protected-sid-exclusion",path.wstring(),error);return error;}
+  }
+  for(const auto& entry:protected_roots_){bool protected_now=false;if((error=Protection(entry.first,&protected_now))||!protected_now)return error?error:ERROR_ACCESS_DENIED;}
   // Revised v2 and ordinary v3 do not edit existing ancestors or volume roots.
   // Native pins + fixed Node module flags + explicit private workspace capability
   // replace the failed metadata-grant experiment; there is no policy fallback.
@@ -152,16 +203,24 @@ DWORD ScopedResources::Revoke(){
   const auto failure=[&](const char* phase,const std::wstring& path,DWORD status){if(status){RecordFailure(phase,path,status);if(!first)first=status;}};
   for(auto it=changed_.rbegin();it!=changed_.rend();++it){const DWORD attrs=GetFileAttributesW(it->c_str());if(attrs==INVALID_FILE_ATTRIBUTES){failure("revoke-attributes",*it,GetLastError());continue;}if(attrs&FILE_ATTRIBUTE_REPARSE_POINT){failure("revoke-reparse",*it,ERROR_REPARSE_TAG_INVALID);continue;}
     if(recursive_.contains(*it)){const DWORD safe=SafeTree(*it);if(safe){failure("revoke-tree",*it,safe);continue;}}
-    failure("revoke-edit",*it,Edit(*it,sid_,0,REVOKE_ACCESS,false));
+    failure("revoke-edit",*it,Edit(*it,sid_,0,REVOKE_ACCESS,false,*it==workspace_));
   }
-  // Verify only after every parent grant has been removed. Earlier verification
-  // of a .git deny entry would still see the source parent's inherited grant.
+  if(!first)for(const auto& path:changed_)failure("verify-parent-before-restore",path,(path==workspace_?VerifyWorkspaceMarker(path,sid_):VerifyNoSid(path,sid_)));
+  // No inheritable source grant remains when inheritance is re-enabled. Never restore an
+  // old ACL snapshot: keep current unrelated ACEs, changing only the saved bit.
+  if(!first)for(const auto& entry:protected_roots_){bool original=entry.second;
+    const DWORD attrs=GetFileAttributesW(entry.first.c_str());if(attrs==INVALID_FILE_ATTRIBUTES){failure("restore-protection-attributes",entry.first,GetLastError());continue;}if(attrs&FILE_ATTRIBUTE_REPARSE_POINT){failure("restore-protection-reparse",entry.first,ERROR_REPARSE_TAG_INVALID);continue;}
+    failure("restore-protection",entry.first,Protection(entry.first,&original,true));bool observed=false;const DWORD status=Protection(entry.first,&observed);failure("verify-protection",entry.first,status?status:observed==original?ERROR_SUCCESS:ERROR_INVALID_SECURITY_DESCR);
+  }
+  // Verify every changed tree again after inheritance restoration; absence at
+  // the root alone never certifies descendant cleanup.
   for(const auto& path:changed_){
     const DWORD attributes=GetFileAttributesW(path.c_str());if(attributes==INVALID_FILE_ATTRIBUTES){failure("verify-attributes",path,GetLastError());continue;}if(attributes&FILE_ATTRIBUTE_REPARSE_POINT){failure("verify-reparse",path,ERROR_REPARSE_TAG_INVALID);continue;}
-    DWORD verified=VerifyNoSid(path,sid_);failure("verify-sid",path,verified);
+    DWORD verified=path==workspace_?VerifyWorkspaceMarker(path,sid_):VerifyNoSid(path,sid_);failure("verify-sid",path,verified);
     if(!verified&&recursive_.contains(path)){const DWORD safe=SafeTree(path);if(safe)failure("verify-tree",path,safe);else try{for(const auto& entry:fs::recursive_directory_iterator(path)){verified=VerifyNoSid(entry.path().wstring(),sid_);if(verified){failure("verify-descendant-sid",entry.path().wstring(),verified);break;}}}catch(...){failure("verify-tree",path,ERROR_ACCESS_DENIED);}}
   }
-  if(!first){changed_.clear();const HRESULT deleted=DeleteAppContainerProfile(profile_.c_str());if(FAILED(deleted))failure("delete-profile",profile_,HRESULT_CODE(deleted));else profile_.clear();}
+  if(!first&&!workspace_.empty()){failure("remove-workspace-marker",workspace_,Edit(workspace_,sid_,0,REVOKE_ACCESS,false));if(!first)failure("verify-workspace-marker-removed",workspace_,VerifyNoSid(workspace_,sid_));}
+  if(!first){changed_.clear();protected_roots_.clear();workspace_.clear();const HRESULT deleted=DeleteAppContainerProfile(profile_.c_str());if(FAILED(deleted))failure("delete-profile",profile_,HRESULT_CODE(deleted));else profile_.clear();}
   return first;
 }
 ScopedResources::~ScopedResources(){if(sid_)FreeSid(sid_);}
