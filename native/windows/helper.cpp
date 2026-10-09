@@ -31,6 +31,7 @@ bool WriteExact(HANDLE handle,const void* data,DWORD length){const auto* cursor=
 bool ReadFrame(HANDLE handle,std::string& body){unsigned char size[4]{};if(!ReadExact(handle,size,4))return false;const DWORD n=(static_cast<DWORD>(size[0])<<24)|(static_cast<DWORD>(size[1])<<16)|(static_cast<DWORD>(size[2])<<8)|size[3];if(!n||n>kMax)throw std::runtime_error("frame exceeds bound");body.resize(n);if(!ReadExact(handle,body.data(),n))throw std::runtime_error("truncated frame");return true;}
 bool Frame(HANDLE handle,const std::string& body){if(body.empty()||body.size()>kMax)return false;const DWORD n=static_cast<DWORD>(body.size());const unsigned char header[]={static_cast<unsigned char>(n>>24),static_cast<unsigned char>(n>>16),static_cast<unsigned char>(n>>8),static_cast<unsigned char>(n)};return WriteExact(handle,header,4)&&WriteExact(handle,body.data(),n);}
 void Event(const std::string& body){bool sent=false;{std::lock_guard lock(event_mutex);sent=Frame(GetStdHandle(STD_ERROR_HANDLE),body);}if(!sent)Shutdown(ERROR_BROKEN_PIPE);}
+std::string ResourceFailures(const ScopedResources& resources){std::string out="[";for(const auto& failure:resources.Failures()){if(out.size()>1)out+=",";out+="{\"phase\":\""+failure.phase+"\",\"path\":"+ToUtf8(JsonString(failure.path))+",\"status\":"+std::to_string(failure.status)+"}";}return out+"]";}
 std::array<unsigned char,32> Hash(const Json& value){const auto text=value.str();if(text.size()!=64)throw std::runtime_error("SHA256 required");std::array<unsigned char,32> out{};for(size_t i=0;i<32;i++){unsigned v=0;for(size_t j=0;j<2;j++){const auto c=text[i*2+j];v*=16;if(c>=L'0'&&c<=L'9')v+=c-L'0';else if(c>=L'a'&&c<=L'f')v+=c-L'a'+10;else throw std::runtime_error("invalid SHA256");}out[i]=static_cast<unsigned char>(v);}return out;}
 DWORD Dword(const Json& value){const uint64_t n=value.num();if(n>MAXDWORD)throw std::runtime_error("DWORD overflow");return static_cast<DWORD>(n);}
 LaunchDescriptor Descriptor(const Json& input){
@@ -93,9 +94,10 @@ int wmain(){
       std::vector<DWORD> ids;const DWORD census=launched?controlled.ProcessIds(ids):ERROR_INVALID_HANDLE;
       const DWORD receipt=!stopped&&!cleanup&&((launched&&!census&&ids.empty())||never_created)?WriteRecoveryReceipt(lifetime->launch,controlled.Identity(),code,never_created):ERROR_INVALID_DATA;
       std::string list;for(DWORD pid:ids){if(!list.empty())list+=",";list+=std::to_string(pid);}
+      const auto failures=ResourceFailures(scoped);
       std::vector<std::string> messages={
         "{\"type\":\"native.finalizing\",\"generation\":\""+generation+"\",\"status\":"+std::to_string(code)+"}",
-        "{\"type\":\"native.resources\",\"phase\":\"revoke\",\"generation\":\""+generation+"\",\"status\":"+std::to_string(cleanup)+"}",
+        "{\"type\":\"native.resources\",\"phase\":\"revoke\",\"generation\":\""+generation+"\",\"status\":"+std::to_string(cleanup)+",\"failures\":"+failures+"}",
         "{\"type\":\"native.recovery\",\"generation\":\""+generation+"\",\"status\":"+std::to_string(receipt)+"}",
         "{\"type\":\"native.observation\",\"generation\":\""+generation+"\",\"status\":"+std::to_string(census)+",\"activePids\":["+list+"]}"};
       {std::lock_guard lock(lifetime->disk_mutex);if(!lifetime->disk_event.empty())messages.insert(messages.begin(),lifetime->disk_event);}
@@ -106,7 +108,7 @@ int wmain(){
       ::ExitProcess(code?code:(stopped?stopped:cleanup));
     };
     const DWORD provision=resources.Provision(d,roots,parsed.at(L"resourceAuthorizationId").str());
-    Event("{\"type\":\"native.resources\",\"phase\":\"provision\",\"generation\":\""+generation+"\",\"status\":"+std::to_string(provision)+"}");
+    Event("{\"type\":\"native.resources\",\"phase\":\"provision\",\"generation\":\""+generation+"\",\"status\":"+std::to_string(provision)+",\"failures\":"+ResourceFailures(resources)+"}");
     if(provision)Shutdown(provision);
     SECURITY_ATTRIBUTES sa{sizeof(sa),nullptr,TRUE};HANDLE in_read=nullptr,in_write=nullptr,out_read=nullptr,out_write=nullptr,log_read=nullptr,log_write=nullptr;
     if(!CreatePipe(&in_read,&in_write,&sa,0)||!CreatePipe(&out_read,&out_write,&sa,0)||!CreatePipe(&log_read,&log_write,&sa,0))throw std::runtime_error("pipe creation failed");

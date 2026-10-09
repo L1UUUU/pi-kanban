@@ -236,3 +236,30 @@ A native receipt can attest either actual zero-Job process identity and cleanup,
 separate `neverCreated` state when CreateProcess never succeeded and scoped permissions
 were revoked. A missing PID does not imply either state. Late native launch before Host
 registration and pre-creation reparse rejection both have explicit recovery probes.
+
+The explicit registry-only diagnostic candidate also grants only READ_ATTRIBUTES and
+TRAVERSE to exact runtime/source/scratch ancestor directories, including their volume
+roots, with no inheritance, directory listing, file content or write rights. Node 24
+otherwise failed during entry-point realpath with `EPERM lstat C:\`. Strict-v1 keeps its
+original traverse-only grants. The recorder requires metadata lookup to succeed while
+listing those ancestors, adjacent file reads and all existing private-resource reads
+remain denied. Every grant is generation-specific and revoked under the shared mutex;
+bounded native cleanup failures report their precise phase, path and Win32 status.
+
+This metadata diagnostic can require WRITE_DAC on existing ancestors/volume roots, which
+ordinary desktop users may not possess. An unavailable grant is a recorded startup failure;
+there is no elevation, broad-principal ACL change or silent policy fallback. Until this is
+validated on supported non-elevated Windows 11 accounts, it is not a usable production
+profile. The expanded CI is an explicitly selected synthetic compatibility experiment.
+
+Revocation filters only this generated SID's allow/deny ACEs from the current ACL,
+copying all unrelated entries, order and flags unchanged. It does not rely on Win32
+REVOKE_ACCESS to remove deny entries (that mode does not do so), and still independently
+verifies SID absence before accepting cleanup. Role-transition and HMAC recovery probes
+must observe successful removal of the protected `.git` deny entries too.
+
+The native CTest includes a dedicated no-process cleanup regression: it confirms the
+protected Git deny exists, revokes the generated SID, checks descendant/runtime SID
+absence, and compares an unrelated identity's ACE bytes before and after. Object/callback
+allow/deny ACEs are parsed with their optional GUID offsets; unknown DACL ACE forms retain
+a cleanup blocker instead of being skipped or falsely certified clean.

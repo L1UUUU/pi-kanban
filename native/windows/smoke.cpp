@@ -1,6 +1,7 @@
 // Synthetic Windows-only native launcher probes. Does not execute Pi, Node, Git Bash,
 // project hooks, production code, real credentials, or public-network model requests.
 #include "launcher.hpp"
+#include "provision.hpp"
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -54,6 +55,34 @@ void Acl(const fs::path& path, PSID sid, DWORD rights, bool inherit = false) {
   PACL acl = nullptr; Require(SetEntriesInAclW(static_cast<ULONG>(count), entries, nullptr, &acl) == ERROR_SUCCESS, "build test ACL");
   const DWORD result = SetNamedSecurityInfoW(const_cast<LPWSTR>(path.c_str()), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION, nullptr, nullptr, acl, nullptr);
   LocalFree(acl); Require(result == ERROR_SUCCESS, "apply test ACL");
+}
+std::vector<unsigned char> SidAces(const fs::path& path,PSID sid,BYTE type=255){
+  PACL acl=nullptr;PSECURITY_DESCRIPTOR descriptor=nullptr;
+  Require(GetNamedSecurityInfoW(path.c_str(),SE_FILE_OBJECT,DACL_SECURITY_INFORMATION,nullptr,nullptr,&acl,nullptr,&descriptor)==ERROR_SUCCESS,"read regression ACL");
+  std::vector<unsigned char> result;
+  if(acl)for(DWORD i=0;i<acl->AceCount;i++){LPVOID raw=nullptr;Require(!!GetAce(acl,i,&raw),"read regression ACE");const auto* header=static_cast<ACE_HEADER*>(raw);
+    if((header->AceType==ACCESS_ALLOWED_ACE_TYPE||header->AceType==ACCESS_DENIED_ACE_TYPE)&&(type==255||header->AceType==type)&&EqualSid(const_cast<DWORD*>(&static_cast<ACCESS_ALLOWED_ACE*>(raw)->SidStart),sid)){
+      const auto* bytes=static_cast<unsigned char*>(raw);result.insert(result.end(),bytes,bytes+header->AceSize);}}
+  if(descriptor)LocalFree(descriptor);return result;
+}
+void ScopedRevokeRegression(const fs::path& root){
+  const auto base=root/L"revoke-regression",source=base/L"source",scratch=base/L"scratch",bin=base/L"bin";
+  fs::create_directories(source/L".git");fs::create_directories(scratch);fs::create_directories(bin);
+  Write(source/L".git"/L"object","synthetic protected fixture");fs::copy_file(Self(),bin/L"node.fixture");Write(bin/L"worker.fixture","synthetic worker");
+  const auto generation=L"revoke-"+std::to_wstring(GetTickCount64());
+  Profile unrelated(AppContainerProfileName(L"unrelated",L"review",generation));
+  Acl(source/L".git",unrelated.sid,FILE_GENERIC_READ,true);
+  const auto unrelated_before=SidAces(source/L".git",unrelated.sid);Require(!unrelated_before.empty(),"unrelated ACE fixture exists");
+  LaunchDescriptor d;d.demand=L"revoke";d.role=L"implementation";d.generation=generation;d.profile_name=AppContainerProfileName(d.demand,d.role,generation);
+  d.node_executable=(bin/L"node.fixture").wstring();d.worker_entry=(bin/L"worker.fixture").wstring();d.workspace=source.wstring();d.scratch=scratch.wstring();d.node_sha256=Sha256(d.node_executable);d.worker_sha256=Sha256(d.worker_entry);
+  d.policy_evidence=L"synthetic-revoke-regression";d.acl_evidence=L"disposable-resources";d.private_channel_evidence=L"no-process-created";d.timeout_ms=10000;d.process_limit=4;d.memory_limit_bytes=128ull*1024*1024;d.output_limit_bytes=16384;
+  ScopedResources scoped;Require(scoped.Provision(d,{d.node_executable,d.worker_entry},L"disposable-revoke-regression")==ERROR_SUCCESS,"provision revoke regression");
+  PSID generated=nullptr;Require(SUCCEEDED(DeriveAppContainerSidFromAppContainerName(d.profile_name.c_str(),&generated)),"derive regression SID");
+  Require(!SidAces(source/L".git",generated,ACCESS_DENIED_ACE_TYPE).empty(),"protected deny ACE must exist before revoke");
+  Require(scoped.Revoke()==ERROR_SUCCESS,"all generated allow AND deny ACEs must revoke");
+  for(const auto& path:{source,source/L".git",source/L".git"/L"object",scratch,bin/L"node.fixture",bin/L"worker.fixture"})Require(SidAces(path,generated).empty(),"generated SID absent after revoke");
+  Require(SidAces(source/L".git",unrelated.sid)==unrelated_before,"unrelated ACE bytes/order preserved");FreeSid(generated);
+  std::cout<<"{\"phase\":\"native-revoke-regression\",\"protectedDenyRemoved\":true,\"unrelatedAceBytesPreserved\":true}"<<std::endl;
 }
 bool CanRead(const fs::path& path, DWORD* error) {
   HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -180,7 +209,7 @@ int wmain(int argc,wchar_t** argv) {
     WSADATA sockets{};Require(WSAStartup(MAKEWORD(2,2),&sockets)==0,"listener sockets");SOCKET listener=socket(AF_INET,SOCK_STREAM,IPPROTO_TCP);
     sockaddr_in bind_to{};bind_to.sin_family=AF_INET;bind_to.sin_addr.s_addr=htonl(INADDR_LOOPBACK);
     Require(bind(listener,reinterpret_cast<sockaddr*>(&bind_to),sizeof(bind_to))==0&&listen(listener,4)==0,"trusted loopback listener");
-    RunRole(root,L"implementation",listener);RunRole(root,L"review",listener);
+    RunRole(root,L"implementation",listener);RunRole(root,L"review",listener);ScopedRevokeRegression(root);
     closesocket(listener);WSACleanup();SetEnvironmentVariableW(L"FORBIDDEN_HOST_CREDENTIAL",nullptr);
     // Keep synthetic artifacts on failure; remove only this freshly generated root after success.
     Require(RegDeleteTreeW(HKEY_CURRENT_USER,registry_path.c_str())==ERROR_SUCCESS,"delete only own synthetic registry fixture");
