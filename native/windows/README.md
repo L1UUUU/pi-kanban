@@ -322,3 +322,19 @@ fixtures out of concurrent disk traversal without weakening any missing/permissi
 failure rule. A check-policy failure terminates the entire Job before returning failure.
 If reverting impersonation itself fails, the helper exits immediately and writes no clean
 receipt; kernel Job-handle closure kills descendants and recovery remains explicitly unknown.
+
+
+The v3 smoke initially recorded WSAEWOULDBLOCK without a completion because the probe
+watched only writefds. WinSock reports failed nonblocking connects in exceptfds. The
+corrected probe watches both under the same one-second bound and requires a successful
+SO_ERROR query returning WSAEACCES; pending sockets, timeouts and API failures still fail.
+https://learn.microsoft.com/en-us/windows/win32/api/winsock2/nf-winsock2-select
+
+Both primary Worker and native-mediated Node commands now use fixed Node 24
+`--preserve-symlinks --preserve-symlinks-main` flags after native component pinning and
+reparse rejection. This avoids the module loader's redundant volume-root realpath walk;
+it grants no filesystem permission and introduces no path fallback. Controlled tools use
+`fs.realpathSync.native` for actual selected-workspace canonicalization. Per-ancestor
+metadata availability is recorded rather than assuming the rejected v2 root grant exists;
+all ancestor-directory listing, adjacent/private file, Git and Host denials remain mandatory.
+https://github.com/nodejs/node/blob/v24.x/doc/api/cli.md#--preserve-symlinks-main

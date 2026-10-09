@@ -12,7 +12,9 @@ export function controlledTools(options:{workspace:string;scratch:string;role:Ru
   delete?:(toolCallId:string,path:string,perform:()=>void)=>Promise<void>;
   shell?:(toolCallId:string,command:string,signal:AbortSignal|undefined)=>Promise<{output:string;exitCode:number|null;[key:string]:unknown}>;
   check?:(toolCallId:string,args:string[],signal:AbortSignal|undefined)=>Promise<{output:string;exitCode:number|null;[key:string]:unknown}>}):ToolDefinition[]{
-  const root=realpathSync(options.workspace);
+  // Native canonicalization opens the selected path directly on Windows rather
+  // than requiring metadata permission on every volume-root ancestor. No fallback.
+  const root=realpathSync.native(options.workspace);
   function path(input:string,write=false){
     if(typeof input!=='string'||!input||isAbsolute(input)||input.split(/[\\/]/).some(x=>x==='..'||x==='.git'||x==='.local'))throw new RuntimeError('TOOL_PATH_DENIED','Only approved relative source paths are allowed');
     const target=resolve(root,input),rel=relative(root,target);if(rel.startsWith('..')||isAbsolute(rel))throw new RuntimeError('TOOL_PATH_DENIED','Outside source workspace');

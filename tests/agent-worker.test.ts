@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { PassThrough } from 'node:stream';
-import { mkdtempSync,mkdirSync,writeFileSync,readFileSync,symlinkSync,existsSync } from 'node:fs';
+import { mkdtempSync,mkdirSync,writeFileSync,readFileSync,symlinkSync,existsSync,realpathSync,rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomBytes,createHash } from 'node:crypto';
@@ -82,4 +82,18 @@ test('check-only Worker waits on its private control channel without any Pi mode
   const running=runWorkerFromStreams(toWorker,fromWorker,init.generation);toWorker.write(encodePrivateFrame(Buffer.from(JSON.stringify(init))));await ready;
   assert.deepEqual(frames.map(frame=>frame.type),['worker.ready']);assert.equal(frames[0]!.sessionId,init.sessionId);
   toWorker.end();await running;assert.equal(frames.some(frame=>frame.type==='model.request'||frame.type==='worker.report'),false);fromWorker.destroy();
+});
+
+
+test('native workspace canonicalization keeps real file reads scoped and rejects junction traversal',async t=>{
+  const root=realpathSync.native(mkdtempSync(join(tmpdir(),'pi-native-canonical-'))),workspace=join(root,'source'),outside=join(root,'source-neighbor'),scratch=join(root,'scratch');
+  for(const path of [workspace,outside,scratch])mkdirSync(path);t.after(()=>rmSync(root,{recursive:true,force:true}));
+  writeFileSync(join(workspace,'allowed.txt'),'approved real file');writeFileSync(join(outside,'private.txt'),'private sibling');
+  symlinkSync(outside,join(workspace,'escape'),'junction');
+  let writes=0;const options={workspace,scratch,role:'implementation' as const,maxFileBytes:1024,commandTimeoutMs:1000,maxOutputBytes:1024,report:async()=>({}),stopRequired:()=>{},write:async(_id:string,_path:string,_content:string,perform:()=>void)=>{writes++;perform();}};
+  const tools=controlledTools(options),read=tools.find(tool=>tool.name==='controlled_read')!,write=tools.find(tool=>tool.name==='controlled_write')!;
+  const actual=await read.execute('read',{path:'allowed.txt'},undefined,undefined,{} as never);assert.equal((actual.content[0] as {text:string}).text,'approved real file');
+  for(const path of ['escape/private.txt','../source-neighbor/private.txt'])await assert.rejects(read.execute('denied',{path},undefined,undefined,{} as never),{code:'TOOL_PATH_DENIED'});
+  await assert.rejects(write.execute('denied-write',{path:'escape/new.txt',content:'denied'},undefined,undefined,{} as never),{code:'TOOL_PATH_DENIED'});
+  assert.equal(writes,0);assert.equal(existsSync(join(outside,'new.txt')),false);assert.equal(readFileSync(join(outside,'private.txt'),'utf8'),'private sibling');
 });

@@ -189,7 +189,7 @@ DWORD ControlledJob::Launch(const LaunchDescriptor& d, const PrivateHandles& cha
   STARTUPINFOEXW startup{}; startup.StartupInfo.cb = sizeof(startup); startup.lpAttributeList = list;
   startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
   startup.StartupInfo.hStdInput = channels.requests_read; startup.StartupInfo.hStdOutput = channels.reports_write; startup.StartupInfo.hStdError = channels.logs_write;
-  std::wstring command = Quote(d.node_executable) + L" " + Quote(d.worker_entry) + L" --controlled-run " + Quote(d.generation);
+  std::wstring command = Quote(d.node_executable) + L" --preserve-symlinks --preserve-symlinks-main " + Quote(d.worker_entry) + L" --controlled-run " + Quote(d.generation);
   stage_ = "get-windows-directory";
   wchar_t windows[MAX_PATH]{}; if (!GetWindowsDirectoryW(windows, MAX_PATH)) return GetLastError();
   // Explicit minimal environment. No inherited PATH, HOME, auth keys, NODE_OPTIONS, proxy or control tokens.
@@ -276,7 +276,7 @@ DWORD ControlledJob::SpawnPinnedCheck(const LaunchDescriptor& d,const std::wstri
       (lpac&&!UpdateProcThreadAttribute(list, 0, PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY, &policy, sizeof(policy), nullptr, nullptr))) return GetLastError();
   STARTUPINFOEXW startup{}; startup.StartupInfo.cb = sizeof(startup); startup.lpAttributeList = list; startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
   startup.StartupInfo.hStdInput = input; startup.StartupInfo.hStdOutput = output; startup.StartupInfo.hStdError = output;
-  std::wstring command = Quote(executable); for (const auto& argument : args) command += L" " + Quote(argument);
+  std::wstring command = Quote(executable)+(shell?L"":L" --preserve-symlinks --preserve-symlinks-main"); for (const auto& argument : args) command += L" " + Quote(argument);
   wchar_t windows[MAX_PATH]{}; if (!GetWindowsDirectoryW(windows, MAX_PATH)) return GetLastError();
   std::vector<std::wstring> environment = {L"APPDATA=" + d.scratch, L"LOCALAPPDATA=" + d.scratch, L"PI_OFFLINE=1", L"SystemDrive=" + std::wstring(windows, 2), L"SystemRoot=" + std::wstring(windows), L"TEMP=" + d.scratch, L"TMP=" + d.scratch, L"USERPROFILE=" + d.scratch};
   if(shell){environment.push_back(L"LANG=C");environment.push_back(L"LC_ALL=C");environment.push_back(L"HOME="+d.scratch);environment.push_back(L"PATH="+d.shell_root+L"\\usr\\bin;"+d.shell_root+L"\\mingw64\\bin");environment.push_back(L"GIT_CONFIG_NOSYSTEM=1");environment.push_back(L"GIT_CONFIG_GLOBAL=NUL");environment.push_back(L"GIT_TERMINAL_PROMPT=0");environment.push_back(L"GCM_INTERACTIVE=never");environment.push_back(L"MSYS2_ARG_CONV_EXCL=*");}

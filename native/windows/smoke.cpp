@@ -118,13 +118,25 @@ int ProbeChild() {
   WSADATA sockets{}; const int wsa_startup_error = WSAStartup(MAKEWORD(2,2), &sockets); const bool sockets_ok = wsa_startup_error == 0;
   SOCKET socket_value = sockets_ok ? socket(AF_INET, SOCK_STREAM, IPPROTO_TCP) : INVALID_SOCKET;
   sockaddr_in addr{}; addr.sin_family = AF_INET; addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK); addr.sin_port = htons(static_cast<u_short>(std::stoi(port_text)));
-  bool network = false; int network_error = socket_value==INVALID_SOCKET?WSAGetLastError():0;
-  if (socket_value != INVALID_SOCKET) { u_long nonblocking = 1; ioctlsocket(socket_value, FIONBIO, &nonblocking);
-    const int result = connect(socket_value, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)); network_error = WSAGetLastError();
-    if (result == 0) network = true;
-    else if (network_error == WSAEWOULDBLOCK) { fd_set ready; FD_ZERO(&ready); FD_SET(socket_value, &ready); timeval timeout{1,0};
-      if (select(0, nullptr, &ready, nullptr, &timeout)>0) { int length=sizeof(network_error); getsockopt(socket_value,SOL_SOCKET,SO_ERROR,reinterpret_cast<char*>(&network_error),&length); network=network_error==0; } }
-    closesocket(socket_value); }
+  bool network=false,network_completed=false;int network_select_status=0,network_error=socket_value==INVALID_SOCKET?WSAGetLastError():0;
+  if(socket_value!=INVALID_SOCKET){u_long nonblocking=1;
+    if(ioctlsocket(socket_value,FIONBIO,&nonblocking)==SOCKET_ERROR)network_error=WSAGetLastError();
+    else{
+      const int result=connect(socket_value,reinterpret_cast<sockaddr*>(&addr),sizeof(addr));network_error=result==0?0:WSAGetLastError();
+      if(result==0){network=true;network_completed=true;}
+      else if(network_error!=WSAEWOULDBLOCK)network_completed=true;
+      else{
+        // WinSock reports failed nonblocking connects in exceptfds, NOT writefds.
+        // Both readiness paths require a successful SO_ERROR query; timeout/API
+        // failure remains inconclusive and cannot be counted as access denial.
+        fd_set ready,failed;FD_ZERO(&ready);FD_ZERO(&failed);FD_SET(socket_value,&ready);FD_SET(socket_value,&failed);timeval timeout{1,0};
+        network_select_status=select(0,nullptr,&ready,&failed,&timeout);
+        if(network_select_status>0){int length=sizeof(network_error);if(getsockopt(socket_value,SOL_SOCKET,SO_ERROR,reinterpret_cast<char*>(&network_error),&length)==0){network_completed=true;network=network_error==0;}else network_error=WSAGetLastError();}
+        else if(network_select_status==SOCKET_ERROR)network_error=WSAGetLastError();
+      }
+    }
+    closesocket(socket_value);
+  }
   if (sockets_ok) WSACleanup();
   std::wstring command = L"\"" + Self() + L"\" --descendant \"" + (root/L"scratch"/L"child-heartbeat.txt").wstring() + L"\"";
   STARTUPINFOW startup{}; startup.cb=sizeof(startup); PROCESS_INFORMATION spawned{};
@@ -134,10 +146,10 @@ int ProbeChild() {
   PROCESS_INFORMATION escape{};const bool escaped=!!CreateProcessW(Self().c_str(),command.data(),nullptr,nullptr,FALSE,CREATE_NO_WINDOW|CREATE_BREAKAWAY_FROM_JOB,nullptr,nullptr,&startup,&escape);
   const DWORD breakaway_error=escaped?0:GetLastError();
   if(escaped){TerminateProcess(escape.hProcess,1);CloseHandle(escape.hThread);CloseHandle(escape.hProcess);}
-  const bool expected=own_read&&(own_write==(role==L"implementation"))&&!other_read&&!db_read&&!git_read&&!env_leak&&!registry_leak&&(policy==L"strict"||(sockets_ok&&network_error==WSAEACCES))&&!network&&!escaped;
+  const bool expected=own_read&&(own_write==(role==L"implementation"))&&!other_read&&!db_read&&!git_read&&!env_leak&&!registry_leak&&(policy==L"strict"||(sockets_ok&&network_completed&&network_error==WSAEACCES))&&!network&&!escaped;
   std::ostringstream report;report<<"{\"phase\":\"native-child-probes\",\"role\":\""<<(role==L"implementation"?"implementation":"review")<<"\",\"ownRead\":"<<own_read<<",\"ownWrite\":"<<own_write
     <<",\"otherRead\":"<<other_read<<",\"hostDbRead\":"<<db_read<<",\"sharedGitRead\":"<<git_read<<",\"hostRegistryRead\":"<<registry_leak<<",\"hostRegistryStatus\":"<<registry_status<<",\"environmentLeak\":"<<env_leak<<",\"loopbackConnected\":"<<network
-    <<",\"networkError\":"<<network_error<<",\"policy\":\""<<(policy==L"registry-read"?"registry-read":policy==L"appcontainer"?"appcontainer":"strict")<<"\",\"networkDenialProven\":"<<(sockets_ok&&!network&&network_error==WSAEACCES)<<",\"wsaStartupError\":"<<wsa_startup_error<<",\"childSpawned\":"<<spawned_child<<",\"childSpawnError\":"<<child_spawn_error<<",\"breakawaySucceeded\":"<<escaped<<",\"breakawayError\":"<<breakaway_error<<",\"readError\":"<<e_read<<",\"writeError\":"<<e_write<<",\"crossReadError\":"<<e_other<<",\"passed\":"<<expected<<"}\n";
+    <<",\"networkCompleted\":"<<network_completed<<",\"networkSelectStatus\":"<<network_select_status<<",\"networkError\":"<<network_error<<",\"policy\":\""<<(policy==L"registry-read"?"registry-read":policy==L"appcontainer"?"appcontainer":"strict")<<"\",\"networkDenialProven\":"<<(sockets_ok&&network_completed&&!network&&network_error==WSAEACCES)<<",\"wsaStartupError\":"<<wsa_startup_error<<",\"childSpawned\":"<<spawned_child<<",\"childSpawnError\":"<<child_spawn_error<<",\"breakawaySucceeded\":"<<escaped<<",\"breakawayError\":"<<breakaway_error<<",\"readError\":"<<e_read<<",\"writeError\":"<<e_write<<",\"crossReadError\":"<<e_other<<",\"passed\":"<<expected<<"}\n";
   const auto text=report.str();DWORD written=0;Require(!!WriteFile(GetStdHandle(STD_OUTPUT_HANDLE),text.data(),static_cast<DWORD>(text.size()),&written,nullptr),"private report");
   Heartbeat(root/L"scratch"/L"parent-heartbeat.txt"); return 0;
 }
@@ -198,6 +210,9 @@ void RunRole(const fs::path& root,const std::wstring& role,SOCKET listener) {
 } // namespace
 int wmain(int argc,wchar_t** argv) {
   try{
+    // This native executable substitutes for pinned Node in CTest only. Consume
+    // the same fixed startup flags; actual Node/Pi compatibility is separate.
+    if(argc>=3&&std::wstring(argv[1])==L"--preserve-symlinks"&&std::wstring(argv[2])==L"--preserve-symlinks-main"){argc-=2;argv+=2;}
     if(argc==3&&std::wstring(argv[1])==L"--descendant"){Heartbeat(argv[2]);return 0;}
     if(argc==4&&std::wstring(argv[2])==L"--controlled-run")return ProbeChild();
     if(argc==2&&std::wstring(argv[1])==L"--registry-read")registry_read_policy=true;
