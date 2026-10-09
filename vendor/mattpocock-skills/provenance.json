@@ -1,0 +1,80 @@
+{
+  "schemaVersion": 1,
+  "repository": "https://github.com/mattpocock/skills",
+  "commit": "b0618bc436ad893b3c5e84e55fba86586d34a404",
+  "license": "MIT",
+  "files": [
+    {
+      "path": "skills/engineering/codebase-design/DEEPENING.md",
+      "sha256": "f3dd099ce99289bd213914d8ee3e2429b78309c3957ca4583f7659551b1d53c1",
+      "gitBlob": "cd94075cfd754d147555c5d747a16431ed4c7dd8",
+      "bytes": 2553
+    },
+    {
+      "path": "skills/engineering/codebase-design/DESIGN-IT-TWICE.md",
+      "sha256": "52b52e75655a27aea59c6966b410bac82448968ad46ef1ebb9f07c274e3ae010",
+      "gitBlob": "d0990138c35c800bd821289a73115e52680c1620",
+      "bytes": 2665
+    },
+    {
+      "path": "skills/engineering/codebase-design/SKILL.md",
+      "sha256": "2c20617f87ec8af6a434859f381b2f061a69b530444e74eb39e78bb016a6d1e2",
+      "gitBlob": "3f63c8146dd2604b419c929e9876b90c30d410e9",
+      "bytes": 6446
+    },
+    {
+      "path": "skills/engineering/codebase-design/agents/openai.yaml",
+      "sha256": "edebc9e4fcfe102114012575eaa9600b9b5fd08c311664f389c36e7bc717740f",
+      "gitBlob": "3180715edb37f6e96bec42f92f00169faa8886ef",
+      "bytes": 102
+    },
+    {
+      "path": "skills/engineering/to-spec/SKILL.md",
+      "sha256": "43ad9cf318e5e7d3d1fa360253a37021796dc87a0c2e595ad262661a10f85088",
+      "gitBlob": "3f52599ae2a4347aee5a07432c2707518e691a7f",
+      "bytes": 3043
+    },
+    {
+      "path": "skills/engineering/to-spec/agents/openai.yaml",
+      "sha256": "1c5b4d1e3d8e52287ef19cc2742fdbbfae1914ac75d33af3e4c8174f08cc55bb",
+      "gitBlob": "549e6f76f020a1b9ba65f52ccda336566ee6222a",
+      "bytes": 135
+    },
+    {
+      "path": "skills/engineering/to-tickets/SKILL.md",
+      "sha256": "56ec23c5b2782785d4e65bff9e315b6d3aeb4ef977c174a219e99489fada1995",
+      "gitBlob": "9b77a01db9460c99c22d03c910c349f890f12c0e",
+      "bytes": 5812
+    },
+    {
+      "path": "skills/engineering/to-tickets/agents/openai.yaml",
+      "sha256": "21bc6215fffcd7614e9f772bb1760e87cc5fc7dcc707e7d282bc9414267a6090",
+      "gitBlob": "24605a5db64e4fc750b999aa94aea126bee814ee",
+      "bytes": 146
+    },
+    {
+      "path": "skills/productivity/grilling/SKILL.md",
+      "sha256": "befdff1e27a1dfe2a294d5871169ac1afe16d983911daa4f32627514a48c1e15",
+      "gitBlob": "df69d9936880cd3314c28858c6c52f48db23b856",
+      "bytes": 2049
+    },
+    {
+      "path": "skills/productivity/grilling/agents/openai.yaml",
+      "sha256": "1411d7df7d99b7e621a1ff8283c8133cc2464be63d064e52d8ce169c6800ee9b",
+      "gitBlob": "ddbdb96139c0c1dfe6bca698f39d0465674b8a39",
+      "bytes": 113
+    },
+    {
+      "path": ".agents/invocation.md",
+      "sha256": "a8ee3ff9cab8fe247c5de4312320117c001df548960970a2769856349ec09402",
+      "gitBlob": "4877b32cd55bf708be61d90b95b720003f0ffdb5",
+      "bytes": 3850
+    },
+    {
+      "path": "LICENSE",
+      "sha256": "0e7ac423bf2c6e223b7c5b156f8cf72da49d748e56a1641402c31f22ad07dbb5",
+      "gitBlob": "f1dd2c09108dde1a5f56097cee8461b3ea834499",
+      "bytes": 1068
+    }
+  ]
+}

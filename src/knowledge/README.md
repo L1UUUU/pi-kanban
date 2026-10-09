@@ -1,0 +1,35 @@
+# Local knowledge and bounded remote observations
+
+## Trusted Host APIs
+
+`new KnowledgeService({db,resolveStore,onBodyRead?,fault?})` uses the Host's `DatabaseSync` and per-project `ImmutableObjectStore`. SQL stores metadata, evidence, eligibility, run manifests and reads; body bytes have one immutable local source.
+
+- `saveCandidate(CandidateInput)`: immutable revision identity, parent, origin demand/author, source kind, material kind, statement kind, target and role scope. Sibling revisions coexist. Saving or labeling content never makes it reusable.
+- `recordEvidence(SourceEvidence)`: Q's independent reviewer records concrete references, source/content/reuse/applicability results and mixed-private-content checks. The original author cannot independently qualify their own material. This is a Host attestation API, not a model-provided completion flag.
+- `registerEligibility(EligibilityInput)`: separate qualification for an exact target, baseline and environment, supported by actual capability evidence. Existing formal facts and independent environment experience need their own evidence; neither waits for the discovering demand to merge. Implementation knowledge additionally requires a live, correctly bound merged observation and separate final-code/revision correspondence. Mock observations cannot grant production implementation eligibility.
+- `createContext(ContextInput)`: freezes a run capability after project, demand, role, explicit revision allowlist, target, exact-baseline and environment checks. Cross-demand bodies/titles never enter search before qualification. Same-demand candidates still require the explicit role/version allowlist.
+- `read(contextId,revisionId,purpose?)`, `search(contextId,query,limit?)`: only immutable versions in that capability. Denials do not look up foreign body/title metadata. Reviewer contexts exclude implementation sessions and equivalent summaries even if requested in an allowlist. Searches run only over the permitted set; each actual body read is recorded.
+- `invalidate({revisionId,reason,evidenceRef})`: preserves versions/history and revokes future or existing-context reads. It does not change project rules or rewrite frozen results.
+- `verifyReferences(projectId)`: integrity findings with no fallback to a newer or similarly named file.
+
+Callers must restrict context-creation, evidence and eligibility APIs to the Host. Workers receive only their specific context's read/search capability. Semantically correct source and capability attestations depend on independent Q verification; the storage layer cannot prove arbitrary prose true. Query matches and read counts are not evidence of real Agent reuse.
+
+## GitHub read-only adapter
+
+`GitHubReadOnlyAdapter({db,binding:{projectId,demandId,owner,repository,pullRequest,target},transport?,timeoutMs?})` exposes only observations, exact tree comparison, and local verification records.
+
+The built-in transport makes bounded, redirect-rejecting GET requests to fixed GitHub API paths. There is no arbitrary URL, token forwarding, comments-to-control, push, PR creation or merge operation. A supplied test transport forces `controlled-response` provenance. The built-in public read path has `github-live` provenance only for requests it actually makes; tests make no real network requests.
+
+PR identity and target are checked. Merge commit existence and its containment in the observed target are verified independently of PR status. Unknown, open, closed-unmerged, wrong-target and merged observations remain distinct; failures do not erase historical facts. Merge observations do not grant acceptance or knowledge eligibility.
+
+`recordContentVerification` stores Q's separate scoped code/capability evidence across accepted, submitted and final content. Different SHAs from squash/rebase are not automatically a mismatch. Acceptance coverage (`covered`, `gap`, `unknown`) is distinct from correspondence and knowledge suitability. Full live GitHub/Agent reuse remains blocked until an authorized test repository and execution combination exist.
+
+## Application lifecycle
+
+`HostKnowledgeLifecycle` in `src/host/knowledge-lifecycle.ts` joins actual application results to these services. After a production tick, `captureResults` retains each exact result N as an immutable local hypothesis only when the Host registry proves that a separately stopped Review received the exact C/N bodies. A model's `knowledgeReviewed` field alone cannot do this. The desktop can inspect candidates, explicitly classify an immutable child revision, pin a GitHub PR, observe its state, select independently observed capability checks, qualify an exact baseline/environment, or invalidate a revision.
+
+Qualification obtains native check data from the Host command registry and verifies artifact ownership, successful actual exit, source-before/source-after identities, stopped independent run, generation and environment. Synthetic receipts are rejected. The user's review decision records reusable meaning, applicability and absence of mixed private conclusions; it supplies no merge or process evidence. Implementation material additionally needs the exact accepted result and a live remote observation. GET-only commit-tree comparisons require submitted and final remote trees to equal the independently reviewed local tree. This deliberately rejects changed final code until separately reviewed; equal squash/rebase trees are supported without assuming equal commits. Existing facts must predate the discovering demand's initial formal baseline. Environment-only material cannot declare code-dependent module paths. Every reuse eligibility pins an exact baseline and observed environment.
+
+Baseline proposals record source commit, formal target, demand HEAD and current baseline. Applying one requires a current-version desktop decision, explicit commit identity, active unprotected demand and stopped execution. The Host first blocks queued execution, then calls the recoverable local workspace operation. There is no fetch, push, PR creation, remote merge or silent formal-target update. Missing local formal objects must be supplied through the user's separately controlled Git workflow. Integrated code remains unverified and the prior reuse baseline remains effective until fresh native checks pass on the exact integrated snapshot. The user selects prior independently observed native check recipes from a retained result. A separate read-only check runner executes those recipes anew without a model session, records native receipts, verifies unchanged source, and confirms full process stop and resource revocation. Historical results supply recipes, never evidence that the new HEAD passed. Existing results are never rewritten or accepted by integration.
+
+`tests/knowledge-lifecycle.test.ts` exercises the application orchestration with isolated repositories and controlled trusted-registry fixtures. It does not establish a real Windows native run, live GitHub merge, paid-model invocation, or actual later-agent reuse. Those external acceptance gates remain unverified.
