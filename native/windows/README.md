@@ -181,8 +181,12 @@ fresh check-slot and zero-Job recheck, so finalization cannot discard the pendin
 Paired fixtures start a real child that writes a heartbeat before its Node command parent
 exits zero. Child standard handles are duplicates of an already-open scratch file, so the
 fixture needs neither a new named pipe nor an inherited helper output writer. The Host
-releases a challenge marker only after a successful native Job census shows the exact
-parent absent and child present. The short-lived child then starts a 75 ms exit timer;
+first requires a successful native Job census containing both exact parent and child
+PIDs before allowing parent exit. The child uses Node's `detached` option to avoid
+libuv's separate kill-with-parent Job; pinned libuv does not request Windows Job
+breakaway for that option. The Host releases a second challenge marker only after
+a native census shows the exact parent absent and child present. The short-lived
+child then starts a 75 ms exit timer;
 the probe requires a live first native census and disappearance in the final census within
 the shared 250 ms window. A scheduling miss fails coverage rather than being called a
 settlement pass. The persistent child keeps running with no inherited helper output
