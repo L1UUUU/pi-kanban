@@ -308,11 +308,14 @@ try {
   concurrentB.send({ type: 'query' }); await concurrentB.wait(() => concurrentB.event('native.observation', event => event.status === 0 && event.activePids.includes(concurrentB.event('native.started').pid)), 'other helper remains alive');
   await concurrentB.stop();
   passed('concurrent-acl-isolation', 'Two overlapping helpers shared exact runtime files; A revoked and independently checked old-SID absence while B completed five bounded Node commands that repeatedly read allowed runtime/source and remained denied sibling data. Each receipt retained successful process-wait/Job-census/output-drain observations; B survived A stop and receipt-to-next-command handoffs.');
-  const testRunner = launch('implementation', 'node-test-runner');
+  const testWorkspace = join(root, 'source-node-test-runner'), testFilename = 'node-native.test.cjs', testName = `native-source-${challenge}`;
+  mkdirSync(testWorkspace); writeFileSync(join(testWorkspace, 'source.txt'), 'original');
+  writeFileSync(join(testWorkspace, testFilename), `const test=require('node:test'),assert=require('node:assert/strict'),fs=require('node:fs');test(${JSON.stringify(testName)},()=>assert.equal(fs.readFileSync('source.txt','utf8'),'original'));`);
+  // Provision the complete testcase first. The Node test CLI performs glob
+  // discovery, so use the authorized workspace cwd without scanning ancestors.
+  const testRunner = launch('implementation', 'node-test-runner', testWorkspace);
   await testRunner.wait(() => testRunner.event('native.started'), 'native direct test runner Worker');
-  const testcase = join(testRunner.workspace, 'node-native.test.cjs'), testName = `native-source-${challenge}`;
-  writeFileSync(testcase, `const test=require('node:test'),assert=require('node:assert/strict'),fs=require('node:fs');test(${JSON.stringify(testName)},()=>assert.equal(fs.readFileSync(${JSON.stringify(join(testRunner.workspace, 'source.txt'))},'utf8'),'original'));`);
-  const testArgs = ['--test', '--test-isolation=none', '--test-reporter=tap', testcase];
+  const testArgs = ['--test', '--test-isolation=none', '--test-reporter=tap', testFilename];
   testRunner.send({ type: 'run-node', requestId: 'node-test-runner', args: testArgs, timeoutMs: 10000, maxOutputBytes: 16384 });
   await testRunner.wait(() => testRunner.event('native.check-result', event => event.requestId === 'node-test-runner'), 'actual direct Node test runner receipt');
   const testReceipt = testRunner.event('native.check-result', event => event.requestId === 'node-test-runner'), testDiagnostic = JSON.stringify(testReceipt);
