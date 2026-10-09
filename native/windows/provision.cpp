@@ -111,6 +111,9 @@ DWORD ScopedResources::Provision(const LaunchDescriptor& d,const std::vector<std
   if((error=grant(d.scratch,FILE_ALL_ACCESS,GRANT_ACCESS,true)))return error;
   for(const auto* name:{L".git",L".local"}){const auto internal=(fs::path(d.workspace)/name).wstring();if(GetFileAttributesW(internal.c_str())!=INVALID_FILE_ATTRIBUTES&&
       (error=grant(internal,FILE_ALL_ACCESS,DENY_ACCESS,true)))return error;}
+  // Ordinary AppContainer v3 relies on the OS's existing metadata/traverse policy.
+  // Do not edit ancestors or the volume root, request elevation, or fall back.
+  if(d.policy_variant==L"appcontainer-no-network-v3")return ERROR_SUCCESS;
   // Node realpath requires metadata on exact ancestor directories, including the
   // drive root. This is explicit candidate-v2 policy only: no listing, contents,
   // inheritance or writes. Strict-v1 keeps its previous traverse-only scope.

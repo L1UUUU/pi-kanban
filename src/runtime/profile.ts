@@ -77,7 +77,7 @@ function verifyProfile(input: unknown, trustedEvidenceRoot: string, trust: Windo
     throw new RuntimeError('PROFILE_MACHINE_MISMATCH', 'Profile OS build and architecture must match this machine exactly');
   if (Number(release().split('.')[2]) < 22000) throw new RuntimeError('WINDOWS_11_REQUIRED', 'Windows 11 build or later required');
   if (typeof config.policySha256 !== 'string' || !/^[a-f0-9]{64}$/.test(config.policySha256)) throw new RuntimeError('POLICY_UNVERIFIED', 'Policy digest missing');
-  if (config.policyVariant !== undefined && config.policyVariant !== 'lpac-strict-v1' && config.policyVariant !== 'lpac-registry-read-no-network-v2')
+  if (config.policyVariant !== undefined && config.policyVariant !== 'lpac-strict-v1' && config.policyVariant !== 'lpac-registry-read-no-network-v2' && config.policyVariant !== 'appcontainer-no-network-v3')
     throw new RuntimeError('PROFILE_POLICY_MISMATCH', 'An explicit supported Windows policy variant is required');
   for (const key of ['node', 'helper', 'worker', 'pi'] as const) {
     const binary = object(config[key]);

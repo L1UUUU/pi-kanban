@@ -18,7 +18,8 @@
 using namespace pi_kanban;
 namespace fs = std::filesystem;
 namespace {
-bool registry_read_policy=false,all_network_validated=true;
+bool registry_read_policy=false,ordinary_appcontainer=false,all_network_validated=true;
+std::wstring SelectedPolicy(){return ordinary_appcontainer?L"appcontainer-no-network-v3":registry_read_policy?L"lpac-registry-read-no-network-v2":L"lpac-strict-v1";}
 void Require(bool value, const char* detail) { if (!value) throw std::runtime_error(std::string(detail) + ": " + std::to_string(GetLastError())); }
 std::wstring Self() { std::vector<wchar_t> path(32768); DWORD n = GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size())); Require(n > 0, "self path"); return {path.data(), n}; }
 void Write(const fs::path& path, const std::string& text) { std::ofstream out(path, std::ios::binary); Require(!!out, "write fixture"); out << text; }
@@ -133,10 +134,10 @@ int ProbeChild() {
   PROCESS_INFORMATION escape{};const bool escaped=!!CreateProcessW(Self().c_str(),command.data(),nullptr,nullptr,FALSE,CREATE_NO_WINDOW|CREATE_BREAKAWAY_FROM_JOB,nullptr,nullptr,&startup,&escape);
   const DWORD breakaway_error=escaped?0:GetLastError();
   if(escaped){TerminateProcess(escape.hProcess,1);CloseHandle(escape.hThread);CloseHandle(escape.hProcess);}
-  const bool expected=own_read&&(own_write==(role==L"implementation"))&&!other_read&&!db_read&&!git_read&&!env_leak&&!registry_leak&&(policy!=L"registry-read"||(sockets_ok&&network_error==WSAEACCES))&&!network&&!escaped;
+  const bool expected=own_read&&(own_write==(role==L"implementation"))&&!other_read&&!db_read&&!git_read&&!env_leak&&!registry_leak&&(policy==L"strict"||(sockets_ok&&network_error==WSAEACCES))&&!network&&!escaped;
   std::ostringstream report;report<<"{\"phase\":\"native-child-probes\",\"role\":\""<<(role==L"implementation"?"implementation":"review")<<"\",\"ownRead\":"<<own_read<<",\"ownWrite\":"<<own_write
     <<",\"otherRead\":"<<other_read<<",\"hostDbRead\":"<<db_read<<",\"sharedGitRead\":"<<git_read<<",\"hostRegistryRead\":"<<registry_leak<<",\"hostRegistryStatus\":"<<registry_status<<",\"environmentLeak\":"<<env_leak<<",\"loopbackConnected\":"<<network
-    <<",\"networkError\":"<<network_error<<",\"policy\":\""<<(policy==L"registry-read"?"registry-read":"strict")<<"\",\"networkDenialProven\":"<<(sockets_ok&&!network&&network_error==WSAEACCES)<<",\"wsaStartupError\":"<<wsa_startup_error<<",\"childSpawned\":"<<spawned_child<<",\"childSpawnError\":"<<child_spawn_error<<",\"breakawaySucceeded\":"<<escaped<<",\"breakawayError\":"<<breakaway_error<<",\"readError\":"<<e_read<<",\"writeError\":"<<e_write<<",\"crossReadError\":"<<e_other<<",\"passed\":"<<expected<<"}\n";
+    <<",\"networkError\":"<<network_error<<",\"policy\":\""<<(policy==L"registry-read"?"registry-read":policy==L"appcontainer"?"appcontainer":"strict")<<"\",\"networkDenialProven\":"<<(sockets_ok&&!network&&network_error==WSAEACCES)<<",\"wsaStartupError\":"<<wsa_startup_error<<",\"childSpawned\":"<<spawned_child<<",\"childSpawnError\":"<<child_spawn_error<<",\"breakawaySucceeded\":"<<escaped<<",\"breakawayError\":"<<breakaway_error<<",\"readError\":"<<e_read<<",\"writeError\":"<<e_write<<",\"crossReadError\":"<<e_other<<",\"passed\":"<<expected<<"}\n";
   const auto text=report.str();DWORD written=0;Require(!!WriteFile(GetStdHandle(STD_OUTPUT_HANDLE),text.data(),static_cast<DWORD>(text.size()),&written,nullptr),"private report");
   Heartbeat(root/L"scratch"/L"parent-heartbeat.txt"); return 0;
 }
@@ -158,9 +159,9 @@ void RunRole(const fs::path& root,const std::wstring& role,SOCKET listener) {
   Require(!!CreatePipe(&in_read,&in_write,&sa,0)&&!!CreatePipe(&out_read,&out_write,&sa,0)&&!!CreatePipe(&log_read,&log_write,&sa,0),"private pipes");
   SetHandleInformation(in_write,HANDLE_FLAG_INHERIT,0);SetHandleInformation(out_read,HANDLE_FLAG_INHERIT,0);SetHandleInformation(log_read,HANDLE_FLAG_INHERIT,0);
   sockaddr_in bound{};int bound_size=sizeof(bound);Require(getsockname(listener,reinterpret_cast<sockaddr*>(&bound),&bound_size)==0,"listener address");
-  const auto command=root.wstring()+L"\n"+(root/L"own").wstring()+L"\n"+role+L"\n"+std::to_wstring(ntohs(bound.sin_port))+L"\n"+(registry_read_policy?L"registry-read":L"strict")+L"\n";
+  const auto command=root.wstring()+L"\n"+(root/L"own").wstring()+L"\n"+role+L"\n"+std::to_wstring(ntohs(bound.sin_port))+L"\n"+(ordinary_appcontainer?L"appcontainer":registry_read_policy?L"registry-read":L"strict")+L"\n";
   DWORD sent=0;Require(!!WriteFile(in_write,command.data(),static_cast<DWORD>(command.size()*sizeof(wchar_t)),&sent,nullptr),"private command");
-  LaunchDescriptor d;d.policy_variant=registry_read_policy?L"lpac-registry-read-no-network-v2":L"lpac-strict-v1";d.demand=L"A";d.role=role;d.generation=generation;d.profile_name=profile.name;
+  LaunchDescriptor d;d.policy_variant=SelectedPolicy();d.demand=L"A";d.role=role;d.generation=generation;d.profile_name=profile.name;
   d.node_executable=(root/L"bin"/L"probe.exe").wstring();d.worker_entry=(root/L"bin"/L"entry.fixture").wstring();d.workspace=(root/L"own").wstring();d.scratch=(root/L"scratch").wstring();
   d.node_sha256=Sha256(d.node_executable);d.worker_sha256=Sha256(d.worker_entry);
   d.policy_evidence=L"synthetic-ci-probe-not-G1";d.acl_evidence=L"this-test-provisioned-dacl";d.private_channel_evidence=L"candidate-under-test";
@@ -198,6 +199,7 @@ int wmain(int argc,wchar_t** argv) {
     if(argc==3&&std::wstring(argv[1])==L"--descendant"){Heartbeat(argv[2]);return 0;}
     if(argc==4&&std::wstring(argv[2])==L"--controlled-run")return ProbeChild();
     if(argc==2&&std::wstring(argv[1])==L"--registry-read")registry_read_policy=true;
+    if(argc==2&&std::wstring(argv[1])==L"--appcontainer")ordinary_appcontainer=true;
     Require(AppContainerProfileName(L"A",L"implementation",L"generation-1")==L"pi-kanban-a898bef33cf31470bdfb100d74db470c2cbf93aea19effb2","Host/native profile-name binding must match");
     const auto root=fs::temp_directory_path()/(L"pi-kanban-native-smoke-"+std::to_wstring(GetCurrentProcessId())+L"-"+std::to_wstring(GetTickCount64()));
     fs::create_directories(root);Acl(root,nullptr,0);fs::create_directories(root/L"other");fs::create_directories(root/L"shared-git");
@@ -213,7 +215,7 @@ int wmain(int argc,wchar_t** argv) {
     closesocket(listener);WSACleanup();SetEnvironmentVariableW(L"FORBIDDEN_HOST_CREDENTIAL",nullptr);
     // Keep synthetic artifacts on failure; remove only this freshly generated root after success.
     Require(RegDeleteTreeW(HKEY_CURRENT_USER,registry_path.c_str())==ERROR_SUCCESS,"delete only own synthetic registry fixture");
-    fs::remove_all(root);std::cout<<"{\"phase\":\"complete\",\"nativeSmokePassed\":true,\"policyVariant\":\""<<(registry_read_policy?"lpac-registry-read-no-network-v2":"lpac-strict-v1")<<"\",\"networkPolicyValidated\":"<<all_network_validated<<",\"nodeGitBashPiCompatibility\":\"not-tested\",\"fullG1\":false}"<<std::endl;return 0;
+    fs::remove_all(root);std::cout<<"{\"phase\":\"complete\",\"nativeSmokePassed\":true,\"policyVariant\":\""<<(ordinary_appcontainer?"appcontainer-no-network-v3":registry_read_policy?"lpac-registry-read-no-network-v2":"lpac-strict-v1")<<"\",\"networkPolicyValidated\":"<<all_network_validated<<",\"nodeGitBashPiCompatibility\":\"not-tested\",\"fullG1\":false}"<<std::endl;return 0;
   }catch(const std::exception& error){std::cerr<<"native smoke failed: "<<error.what()<<std::endl;return 1;}
 }
 #endif

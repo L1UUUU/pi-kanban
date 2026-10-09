@@ -263,3 +263,28 @@ protected Git deny exists, revokes the generated SID, checks descendant/runtime 
 absence, and compares an unrelated identity's ACE bytes before and after. Object/callback
 allow/deny ACEs are parsed with their optional GUID offsets; unknown DACL ACE forms retain
 a cleanup blocker instead of being skipped or falsely certified clean.
+
+
+## Explicit ordinary AppContainer comparison
+
+`appcontainer-no-network-v3` is a separately named primary-scope AppContainer + Job
+candidate. It omits the LPAC opt-out attribute, grants zero capabilities, and verifies
+both the actual AppContainer SID and the token's exact LPAC/non-LPAC state before
+resuming any instruction. The same Job, bounded private pipes, exact runtime file grants,
+source-role restrictions, disk monitor and authenticated cleanup apply. This variant
+performs no ancestor or volume-root ACL edits and never elevates or falls back.
+
+Ordinary AppContainer honors Windows' existing ALL_APPLICATION_PACKAGES resource policy;
+that is a real difference from LPAC, not an equivalent isolation claim. The separate
+`native_appcontainer_smoke` and explicitly selected Node/Pi/Bash recorder must still pass
+all private/sibling/Git/HKCU/network denials and metadata-versus-directory-listing probes.
+An unexpected read remains a failed diagnostic; no negative test is waived for usability.
+Strict-v1 remains the default. Prior strict Winsock failure and v2 root-metadata/ACL timing
+failure remain historical failures and cannot authorize v3. Every signature binds the
+exact selected policy and changed helper artifact.
+
+```powershell
+node native/windows/probe-worker.mjs --helper build/native/Release/pi_kanban_native_helper.exe --worker dist/worker/main.mjs --output artifacts/windows-worker --policy appcontainer-no-network-v3 --git-bash "C:\Program Files\Git"
+```
+
+Primary token-state API: https://learn.microsoft.com/en-us/windows/win32/api/winnt/ne-winnt-token_information_class

@@ -12,7 +12,7 @@ import { createPublicKey, verify } from 'node:crypto';
 import { RuntimeError } from './types.ts';
 import type { LockedShellRuntime } from './shell-profile.ts';
 
-export type WindowsRuntimePolicyVariant = 'lpac-strict-v1' | 'lpac-registry-read-no-network-v2';
+export type WindowsRuntimePolicyVariant = 'lpac-strict-v1' | 'lpac-registry-read-no-network-v2' | 'appcontainer-no-network-v3';
 export const WINDOWS_RECORDER_ID = 'pi-kanban-windows-host-recorder-v1';
 export const REQUIRED_WINDOWS_PROBES = [
   'implementation-own-write', 'review-source-read-only', 'cross-demand-denied',
@@ -128,10 +128,11 @@ export function verifyWindowsEvidence(bytes: Uint8Array, expected: ExpectedWindo
     throw new RuntimeError('EVIDENCE_RECORDER_MISMATCH', 'Evidence recorder provenance does not match the pinned Host recorder');
   const bindings = record(report.bindings);
   // A legacy omission establishes only the original strict policy. Registry-read
-  // candidates need newly captured, signed evidence for their explicit variant.
+  // and ordinary AppContainer candidates need newly captured, signed evidence for
+  // their explicit variant; neither inherits approval from another candidate.
   const expectedVariant = expected.policyVariant === undefined ? 'lpac-strict-v1' : expected.policyVariant;
   const actualVariant = bindings.policyVariant === undefined ? 'lpac-strict-v1' : bindings.policyVariant;
-  if ((expectedVariant !== 'lpac-strict-v1' && expectedVariant !== 'lpac-registry-read-no-network-v2') || actualVariant !== expectedVariant)
+  if ((expectedVariant !== 'lpac-strict-v1' && expectedVariant !== 'lpac-registry-read-no-network-v2' && expectedVariant !== 'appcontainer-no-network-v3') || actualVariant !== expectedVariant)
     throw new RuntimeError('EVIDENCE_INAPPLICABLE', 'Evidence policy variant differs from the explicitly locked runtime');
   if (typeof expected.policySha256 !== 'string' || !digestPattern.test(expected.policySha256) || bindings.policySha256 !== expected.policySha256)
     throw new RuntimeError('EVIDENCE_INAPPLICABLE', 'Evidence was produced for a different policy');

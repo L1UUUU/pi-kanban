@@ -158,23 +158,25 @@ test('an omitted runtime capability policy canonicalizes to strict with no infer
   assert.equal(runtimeProfileInput(configuration).policyVariant, 'lpac-strict-v1');
   assert.equal(inspectConfiguration(configuration).configuration.runtime!.policyVariant, 'lpac-strict-v1');
   assert.equal(configurationDigest(configuration), configurationDigest({ ...configuration, runtime: { ...configuration.runtime, policyVariant: 'lpac-strict-v1' } }));
-  for (const policyVariant of [null, undefined, '', 'automatic', 'registryRead', 'lpac-registry-read-no-network-v3', true]) {
+  for (const policyVariant of [null, undefined, '', 'automatic', 'registryRead', 'lpac-registry-read-no-network-v3', 'appcontainer', 'appcontainer-no-network-v1', 'appcontainer-no-network-v2', true]) {
     assert.throws(() => parseConfiguration({ ...configuration, runtime: { ...configuration.runtime, policyVariant } }), { code: 'INVALID_CONFIGURATION' });
   }
 });
 
-test('the explicit registry-read policy round-trips, changes the digest and reaches the native verifier unchanged', t => {
+for (const policyVariant of ['lpac-registry-read-no-network-v2', 'appcontainer-no-network-v3'] as const) test(`the explicit ${policyVariant} policy round-trips and reaches the native verifier unchanged`, t => {
   const { root, file, configuration, store } = fixture(t); configuration.runtime = runtime(file);
   const strictDigest = configurationDigest(configuration);
-  configuration.runtime.policyVariant = 'lpac-registry-read-no-network-v2';
+  configuration.runtime.policyVariant = policyVariant;
   const selectedDigest = configurationDigest(configuration);
   assert.notEqual(selectedDigest, strictDigest);
-  const imported = join(root, 'registry-read-config.json'); writeFileSync(imported, JSON.stringify(configuration));
+  const otherPolicy = policyVariant === 'appcontainer-no-network-v3' ? 'lpac-registry-read-no-network-v2' : 'appcontainer-no-network-v3';
+  assert.notEqual(selectedDigest, configurationDigest({ ...configuration, runtime: { ...configuration.runtime, policyVariant: otherPolicy } }));
+  const imported = join(root, 'explicit-policy-config.json'); writeFileSync(imported, JSON.stringify(configuration));
   const saved = store.importFromFile(imported), loaded = store.load(), summary = store.inspect();
   assert.deepEqual(loaded, saved);
-  assert.equal(loaded.runtime!.policyVariant, 'lpac-registry-read-no-network-v2');
-  assert.equal(runtimeProfileInput(loaded).policyVariant, 'lpac-registry-read-no-network-v2');
-  assert.equal(summary.configuration.runtime!.policyVariant, 'lpac-registry-read-no-network-v2');
+  assert.equal(loaded.runtime!.policyVariant, policyVariant);
+  assert.equal(runtimeProfileInput(loaded).policyVariant, policyVariant);
+  assert.equal(summary.configuration.runtime!.policyVariant, policyVariant);
   assert.equal(summary.configurationDigest, configurationDigest(loaded));
   assert.equal(summary.runtime.status, 'configured-unverified'); assert.equal(summary.executionEnabled, false);
   assert.equal(configurationDigest({ ...loaded, revision: configuration.revision }), selectedDigest);

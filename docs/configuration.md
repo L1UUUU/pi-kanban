@@ -118,14 +118,19 @@ A non-null `runtime` has these fields (required unless marked optional):
 - `shell`: null, or an explicitly locked Git Bash executable and manifest as
   described below. Older schema-v1 documents may omit this field; parsing
   canonicalizes omission to null. There is no default shell or PATH discovery.
-- `policyVariant`: optional exact enum `lpac-strict-v1` or
-  `lpac-registry-read-no-network-v2`. Omission canonicalizes to `lpac-strict-v1`.
-  Null, unknown values and automatic selection are rejected. The second policy
-  explicitly adds the native registry-read capability while retaining network
-  denial; it is never selected after a strict-policy failure. Its selection is
-  preserved in settings, the configuration digest, the UI summary and the native
-  verifier input. Signed evidence must bind that exact policy; old strict-policy
-  evidence cannot authorize the registry-read variant.
+- `policyVariant`: optional exact enum `lpac-strict-v1`,
+  `lpac-registry-read-no-network-v2` or `appcontainer-no-network-v3`. Omission
+  canonicalizes to `lpac-strict-v1`. Null, unknown values and automatic selection
+  are rejected. The registry-read variant explicitly adds that capability to
+  LPAC while retaining network denial. It remains a diagnostic candidate with
+  observed compatibility failures, not a verified production profile. The
+  standard AppContainer candidate selects `appcontainer-no-network-v3`, with no
+  network capability and no filesystem-root ACL grant. Neither alternate policy
+  is ever selected after another policy fails. Selection is preserved in
+  settings, the configuration digest, the UI summary and native verifier input.
+  Signed evidence must bind that exact policy; evidence from either LPAC variant
+  cannot authorize the standard AppContainer candidate, or vice versa. All
+  candidates still require independent target-machine validation before use.
 - `policySha256`: exact lowercase SHA-256, or null.
 - `evidence`: required object with `privateChannel`, `filesystem`, `processTree`
   and `network`. Each is null or an explicit `{id,path,sha256}` file reference.

@@ -8,6 +8,7 @@ export function runtimePolicyDisclosure(value?: unknown): { id: string; label: s
   const detail = '仅显示当前配置选择。能否运行仍须针对本策略、实际系统和锁定程序核验原生证据。';
   if (id === 'lpac-strict-v1') return { id, label: '严格 LPAC · 网络禁止', detail };
   if (id === 'lpac-registry-read-no-network-v2') return { id, label: 'LPAC · 系统注册表读取 · 网络仍禁止', detail };
+  if (id === 'appcontainer-no-network-v3') return { id, label: '普通 AppContainer · 网络禁止', detail: '仅显示当前配置选择。能否运行仍须针对本策略、实际系统和锁定程序独立核验原生证据。' };
   return { id, label: '未知隔离策略 · 尚不可判定', detail: '未识别的策略不能用作隔离或网络限制已核验的依据。请核对 Host 配置。' };
 }
 

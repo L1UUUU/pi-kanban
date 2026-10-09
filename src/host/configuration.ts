@@ -134,7 +134,7 @@ function shellConfiguration(value: unknown): ShellConfiguration {
 function runtimeConfiguration(value: unknown): RuntimeConfiguration {
   const o = object(value, ['profileId', 'osBuild', 'arch', 'node', 'helper', 'worker', 'pi', 'shell', 'policyVariant', 'policySha256', 'evidence'], 'runtime', ['shell', 'policyVariant']);
   const policyVariant = Object.hasOwn(o, 'policyVariant') ? o.policyVariant : 'lpac-strict-v1';
-  if (policyVariant !== 'lpac-strict-v1' && policyVariant !== 'lpac-registry-read-no-network-v2') fail('INVALID_CONFIGURATION', 'runtime.policyVariant must explicitly select a known locked capability policy.');
+  if (policyVariant !== 'lpac-strict-v1' && policyVariant !== 'lpac-registry-read-no-network-v2' && policyVariant !== 'appcontainer-no-network-v3') fail('INVALID_CONFIGURATION', 'runtime.policyVariant must explicitly select a known locked capability policy.');
   if (o.arch !== null && o.arch !== 'x64') fail('INVALID_CONFIGURATION', 'runtime.arch must be x64 or null.');
   if (o.osBuild !== null && (typeof o.osBuild !== 'string' || !/^\d+\.\d+\.\d+(?:\.\d+)?$/.test(o.osBuild))) fail('INVALID_CONFIGURATION', 'runtime.osBuild must be an exact numeric Windows release or null.');
   const evidence = object(o.evidence, ['privateChannel', 'filesystem', 'processTree', 'network'], 'runtime.evidence');

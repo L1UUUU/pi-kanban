@@ -198,3 +198,25 @@ test('legacy strict signatures cannot authorize the registry-read candidate or a
     assert.throws(() => verifyWindowsEvidence(bytes(envelope(invalidReport)), expected, trust), { code: 'EVIDENCE_INAPPLICABLE' });
   }
 });
+
+
+test('all three Windows policy variants require their own exact signed evidence', () => {
+  const { report, expected } = fixture();
+  const variants = ['lpac-strict-v1', 'lpac-registry-read-no-network-v2', 'appcontainer-no-network-v3'] as const;
+  for (const observedVariant of variants) {
+    const signed = bytes(envelope({ ...report, bindings: { ...report.bindings, policyVariant: observedVariant } }));
+    for (const expectedVariant of variants) {
+      const binding = { ...expected, policyVariant: expectedVariant };
+      if (observedVariant === expectedVariant) {
+        assert.equal(verifyWindowsEvidence(signed, binding, trust).bindings.policyVariant, expectedVariant);
+      } else {
+        assert.throws(() => verifyWindowsEvidence(signed, binding, trust), { code: 'EVIDENCE_INAPPLICABLE' }, `${observedVariant} cannot authorize ${expectedVariant}`);
+      }
+    }
+  }
+  const legacy = bytes(envelope(report)), v3 = 'appcontainer-no-network-v3' as const;
+  assert.throws(() => verifyWindowsEvidence(legacy, { ...expected, policyVariant: v3 }, trust), { code: 'EVIDENCE_INAPPLICABLE' });
+  const candidate = { ...report, bindings: { ...report.bindings, policyVariant: v3 } };
+  assert.throws(() => verifyWindowsEvidence(bytes(envelope(candidate)), expected, trust), { code: 'EVIDENCE_INAPPLICABLE' });
+  assert.throws(() => verifyWindowsEvidence(bytes(envelope({ ...candidate, releaseAuthorized: false })), { ...expected, policyVariant: v3 }, trust), { code: 'EVIDENCE_INAPPLICABLE' });
+});

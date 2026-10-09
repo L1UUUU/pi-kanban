@@ -20,7 +20,7 @@ for (let i = 2; i < process.argv.length; i += 2) { assert.ok(['--helper', '--wor
 const helperPath = options.get('--helper') ?? resolve('build/native/Release/pi_kanban_native_helper.exe');
 const workerPath = options.get('--worker') ?? resolve('dist/worker/main.mjs');
 const policyVariant = options.get('--policy') ?? 'lpac-strict-v1';
-assert.ok(['lpac-strict-v1', 'lpac-registry-read-no-network-v2'].includes(policyVariant));
+assert.ok(['lpac-strict-v1', 'lpac-registry-read-no-network-v2', 'appcontainer-no-network-v3'].includes(policyVariant));
 const outputDirectory = options.get('--output') ?? resolve('artifacts/windows-worker');
 mkdirSync(outputDirectory, { recursive: true });
 const root = realpathSync(mkdtempSync(join(tmpdir(), 'pi-kanban-worker-')));

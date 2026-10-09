@@ -401,7 +401,11 @@ test('renderer: runtime policy selection discloses registry access and network p
   assert.deepEqual(runtimePolicyDisclosure('lpac-strict-v1'), strict);
   const registry = runtimePolicyDisclosure('lpac-registry-read-no-network-v2');
   assert.equal(registry.id, 'lpac-registry-read-no-network-v2'); assert.match(registry.label, /系统注册表读取.*网络仍禁止/);
-  for (const policy of [strict, registry]) { assert.match(policy.detail, /仅显示当前配置选择/); assert.match(policy.detail, /仍须.*核验原生证据/); assert.doesNotMatch(policy.label, /已核验|已启用|自动/); }
+  const appContainer = runtimePolicyDisclosure('appcontainer-no-network-v3');
+  assert.equal(appContainer.id, 'appcontainer-no-network-v3'); assert.match(appContainer.label, /普通 AppContainer.*网络禁止/);
+  assert.match(appContainer.detail, /独立核验原生证据/);
+  assert.deepEqual(runtimePolicyDisclosure(), strict, 'An explicit AppContainer display does not change the default');
+  for (const policy of [strict, registry, appContainer]) { assert.match(policy.detail, /仅显示当前配置选择/); assert.match(policy.detail, /仍须.*核验原生证据/); assert.doesNotMatch(policy.label, /已核验|已启用|自动/); }
   const unknown = runtimePolicyDisclosure('synthetic-unknown');
   assert.equal(unknown.id, 'synthetic-unknown'); assert.match(unknown.label, /未知隔离策略/); assert.doesNotMatch(unknown.label, /网络禁止/);
   assert.notEqual(runtimePolicyDisclosure(null).id, strict.id, 'Only an omitted variant defaults to strict');

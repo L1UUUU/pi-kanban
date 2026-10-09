@@ -112,7 +112,7 @@ std::wstring AppContainerProfileName(const std::wstring& demand,const std::wstri
   const wchar_t hex[]=L"0123456789abcdef";std::wstring name=L"pi-kanban-";for(size_t i=0;i<24;i++){name+=hex[digest[i]>>4];name+=hex[digest[i]&15];}return name;
 }
 DWORD ValidateDescriptor(const LaunchDescriptor& d) {
-  if(d.policy_variant!=L"lpac-strict-v1"&&d.policy_variant!=L"lpac-registry-read-no-network-v2")return ERROR_INVALID_PARAMETER;
+  if(d.policy_variant!=L"lpac-strict-v1"&&d.policy_variant!=L"lpac-registry-read-no-network-v2"&&d.policy_variant!=L"appcontainer-no-network-v3")return ERROR_INVALID_PARAMETER;
   if (d.version != 1 || !Identifier(d.demand) || !Identifier(d.generation)) return ERROR_INVALID_PARAMETER;
   if (d.role != L"planning" && d.role != L"implementation" && d.role != L"review" && d.role != L"boundary-review" && d.role != L"check") return ERROR_INVALID_PARAMETER;
   if (d.profile_name.empty() || d.profile_name.size()>64 || d.profile_name != AppContainerProfileName(d.demand,d.role,d.generation)) return ERROR_INVALID_PARAMETER;
@@ -174,16 +174,17 @@ DWORD ControlledJob::Launch(const LaunchDescriptor& d, const PrivateHandles& cha
   limits.JobMemoryLimit = d.memory_limit_bytes;
   if (!SetInformationJobObject(job.value, JobObjectExtendedLimitInformation, &limits, sizeof(limits))) return GetLastError();
   stage_ = "initialize-process-attributes";
-  SIZE_T size = 0; InitializeProcThreadAttributeList(nullptr, 3, 0, &size);
+  const bool lpac=d.policy_variant!=L"appcontainer-no-network-v3";const DWORD attribute_count=lpac?3:2;
+  SIZE_T size = 0; InitializeProcThreadAttributeList(nullptr, attribute_count, 0, &size);
   if (!size) return GetLastError();
   Attributes attributes; attributes.bytes.resize(size);
   auto* list = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attributes.bytes.data());
-  if (!InitializeProcThreadAttributeList(list, 3, 0, &size)) return GetLastError(); attributes.list = list;
+  if (!InitializeProcThreadAttributeList(list, attribute_count, 0, &size)) return GetLastError(); attributes.list = list;
   stage_ = "set-process-attributes";
   DWORD policy = PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT;
   if (!UpdateProcThreadAttribute(list, 0, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, &security, sizeof(security), nullptr, nullptr) ||
       !UpdateProcThreadAttribute(list, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherited, sizeof(inherited), nullptr, nullptr) ||
-      !UpdateProcThreadAttribute(list, 0, PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY, &policy, sizeof(policy), nullptr, nullptr)) return GetLastError();
+      (lpac&&!UpdateProcThreadAttribute(list, 0, PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY, &policy, sizeof(policy), nullptr, nullptr))) return GetLastError();
   STARTUPINFOEXW startup{}; startup.StartupInfo.cb = sizeof(startup); startup.lpAttributeList = list;
   startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
   startup.StartupInfo.hStdInput = channels.requests_read; startup.StartupInfo.hStdOutput = channels.reports_write; startup.StartupInfo.hStdError = channels.logs_write;
@@ -210,6 +211,7 @@ DWORD ControlledJob::Launch(const LaunchDescriptor& d, const PrivateHandles& cha
   stage_ = "verify-appcontainer-token";
   Handle token;
   if (!OpenProcessToken(process.value, TOKEN_QUERY, &token.value)) return fail(GetLastError());
+  DWORD actual_lpac=0,lpac_bytes=0;if(!GetTokenInformation(token.value,TokenIsLessPrivilegedAppContainer,&actual_lpac,sizeof(actual_lpac),&lpac_bytes)||!!actual_lpac!=lpac)return fail(ERROR_ACCESS_DENIED);
   DWORD is_container = 0, returned = 0;
   if (!GetTokenInformation(token.value, TokenIsAppContainer, &is_container, sizeof(is_container), &returned) || !is_container) return fail(ERROR_ACCESS_DENIED);
   DWORD token_size = 0; GetTokenInformation(token.value, TokenAppContainerSid, nullptr, 0, &token_size);
@@ -253,13 +255,14 @@ DWORD ControlledJob::SpawnPinnedCheck(const LaunchDescriptor& d,const std::wstri
   SECURITY_CAPABILITIES security{}; security.AppContainerSid = sid.value;security.CapabilityCount=d.policy_variant==L"lpac-registry-read-no-network-v2"?1:0;security.Capabilities=security.CapabilityCount?&registry.entry:nullptr; // Same identity and explicit registry-only policy; no network capability.
   HANDLE handles[] = {input, output};
   for (HANDLE h : handles) { DWORD flags = 0; if (!GetHandleInformation(h, &flags) || !(flags & HANDLE_FLAG_INHERIT) || GetFileType(h) != FILE_TYPE_PIPE) return ERROR_INVALID_HANDLE; }
-  SIZE_T size = 0; InitializeProcThreadAttributeList(nullptr, 3, 0, &size); if (!size) return GetLastError();
+  const bool lpac=d.policy_variant!=L"appcontainer-no-network-v3";const DWORD attribute_count=lpac?3:2;
+  SIZE_T size = 0; InitializeProcThreadAttributeList(nullptr, attribute_count, 0, &size); if (!size) return GetLastError();
   Attributes attributes; attributes.bytes.resize(size); auto* list = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attributes.bytes.data());
-  if (!InitializeProcThreadAttributeList(list, 3, 0, &size)) return GetLastError(); attributes.list = list;
+  if (!InitializeProcThreadAttributeList(list, attribute_count, 0, &size)) return GetLastError(); attributes.list = list;
   DWORD policy = PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT;
   if (!UpdateProcThreadAttribute(list, 0, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, &security, sizeof(security), nullptr, nullptr) ||
       !UpdateProcThreadAttribute(list, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, handles, sizeof(handles), nullptr, nullptr) ||
-      !UpdateProcThreadAttribute(list, 0, PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY, &policy, sizeof(policy), nullptr, nullptr)) return GetLastError();
+      (lpac&&!UpdateProcThreadAttribute(list, 0, PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY, &policy, sizeof(policy), nullptr, nullptr))) return GetLastError();
   STARTUPINFOEXW startup{}; startup.StartupInfo.cb = sizeof(startup); startup.lpAttributeList = list; startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
   startup.StartupInfo.hStdInput = input; startup.StartupInfo.hStdOutput = output; startup.StartupInfo.hStdError = output;
   std::wstring command = Quote(executable); for (const auto& argument : args) command += L" " + Quote(argument);
@@ -276,6 +279,7 @@ DWORD ControlledJob::SpawnPinnedCheck(const LaunchDescriptor& d,const std::wstri
   if (!AssignProcessToJobObject(job_, process.value)) return fail(GetLastError());
   BOOL in_job = FALSE; if (!IsProcessInJob(process.value, job_, &in_job) || !in_job) return fail(ERROR_ACCESS_DENIED);
   Handle token; if (!OpenProcessToken(process.value, TOKEN_QUERY, &token.value)) return fail(GetLastError());
+  DWORD actual_lpac=0,lpac_bytes=0;if(!GetTokenInformation(token.value,TokenIsLessPrivilegedAppContainer,&actual_lpac,sizeof(actual_lpac),&lpac_bytes)||!!actual_lpac!=lpac)return fail(ERROR_ACCESS_DENIED);
   DWORD bytes = 0; GetTokenInformation(token.value, TokenAppContainerSid, nullptr, 0, &bytes); std::vector<unsigned char> data(bytes);
   if (!bytes || !GetTokenInformation(token.value, TokenAppContainerSid, data.data(), bytes, &bytes) || !EqualSid(reinterpret_cast<TOKEN_APPCONTAINER_INFORMATION*>(data.data())->TokenAppContainer, sid.value)) return fail(ERROR_ACCESS_DENIED);
   DWORD capability_bytes=0;GetTokenInformation(token.value,TokenCapabilities,nullptr,0,&capability_bytes);std::vector<unsigned char> capability_info(capability_bytes);
