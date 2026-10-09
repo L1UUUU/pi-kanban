@@ -179,13 +179,26 @@ publishing the receipt. Publication is serialized with the natural-shutdown watc
 fresh check-slot and zero-Job recheck, so finalization cannot discard the pending receipt.
 
 Paired fixtures start a real child that writes a heartbeat before its Node command parent
-exits zero. The short-lived child starts a 75 ms exit timer only after parent-pipe EOF;
+exits zero. Child standard handles are duplicates of an already-open scratch file, so the
+fixture needs neither a new named pipe nor an inherited helper output writer. The Host
+releases a challenge marker only after a successful native Job census shows the exact
+parent absent and child present. The short-lived child then starts a 75 ms exit timer;
 the probe requires a live first native census and disappearance in the final census within
 the shared 250 ms window. A scheduling miss fails coverage rather than being called a
 settlement pass. The persistent child keeps running with no inherited helper output
 writer; its continued presence must fail command completion despite parent exit zero and
 normal output EOF. Both fixtures require actual zero-Job/revoked-ACL authenticated cleanup
 and an independently quiescent heartbeat. Waiting alone never proves a clean stop.
+Bounded progress markers around file opening, spawn and readiness are preserved in the
+transcript even if the command times out before producing output.
+
+The recorder also runs a real `node --test --test-isolation=none --test-reporter=tap`
+source testcase and checks both its challenged assertion and genuine native receipt.
+Default process isolation and other child-process pipe-dependent JavaScript commands
+remain outside this evidence. The pinned [Node 24.19.0 libuv pipe code](https://github.com/nodejs/node/blob/v24.19.0/deps/uv/src/win/pipe.c#L194-L219)
+retries `ERROR_ACCESS_DENIED` while creating a global named stdio pipe; that is consistent
+with the earlier child-fixture timeout before its JavaScript deadline could run. No
+namespace grant or runtime patch is introduced to make that optional pipe path work.
 
 Baseline and unexpected-process diagnostics additionally attempt read-only handle queries
 for image path, birth/exit time, zero-time wait, exit code and membership in this exact Job.

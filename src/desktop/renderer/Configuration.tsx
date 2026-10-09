@@ -19,7 +19,8 @@ export function ConfigurationPanel({ state, demand, pending, preparing, offline,
     <section className="runtime-support" aria-label="首版运行支持范围">
       <div className="configuration-section-heading"><span className="configuration-step">首版支持范围</span><span className="tiny-pill">执行前须核验</span></div>
       <h3>Node 原生受控工具</h3>
-      <p>支持范围：受控读写、删除、搜索、Node 测试与适用的 JavaScript CLI。写入和删除仍受阶段授权与需求工作区限制。</p>
+      <p>支持范围：受控读写、删除、搜索；Node 测试须显式使用 --test-isolation=none 进程内模式。测试、依赖与 JavaScript CLI 不得新建子进程管道或 IPC 命名管道。</p>
+      <p>默认进程隔离的 Node 测试不受支持；必需检查的语义不能静默改写。写入和删除仍受阶段授权与需求工作区限制。</p>
       <p>不支持 Bash / POSIX shell、shell 脚本及依赖 shell 的 CLI。运行配置中的 shell 必须为空。</p>
       <p>Windows 目标机的隔离、文件系统、进程树与网络证据仍须由 Host 核验。导入成功不代表执行已启用。</p>
       {runtime?.shell && <div className="runtime-unsupported" role="alert"><strong>已导入不受支持的 shell，执行受阻</strong><Fact label="遗留 shell 来源 · 仅用于排查" value={`${runtime.shell.kind} · ${runtime.shell.path}`} /><p>请将运行配置中的 shell 设为 null 或省略，再重新导入。清除后仍须核验其余运行条件。</p></div>}

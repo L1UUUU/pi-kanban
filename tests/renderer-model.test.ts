@@ -423,6 +423,9 @@ test('renderer: Node support scope stays unverified and legacy shell diagnostics
   const render = compiledModule.exports.render as (state: ViewState) => string;
   const empty = render(state());
   assert.match(empty, /Node 原生受控工具/);
+  assert.match(empty, /Node 测试须显式使用 --test-isolation=none 进程内模式/);
+  assert.match(empty, /测试、依赖与 JavaScript CLI 不得新建子进程管道或 IPC 命名管道/);
+  assert.match(empty, /默认进程隔离的 Node 测试不受支持/);
   assert.match(empty, /不支持 Bash \/ POSIX shell/);
   assert.match(empty, /Windows 目标机.*仍须由 Host 核验/);
   assert.match(empty, /导入成功不代表执行已启用/);

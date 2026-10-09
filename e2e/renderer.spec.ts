@@ -178,7 +178,9 @@ test.describe('Synthetic renderer interaction coverage (not backend acceptance)'
     const dialog = page.getByRole('dialog');
     const support = dialog.getByRole('region', { name: '首版运行支持范围', exact: true });
     await expect(support).toContainText('Node 原生受控工具');
-    await expect(support).toContainText('受控读写、删除、搜索、Node 测试与适用的 JavaScript CLI');
+    await expect(support).toContainText('Node 测试须显式使用 --test-isolation=none 进程内模式');
+    await expect(support).toContainText('测试、依赖与 JavaScript CLI 不得新建子进程管道或 IPC 命名管道');
+    await expect(support).toContainText('默认进程隔离的 Node 测试不受支持');
     await expect(support).toContainText('不支持 Bash / POSIX shell、shell 脚本及依赖 shell 的 CLI');
     await expect(support).toContainText('Windows 目标机的隔离、文件系统、进程树与网络证据仍须由 Host 核验');
     await expect(support).toContainText('导入成功不代表执行已启用');

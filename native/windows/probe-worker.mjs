@@ -5,7 +5,7 @@
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
-import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync, existsSync, statSync, symlinkSync, rmSync, readdirSync, lstatSync, realpathSync } from 'node:fs';
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync, existsSync, statSync, symlinkSync, rmSync, readdirSync, lstatSync, realpathSync, renameSync, openSync, readSync, closeSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { tmpdir, release, version as osVersion } from 'node:os';
 import { dirname, join, resolve, relative, parse } from 'node:path';
@@ -188,19 +188,43 @@ async function runCompletionDescendantFixture(persistent) {
   run.runRecord.identity = { pid: started.pid, birth: started.birth, generation: run.generation, controlId: run.runRecord.runId, driver: 'windows-appcontainer-job-v1' };
   run.recoveryStore.bind(run.runRecord.runId, run.runRecord.identity);
   const ready = join(run.scratch, 'child-ready.json'), heartbeat = join(run.scratch, 'child-heartbeat.txt'), exited = join(run.scratch, 'child-exited.txt');
-  // Child stdin belongs only to the command parent. Its EOF proves that parent
-  // closed its handle; the short-lived child's 75 ms timer starts at that point,
-  // not at process creation. Child stdout/stderr never hold the helper's pipe.
-  const childProgram = `const fs=require('node:fs');const beat=()=>fs.appendFileSync(${JSON.stringify(heartbeat)},'tick\\n');const timer=setInterval(beat,10);process.stdin.on('end',()=>{${persistent ? '' : `setTimeout(()=>{clearInterval(timer);fs.writeFileSync(${JSON.stringify(exited)},${JSON.stringify(challenge)});process.exit(0)},75);`}});process.stdin.resume();beat();fs.writeFileSync(${JSON.stringify(`${ready}.tmp`)},JSON.stringify({challenge:${JSON.stringify(challenge)},pid:process.pid}));fs.renameSync(${JSON.stringify(`${ready}.tmp`)},${JSON.stringify(ready)});`;
-  const parentProgram = `const fs=require('node:fs'),cp=require('node:child_process');const child=cp.spawn(process.execPath,['--preserve-symlinks','--preserve-symlinks-main','-e',${JSON.stringify(childProgram)}],{stdio:['pipe','ignore','ignore'],windowsHide:true,env:process.env});child.on('error',error=>{process.stderr.write(String(error));process.exit(2)});const deadline=Date.now()+5000;const timer=setInterval(()=>{if(fs.existsSync(${JSON.stringify(ready)})&&fs.existsSync(${JSON.stringify(heartbeat)})){const value=JSON.parse(fs.readFileSync(${JSON.stringify(ready)},'utf8'));const bytes=fs.statSync(${JSON.stringify(heartbeat)}).size;if(value.pid===child.pid&&value.challenge===${JSON.stringify(challenge)}&&bytes>0){clearInterval(timer);process.stdout.write(JSON.stringify({challenge:value.challenge,childPid:child.pid,heartbeatBytes:bytes}));process.exit(0)}}if(Date.now()>=deadline)process.exit(3)},5);`;
+  const parentReady = join(run.scratch, 'parent-ready.json'), releaseChild = join(run.scratch, 'release-child.txt'), progress = join(run.scratch, 'parent-progress.json'), childStdio = join(run.scratch, 'child-stdio.txt');
+  // Node 24's Windows stdio:'pipe' creates a named pipe synchronously. That is
+  // unnecessary for this containment fixture and can hang on AppContainer denial.
+  // Duplicate an already-open scratch file for all child stdio instead. Only an
+  // actual native census showing parent absent/child present releases the child.
+  const childProgram = `const fs=require('node:fs');const beat=()=>fs.appendFileSync(${JSON.stringify(heartbeat)},'tick\\n');const timer=setInterval(beat,10);${persistent ? '' : `const release=setInterval(()=>{if(fs.existsSync(${JSON.stringify(releaseChild)})&&fs.readFileSync(${JSON.stringify(releaseChild)},'utf8')===${JSON.stringify(challenge)}){clearInterval(release);setTimeout(()=>{clearInterval(timer);fs.writeFileSync(${JSON.stringify(exited)},${JSON.stringify(challenge)});process.exit(0)},75)}},5);`}beat();fs.writeFileSync(${JSON.stringify(`${ready}.tmp`)},JSON.stringify({challenge:${JSON.stringify(challenge)},pid:process.pid}));fs.renameSync(${JSON.stringify(`${ready}.tmp`)},${JSON.stringify(ready)});`;
+  const parentProgram = `const fs=require('node:fs'),cp=require('node:child_process');const stage=(phase,extra={})=>fs.writeFileSync(${JSON.stringify(progress)},JSON.stringify({phase,pid:process.pid,...extra}));stage('opening-stdio');const io=fs.openSync(${JSON.stringify(childStdio)},'w+');const deadline=Date.now()+5000;stage('before-spawn');const child=cp.spawn(process.execPath,['--preserve-symlinks','--preserve-symlinks-main','-e',${JSON.stringify(childProgram)}],{stdio:[io,io,io],windowsHide:true,env:process.env});fs.closeSync(io);stage('after-spawn',{childPid:child.pid});child.on('error',error=>{stage('spawn-error',{error:String(error)});process.exit(2)});const timer=setInterval(()=>{if(fs.existsSync(${JSON.stringify(ready)})&&fs.existsSync(${JSON.stringify(heartbeat)})){const value=JSON.parse(fs.readFileSync(${JSON.stringify(ready)},'utf8'));const bytes=fs.statSync(${JSON.stringify(heartbeat)}).size;if(value.pid===child.pid&&value.challenge===${JSON.stringify(challenge)}&&bytes>0){clearInterval(timer);const result={challenge:value.challenge,parentPid:process.pid,childPid:child.pid,heartbeatBytes:bytes};fs.writeFileSync(${JSON.stringify(`${parentReady}.tmp`)},JSON.stringify(result));fs.renameSync(${JSON.stringify(`${parentReady}.tmp`)},${JSON.stringify(parentReady)});stage('parent-exit',{childPid:child.pid});fs.writeSync(1,JSON.stringify(result));process.exit(0)}}if(Date.now()>=deadline){stage('readiness-timeout');process.exit(3)}},5);`;
   const args = ['-e', parentProgram];
   assert.ok(parentProgram.length <= 8192, 'Bounded parent command fixture');
+  let parentIdentity, releaseObservation, observationCursor = run.native.length, lastQuery = 0;
   run.send({ type: 'run-node', requestId: suffix, args, timeoutMs: 10000, maxOutputBytes: 4096 });
-  await run.wait(() => run.event('native.check-result', event => event.requestId === suffix), `${suffix} exact command receipt`, 15000);
+  try {
+    await run.wait(() => {
+      if (!parentIdentity && existsSync(parentReady)) {
+        parentIdentity = JSON.parse(readFileSync(parentReady, 'utf8'));
+        assert.equal(parentIdentity.challenge, challenge); assert.ok(Number.isInteger(parentIdentity.parentPid) && parentIdentity.parentPid > 0); assert.ok(Number.isInteger(parentIdentity.childPid) && parentIdentity.childPid > 0 && parentIdentity.childPid !== parentIdentity.parentPid);
+      }
+      if (parentIdentity && !releaseObservation) {
+        for (; observationCursor < run.native.length; observationCursor++) {
+          const observation = run.native[observationCursor];
+          if (observation.type === 'native.observation' && observation.generation === run.generation && observation.status === 0 && !observation.activePids.includes(parentIdentity.parentPid) && observation.activePids.includes(parentIdentity.childPid)) {
+            releaseObservation = observation; writeFileSync(`${releaseChild}.tmp`, challenge); renameSync(`${releaseChild}.tmp`, releaseChild);
+            record('descendant-parent-exit-observation', { suffix, parentIdentity, observation }); break;
+          }
+        }
+        if (!releaseObservation && Date.now() - lastQuery >= 10 && !run.event('native.check-result', event => event.requestId === suffix)) { run.send({ type: 'query' }); lastQuery = Date.now(); }
+      }
+      return run.event('native.check-result', event => event.requestId === suffix);
+    }, `${suffix} exact command receipt`, 15000);
+  } finally {
+    const bounded = path => { let fd; try { fd = openSync(path, 'r'); const buffer = Buffer.alloc(4096), count = readSync(fd, buffer, 0, buffer.length, 0); return buffer.subarray(0, count).toString('utf8'); } catch (error) { return { error: error.code }; } finally { if (fd !== undefined) closeSync(fd); } };
+    record('descendant-fixture-progress', { suffix, progress: bounded(progress), childReady: bounded(ready), parentReady: bounded(parentReady), childStdio: bounded(childStdio), released: Boolean(releaseObservation) });
+  }
   const receipt = run.event('native.check-result', event => event.requestId === suffix), diagnostic = JSON.stringify(receipt);
   assert.equal(receipt.generation, run.generation); assert.deepEqual(receipt.arguments, args); assert.equal(receipt.status, 0, diagnostic); assert.equal(receipt.exitCode, 0, diagnostic);
   const result = JSON.parse(Buffer.from(receipt.outputBase64, 'base64').toString('utf8'));
-  assert.equal(result.challenge, challenge); assert.ok(Number.isInteger(result.childPid) && result.childPid > 0 && result.heartbeatBytes > 0);
+  assert.equal(result.challenge, challenge); assert.equal(result.parentPid, receipt.pid); assert.deepEqual(result, parentIdentity); assert.ok(releaseObservation, 'Actual native census must observe parent absent and child present before release'); assert.ok(Number.isInteger(result.childPid) && result.childPid > 0 && result.heartbeatBytes > 0);
   assert.deepEqual(JSON.parse(readFileSync(ready, 'utf8')), { challenge, pid: result.childPid }); assert.ok(statSync(heartbeat).size >= result.heartbeatBytes);
   assert.equal(receipt.completion.completionBudgetMs, 250); assert.equal(receipt.completion.waitStatus, 0); assert.equal(receipt.completion.exitConfirmed, true); assert.equal(receipt.completion.censusStatus, 0);
   assert.ok(receipt.completion.initialUnexpectedPids.includes(result.childPid), 'Fixture must actually overlap parent exit and first native census; a scheduling miss is not branch coverage');
@@ -219,7 +243,7 @@ async function runCompletionDescendantFixture(persistent) {
   const size = statSync(heartbeat).size; await delay(150); assert.equal(statSync(heartbeat).size, size, 'Authenticated cleanup must also leave the descendant heartbeat quiescent');
   passed(persistent ? 'persistent-descendant-denied' : 'short-lived-descendant-settled', persistent
     ? 'Actual Node command exited zero after its same-Job child wrote a heartbeat; the child remained in first/final native census beyond the shared 250 ms completion window, so the command failed. Zero-Job/revoked-ACL authenticated cleanup and a quiescent heartbeat were independently checked.'
-    : 'Actual Node command exited zero while its same-Job child was still live in first native census; the child exited after parent-pipe EOF and disappeared from final census within the shared 250 ms window. Normal output end, successful receipt and authenticated stop/cleanup were independently checked.');
+    : 'Actual Node command exited zero while its same-Job child was still live in first native census; the child exited after native-observed parent absence and disappeared from final census within the shared 250 ms window. Normal output end, successful receipt and authenticated stop/cleanup were independently checked.');
 }
 
 try {
@@ -284,6 +308,19 @@ try {
   concurrentB.send({ type: 'query' }); await concurrentB.wait(() => concurrentB.event('native.observation', event => event.status === 0 && event.activePids.includes(concurrentB.event('native.started').pid)), 'other helper remains alive');
   await concurrentB.stop();
   passed('concurrent-acl-isolation', 'Two overlapping helpers shared exact runtime files; A revoked and independently checked old-SID absence while B completed five bounded Node commands that repeatedly read allowed runtime/source and remained denied sibling data. Each receipt retained successful process-wait/Job-census/output-drain observations; B survived A stop and receipt-to-next-command handoffs.');
+  const testRunner = launch('implementation', 'node-test-runner');
+  await testRunner.wait(() => testRunner.event('native.started'), 'native direct test runner Worker');
+  const testcase = join(testRunner.workspace, 'node-native.test.cjs'), testName = `native-source-${challenge}`;
+  writeFileSync(testcase, `const test=require('node:test'),assert=require('node:assert/strict'),fs=require('node:fs');test(${JSON.stringify(testName)},()=>assert.equal(fs.readFileSync(${JSON.stringify(join(testRunner.workspace, 'source.txt'))},'utf8'),'original'));`);
+  const testArgs = ['--test', '--test-isolation=none', '--test-reporter=tap', testcase];
+  testRunner.send({ type: 'run-node', requestId: 'node-test-runner', args: testArgs, timeoutMs: 10000, maxOutputBytes: 16384 });
+  await testRunner.wait(() => testRunner.event('native.check-result', event => event.requestId === 'node-test-runner'), 'actual direct Node test runner receipt');
+  const testReceipt = testRunner.event('native.check-result', event => event.requestId === 'node-test-runner'), testDiagnostic = JSON.stringify(testReceipt);
+  assert.equal(testReceipt.generation, testRunner.generation); assert.deepEqual(testReceipt.arguments, testArgs); assert.equal(testReceipt.status, 0, testDiagnostic); assert.equal(testReceipt.reason, 'exited', testDiagnostic); assert.equal(testReceipt.exitCode, 0, testDiagnostic); assert.equal(testReceipt.completion?.settled, true, testDiagnostic);
+  const testOutput = Buffer.from(testReceipt.outputBase64, 'base64').toString('utf8');
+  assert.ok(testOutput.includes(`ok 1 - ${testName}`), testDiagnostic); assert.match(testOutput, /^# pass 1\r?$/m); assert.match(testOutput, /^# fail 0\r?$/m);
+  await testRunner.stop();
+  passed('node-test-runner-no-process-isolation', 'Actual pinned Node ran --test --test-isolation=none against its own source testcase; TAP proved the challenged assertion passed and native receipt/zero-Job cleanup succeeded. Child-process pipe-dependent test runners remain outside this evidence.');
   await runCompletionDescendantFixture(false);
   await runCompletionDescendantFixture(true);
   // Break both Host output readers while a native-contained command produces
