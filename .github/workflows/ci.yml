@@ -1,0 +1,75 @@
+name: Workbench checks
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+concurrency:
+  group: checks-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  portable:
+    name: TypeScript, SQLite, Git and SDK (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.19.0'
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm run check
+      - name: Record actual environment, without secrets
+        shell: bash
+        run: node scripts/diagnostics.mjs > runtime-observation.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: runtime-observation-${{ matrix.os }}
+          path: runtime-observation.json
+          retention-days: 14
+  native-windows:
+    name: Windows AppContainer and Job smoke (partial evidence)
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure native candidate
+        run: cmake -S native/windows -B build/native -A x64
+      - name: Compile native candidate
+        run: cmake --build build/native --config Release
+      - name: Run real Win32 smoke probes
+        run: ctest --test-dir build/native -C Release --output-on-failure
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-native-smoke-evidence
+          path: build/native/Testing/Temporary/LastTest.log
+          retention-days: 14
+  browser:
+    name: Synthetic renderer interaction and screenshots
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.19.0'
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npx playwright install --with-deps chromium
+      - run: npm run test:ui
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: synthetic-renderer-evidence
+          path: |
+            test-results/
+            playwright-report/
+          retention-days: 14

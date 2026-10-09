@@ -1,0 +1,30 @@
+# Controlled workspace service
+
+These APIs are for the trusted Host, not a Worker RPC surface. F authenticates grants and rechecks current pause/cancel/protection state before calls or recovery. R must actually stop all writers before supplying `writerStopped`. This module does not provide an OS sandbox or prove process quiescence.
+
+## APIs
+
+- `new WorkspaceService({ db, gitExecutable, timeoutMs?, fault? })`. `db` is the Host-owned Node 24 `DatabaseSync`; schemas use `workspace_` names. `gitExecutable` is a verified absolute executable path; Windows deliberately has no guessed default. `fault` is a deterministic test hook.
+- `bindProject({projectId, anchorPath, formalTarget})`: a persistent main repository, explicit local formal-target branch, and a project identity. A disposable linked worktree cannot be the anchor.
+- `prepare({operationId, projectId, demandId, worktreePath, branch, baseline, prepareAuthorized})`: one branch/worktree per demand. Baseline is an exact formal-source commit, or `null` for a genuinely unborn repository. Existing unowned paths/branches are blocked, never overwritten. A completed retry validates and returns the existing binding even after later demand commits.
+- `adoptExisting({...prepareRequest,expectedHead,takeoverAuthorized,writerStopped})`: explicit clean existing-worktree takeover after repository, branch, exact HEAD, formal-baseline and writer checks. Dirty or staged work is preserved and blocks takeover.
+- `commit({operationId,demandId,expectedHead,paths,expectedFiles,message,author,commitAuthorized,writerStopped})`: each exact path requires its SHA-256 or `null` for deletion. Existing user staging is preserved by refusing the operation. Only explicit paths enter a private index. Ordinary immutable commits use a deterministic timestamp, parent and tree plus compare-and-swap branch update. No amend/rebase/reset/push APIs exist. No-change saves terminate cleanly.
+- `reconcile(operationId)`: checks recorded side effects. Worktree creation and commit retries cannot create duplicate objects/commits; unexpected branch, index or content changes block recovery without rollback. The caller must revalidate current authority first.
+- `updateBaseline({operationId,demandId,sourceCommit,formalTarget,updateAuthorized,writerStopped,controlState,author})`: integrates the exact selected formal source using fast-forward or ordinary merge, with no latest-target chasing. Dirty work, paused/cancelled/protected demands, absent permission and mismatched targets block. Conflicted merges retain the index, working files, MERGE_HEAD and intent.
+- `verifyBaseline({operationId,expectedHead,capabilitiesVerified,evidenceRefs})`: records Q's actual code/environment verification separately. Mere ancestry or a clean merge never sets capability availability. Initial baseline and each integration remain in history.
+- `inspectContent({demandId,expectedCommit})`: checks live HEAD and working/index drift without changing user files; Q/F must call it when considering previously checked content. It is not proof of an atomic read-only interval.
+- `readAuthorizedFile({demandId,commit,path,allowedCommits,allowedPaths})`: checks both exact allowlists before reading an object. Allowlists must come from the Host, not Worker parameters.
+
+## Local materials
+
+`ImmutableObjectStore.open(anchorPath,projectId)` owns only `.local/pi-kanban`. `put`, `read` and `verify` use `{sha256,bytes}` references. A project manifest prevents silently substituting another project. Existing unknown nonempty stores are not adopted. Content is size bounded, regular-file checked and digest verified.
+
+Publication is same-volume staging, file fsync, verification, and atomic **no-replace hard-link installation**, followed by directory fsync on POSIX. This provides stronger no-overwrite behavior than ordinary rename. Existing corrupt objects are never replaced. Objects written before SQL registration remain private orphan evidence; missing references never fall back to a latest version. Windows directory-fsync/power-loss semantics remain unverified, not claimed equivalent to Linux.
+
+Only `/.local/pi-kanban/` is added to local Git exclude. The conservative prototype refuses *all* `.local` delivery paths or tracked/staged content; explicit project-owned formal-document exceptions need a later reviewed adapter. It never globally ignores other `.local` content or rewrites prior commits.
+
+## Fail-closed support limits
+
+Git commands have fixed argument structures, no shell, a minimal environment, disabled prompting, bounded timeout/output and explicit executable identity. Every Git invocation denies all network/file transport protocols and lazy fetch; unused credential-helper configuration is preserved and never invoked. Configured hooks, signing, filters, fsmonitor, custom merge/diff programs, partial clones and alternate object stores are blocked rather than bypassed or executed with Host privileges. Source symlinks/submodules, path traversal/Windows aliases and Git-administration links or non-regular objects are blocked. Administrative scans are bounded at 100,000 entries.
+
+The checks are defense in depth, not atomic OS ACL isolation against a concurrently malicious administrator. Symlink/junction behavior, hard power loss, Windows file locking and real Windows isolation still require the native integration evidence. Interrupted SQL/filesystem/Git effects are not one transaction.
