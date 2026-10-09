@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { WorkbenchStore, WorkflowService } from '../src/domain/index.ts';
@@ -12,11 +12,13 @@ import { GitHubReadOnlyAdapter } from '../src/knowledge/remote.ts';
 import { ProductionEvidence } from '../src/host/evidence.ts';
 import { HostKnowledgeLifecycle } from '../src/host/knowledge-lifecycle.ts';
 import type { KnowledgeAction } from '../src/host/knowledge-lifecycle.ts';
-const gitExecutable=process.env.PI_KANBAN_TEST_GIT??'/usr/bin/git';
-const git=(cwd:string,...args:string[])=>execFileSync(gitExecutable,args,{cwd,encoding:'utf8',env:{...process.env,GIT_AUTHOR_NAME:'Fixture',GIT_COMMITTER_NAME:'Fixture',GIT_AUTHOR_EMAIL:'fixture@example.invalid',GIT_COMMITTER_EMAIL:'fixture@example.invalid'},stdio:['ignore','pipe','pipe']}).trim();
+// Resolve the installed test Git once and pass its exact path to the product;
+// the product's Windows executable policy never falls back to PATH lookup.
+const gitExecutable=process.env.PI_KANBAN_TEST_GIT ?? (process.platform==='win32' ? execFileSync('where.exe',['git.exe'],{encoding:'utf8'}).trim().split(/\r?\n/)[0]! : existsSync('/usr/local/bin/git')?'/usr/local/bin/git':'/usr/bin/git');
+const git=(cwd:string,...args:string[])=>execFileSync(gitExecutable,args,{cwd,encoding:'utf8',env:{...process.env,GIT_CONFIG_NOSYSTEM:'1',GIT_CONFIG_GLOBAL:process.platform==='win32'?'NUL':'/dev/null',GIT_AUTHOR_NAME:'Fixture',GIT_COMMITTER_NAME:'Fixture',GIT_AUTHOR_EMAIL:'fixture@example.invalid',GIT_COMMITTER_EMAIL:'fixture@example.invalid'},stdio:['ignore','pipe','pipe']}).trim();
 function fixture(t:test.TestContext) {
   const root=mkdtempSync(join(tmpdir(),'pi-lifecycle-')), repo=join(root,'repo');mkdirSync(repo);
-  git(repo,'init','-b','main');writeFileSync(join(repo,'code.txt'),'reviewed existing capability\n');git(repo,'add','code.txt');git(repo,'commit','-m','Synthetic fixture');
+  git(repo,'init','-b','main');git(repo,'config','core.autocrlf','false');git(repo,'config','core.eol','lf');writeFileSync(join(repo,'code.txt'),'reviewed existing capability\n');git(repo,'add','code.txt');git(repo,'commit','-m','Synthetic fixture');
   const base=git(repo,'rev-parse','HEAD'), store=new WorkbenchStore(), workflow=new WorkflowService(store), workspace=new WorkspaceService({db:store.db,gitExecutable});
   const method={id:'fixture',version:'1',digest:'a'.repeat(64),adapter:'fixture'};
   workflow.createProject({id:'project',name:'Synthetic',rootPath:repo,methods:{planning:method,implementation:method,review:method}});
@@ -134,19 +136,37 @@ test('baseline apply rejects a stale exact HEAD without overwriting intervening 
   await assert.rejects(f.action({action:'apply-baseline',proposalId:proposal.proposalId,author:{name:'Fixture',email:'fixture@example.invalid'}}),/proposal HEAD or baseline changed/);
   assert.equal(readFileSync(join(f.binding.worktreePath,'code.txt'),'utf8'),'intervening local change');
 });
-test('baseline verification consumes a new independent exact integrated result and preserves original baseline',async t=>{
-  const f=fixture(t);writeFileSync(join(f.repo,'new.txt'),'formal capability');git(f.repo,'add','new.txt');git(f.repo,'commit','-m','Formal fixture');const source=git(f.repo,'rev-parse','HEAD');
+test('baseline verification runs historical recipes freshly through the check-only callback without creating a new result',async t=>{
+  const f=fixture(t);f.check();writeFileSync(join(f.repo,'new.txt'),'formal capability');git(f.repo,'add','new.txt');git(f.repo,'commit','-m','Formal fixture');const source=git(f.repo,'rev-parse','HEAD');
+  await f.action({action:'propose-baseline',sourceCommit:source});const proposal=f.lifecycle.snapshot('demand').proposals[0]!;
+  const before=f.store.getDemand('demand');before.activeResultId=undefined;before.phase='rework';f.store.saveDemand(before);
+  await f.action({action:'apply-baseline',proposalId:proposal.proposalId,author:{name:'Fixture',email:'fixture@example.invalid'}});
+  assert.ok(f.store.getDemand('demand').invalidatedContentIds.includes('content'));
+  let calls=0;
+  f.lifecycle.options.verifyBaselineChecks=async input=>{
+    calls++;assert.equal(input.templateResultId,'result');assert.deepEqual(input.checkIds,['check']);assert.equal(input.expectedHead,source);
+    // Controlled callback test: this real local subprocess checks NEW source, but
+    // does not establish Windows sandbox/native-helper production acceptance.
+    execFileSync(process.execPath,['-e',"const assert=require('node:assert/strict');const fs=require('node:fs');assert.equal(fs.readFileSync('new.txt','utf8'),'formal capability');"],{cwd:f.binding.worktreePath});
+    const material=f.evidence.sourceMaterial('demand');
+    return {head:source,sourceDigest:material.sha256,environment:'controlled-check-callback-fixture',evidenceRefs:['fixture-fresh-check-receipt'],provenance:'native-helper-command-observation',stopped:true};
+  };
+  await f.action({action:'verify-baseline',operationId:proposal.proposalId,resultId:'result',checkIds:['check']});
+  assert.equal(calls,1);assert.equal(f.store.getDemand('demand').results.length,1,'No new result or model stage is manufactured.');
+  assert.ok(!f.store.getDemand('demand').blockedReasons.some(reason=>reason.includes('BASELINE_VERIFICATION_REQUIRED')));
+  assert.ok(f.store.getDemand('demand').blockedReasons.some(reason=>reason.startsWith('Content changed:')),'Other blockers and invalidated content remain intact.');
+  assert.equal(f.workspace.getBinding('demand')!.currentBaseline,source);assert.equal(f.workspace.getBinding('demand')!.initialBaseline,f.base);assert.equal(f.lifecycle.snapshot('demand').proposals[0]!.result!.state,'verified');
+});
+for(const failure of ['synthetic','source-changed','not-stopped'] as const)test(`fresh baseline checks refuse ${failure} evidence and preserve the old reuse baseline`,async t=>{
+  const f=fixture(t);f.check();writeFileSync(join(f.repo,'new.txt'),'formal capability');git(f.repo,'add','new.txt');git(f.repo,'commit','-m','Formal fixture');const source=git(f.repo,'rev-parse','HEAD');
   await f.action({action:'propose-baseline',sourceCommit:source});const proposal=f.lifecycle.snapshot('demand').proposals[0]!;
   const before=f.store.getDemand('demand');before.activeResultId=undefined;before.activeContentId=undefined;before.phase='rework';f.store.saveDemand(before);
   await f.action({action:'apply-baseline',proposalId:proposal.proposalId,author:{name:'Fixture',email:'fixture@example.invalid'}});
-  const author={...f.store.getRun('author'),id:'author2',contextId:'author-context-2',generation:3}, reviewer={...f.store.getRun('reviewer'),id:'reviewer2',contextId:'review-context-2',generation:4,contentId:'content2'};f.store.saveRun(author);f.store.saveRun(reviewer);
-  const code=f.evidence.saveSource('project','demand',author.id,'code2'), note=f.store.getDemand('demand').results[0]!.N[0]!, review=f.evidence.save({id:'review2',projectId:'project',demandId:'demand',runId:reviewer.id,kind:'check-evidence',text:'Synthetic post-integration independent Review'});
-  f.evidence.recordRun(reviewer,{role:'review',source:f.evidence.sourceMaterial('demand'),materials:[f.evidence.read('demand',code),f.evidence.read('demand',note)],sessionId:'session2',runtimeRunId:'native2',generation:'native-generation-2'});
-  f.store.db.exec('CREATE TABLE host_native_checks(request_id TEXT PRIMARY KEY,runtime_run_id TEXT NOT NULL,domain_run_id TEXT NOT NULL,artifact_id TEXT NOT NULL,body TEXT NOT NULL)');
-  const observed={provenance:'native-helper-command-observation',requestId:'check2',runtimeRunId:'native2',generation:'native-generation-2',sourceBefore:code.digest,sourceAfter:code.digest,environment:'fixture-native-environment',reason:'exited',exitCode:0};
-  const check=f.evidence.save({id:'check2',projectId:'project',demandId:'demand',runId:reviewer.id,kind:'check-evidence',text:canonicalJson(observed)});f.store.db.prepare('INSERT INTO host_native_checks VALUES(?,?,?,?,?)').run('check2','native2','reviewer2',check.id,canonicalJson(observed));
-  const demand=f.store.getDemand('demand');demand.contents.push({id:'content2',planId:'plan',code,knowledge:[note],maintenance:'complete',deliveryNotes:'Synthetic updated content',createdByRun:author.id,cycle:1});demand.results.push({...demand.results[0]!,id:'result2',K:code,contentId:'content2',review:{id:'review2',contentId:'content2',runId:reviewer.id,contextId:reviewer.contextId,evidence:review,knowledgeReviewed:true,findings:[]},E:[{id:'check2',contentId:'content2',requirementId:'capability',status:'passed',evidence:check,environment:'fixture-native-environment'}]});f.store.saveDemand(demand);
-  await f.action({action:'verify-baseline',operationId:proposal.proposalId,resultId:'result2',checkIds:['check2']});
-  assert.equal(f.workspace.getBinding('demand')!.currentBaseline,source);assert.equal(f.workspace.getBinding('demand')!.initialBaseline,f.base);assert.equal(f.lifecycle.snapshot('demand').proposals[0]!.result!.state,'verified');
-  f.lifecycle.captureResults();assert.ok(f.lifecycle.snapshot('demand').candidates.some(c=>c.resultId==='result2'),'Unchanged N from an earlier author retains exact independent Review and origin.');
+  f.lifecycle.options.verifyBaselineChecks=async ()=>{
+    const material=f.evidence.sourceMaterial('demand');if(failure==='source-changed')writeFileSync(join(f.binding.worktreePath,'new.txt'),'changed while checking');
+    return {head:source,sourceDigest:material.sha256,environment:'controlled-fixture',evidenceRefs:['fixture-receipt'],provenance:failure==='synthetic'?'synthetic-native-receipt':'native-helper-command-observation',stopped:failure!=='not-stopped'};
+  };
+  await assert.rejects(f.action({action:'verify-baseline',operationId:proposal.proposalId,resultId:'result',checkIds:['check']}),/genuine native checks|source changed/);
+  assert.equal(f.workspace.getBinding('demand')!.currentBaseline,f.base);
+  assert.ok(f.store.getDemand('demand').blockedReasons.some(reason=>reason.includes('BASELINE_VERIFICATION_REQUIRED')));
 });

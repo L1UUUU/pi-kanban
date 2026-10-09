@@ -6,6 +6,8 @@ import type { Methods, MethodSnapshot, Stage } from '../domain/types.ts';
 import type { ModelGrant } from '../runtime/budget.ts';
 import { RuntimeError } from '../runtime/types.ts';
 import type { RuntimeRole } from '../runtime/types.ts';
+import { readLockedShellManifest } from '../runtime/shell-profile.ts';
+import type { WindowsRuntimePolicyVariant } from '../runtime/profile.ts';
 
 export const CONFIGURATION_SCHEMA_VERSION = 1;
 export const CONFIGURATION_FILENAME = 'configuration.v1.json';
@@ -16,10 +18,15 @@ const STAGES: readonly Stage[] = ['planning', 'implementation', 'review'];
 const ROLES: readonly RuntimeRole[] = ['planning', 'implementation', 'review', 'boundary-review', 'check'];
 export interface FileReference { id: string; path: string; sha256: string }
 export interface RuntimeFileReference extends FileReference { version: string }
+export interface ShellConfiguration extends RuntimeFileReference { kind: 'git-bash'; manifest: FileReference }
 export interface RuntimeConfiguration {
   profileId: string; osBuild: string | null; arch: 'x64' | null;
   node: RuntimeFileReference | null; helper: RuntimeFileReference | null; worker: RuntimeFileReference | null;
   pi: (RuntimeFileReference & { package: '@earendil-works/pi-coding-agent' }) | null;
+  /** Older schema-v1 documents may omit shell; parsing always normalizes it to null. */
+  shell?: ShellConfiguration | null;
+  /** Omission selects the strict policy only; alternate capabilities require explicit input. */
+  policyVariant?: WindowsRuntimePolicyVariant;
   policySha256: string | null;
   evidence: { privateChannel: FileReference | null; filesystem: FileReference | null; processTree: FileReference | null; network: FileReference | null };
 }
@@ -59,11 +66,11 @@ export interface LoadedMethods {
 export interface ModelDecisionReference { id: string; demandId: string; decisionId: string }
 
 function fail(code: string, message: string): never { throw new RuntimeError(code, message); }
-function object(value: unknown, allowed: readonly string[], label: string): Record<string, unknown> {
+function object(value: unknown, allowed: readonly string[], label: string, optional: readonly string[] = []): Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value) || ![Object.prototype, null].includes(Object.getPrototypeOf(value))) fail('INVALID_CONFIGURATION', `${label} must be an ordinary object.`);
   const record = value as Record<string, unknown>;
   if (Object.keys(record).some(key => !allowed.includes(key))) fail('INVALID_CONFIGURATION', `${label} has an unsupported field. Credentials, authorization flags and implicit discovery are not configuration.`);
-  if (allowed.some(key => !Object.hasOwn(record, key))) fail('INVALID_CONFIGURATION', `${label} is incomplete; use explicit null for unknown values.`);
+  if (allowed.some(key => !optional.includes(key) && !Object.hasOwn(record, key))) fail('INVALID_CONFIGURATION', `${label} is incomplete; use explicit null for unknown values.`);
   return record;
 }
 function string(value: unknown, label: string, max = 256): string {
@@ -102,17 +109,32 @@ function fileReference(value: unknown, label: string, extra: readonly string[] =
   const o = object(value, ['id', 'path', 'sha256', ...extra], label);
   return { id: identifier(o.id, `${label}.id`), path: localPath(o.path, `${label}.path`), sha256: digest(o.sha256, `${label}.sha256`) };
 }
+function exactVersion(value: unknown, label: string): string {
+  const version = string(value, `${label}.version`, 80);
+  if (!/^v?\d+\.\d+\.\d+(?:-[a-zA-Z0-9.-]+)?(?:\+[a-zA-Z0-9.-]+)?$/.test(version)) fail('INVALID_CONFIGURATION', `${label} requires an exact version, not a range.`);
+  return version;
+}
 function runtimeFile(value: unknown, label: string, pi = false): RuntimeFileReference & { package?: '@earendil-works/pi-coding-agent' } {
   const ref = fileReference(value, label, pi ? ['version', 'package'] : ['version']);
   const o = value as Record<string, unknown>;
-  const version = string(o.version, `${label}.version`, 80);
-  if (!/^v?\d+\.\d+\.\d+(?:-[a-zA-Z0-9.-]+)?(?:\+[a-zA-Z0-9.-]+)?$/.test(version)) fail('INVALID_CONFIGURATION', `${label} requires an exact version, not a range.`);
+  const version = exactVersion(o.version, label);
   if (label.endsWith('.node') && !/^v?24\./.test(version)) fail('INVALID_CONFIGURATION', 'Only an explicitly pinned Node 24 runtime is supported.');
   if (pi && o.package !== '@earendil-works/pi-coding-agent') fail('INVALID_CONFIGURATION', 'The Pi SDK package must be explicitly identified.');
   return { ...ref, version, ...(pi ? { package: '@earendil-works/pi-coding-agent' as const } : {}) };
 }
+function shellConfiguration(value: unknown): ShellConfiguration {
+  const label = 'runtime.shell', ref = fileReference(value, label, ['version', 'kind', 'manifest']);
+  const o = value as Record<string, unknown>;
+  if (o.kind !== 'git-bash') fail('INVALID_CONFIGURATION', 'runtime.shell.kind must explicitly identify git-bash.');
+  const manifest = fileReference(o.manifest, 'runtime.shell.manifest');
+  unique([ref.id, manifest.id], 'Shell and manifest identifiers');
+  if (samePath(ref.path, manifest.path)) fail('INVALID_CONFIGURATION', 'The shell executable and manifest must be distinct files.');
+  return { ...ref, version: exactVersion(o.version, label), kind: 'git-bash', manifest };
+}
 function runtimeConfiguration(value: unknown): RuntimeConfiguration {
-  const o = object(value, ['profileId', 'osBuild', 'arch', 'node', 'helper', 'worker', 'pi', 'policySha256', 'evidence'], 'runtime');
+  const o = object(value, ['profileId', 'osBuild', 'arch', 'node', 'helper', 'worker', 'pi', 'shell', 'policyVariant', 'policySha256', 'evidence'], 'runtime', ['shell', 'policyVariant']);
+  const policyVariant = Object.hasOwn(o, 'policyVariant') ? o.policyVariant : 'lpac-strict-v1';
+  if (policyVariant !== 'lpac-strict-v1' && policyVariant !== 'lpac-registry-read-no-network-v2') fail('INVALID_CONFIGURATION', 'runtime.policyVariant must explicitly select a known locked capability policy.');
   if (o.arch !== null && o.arch !== 'x64') fail('INVALID_CONFIGURATION', 'runtime.arch must be x64 or null.');
   if (o.osBuild !== null && (typeof o.osBuild !== 'string' || !/^\d+\.\d+\.\d+(?:\.\d+)?$/.test(o.osBuild))) fail('INVALID_CONFIGURATION', 'runtime.osBuild must be an exact numeric Windows release or null.');
   const evidence = object(o.evidence, ['privateChannel', 'filesystem', 'processTree', 'network'], 'runtime.evidence');
@@ -121,6 +143,8 @@ function runtimeConfiguration(value: unknown): RuntimeConfiguration {
     node: nullable(o.node, v => runtimeFile(v, 'runtime.node')), helper: nullable(o.helper, v => runtimeFile(v, 'runtime.helper')),
     worker: nullable(o.worker, v => runtimeFile(v, 'runtime.worker')),
     pi: nullable(o.pi, v => runtimeFile(v, 'runtime.pi', true) as RuntimeConfiguration['pi'] & {}),
+    shell: Object.hasOwn(o, 'shell') ? nullable(o.shell, shellConfiguration) : null,
+    policyVariant,
     policySha256: nullable(o.policySha256, v => digest(v, 'runtime.policySha256')),
     evidence: {
       privateChannel: nullable(evidence.privateChannel, v => fileReference(v, 'runtime.evidence.privateChannel')),
@@ -299,6 +323,9 @@ function runtimeGaps(runtime: RuntimeConfiguration | null): string[] {
     if (!file) blockers.push(`runtime.${key} exact version, local path and SHA-256 are missing.`);
     else try { checkedFile(file, 256 * 1024 * 1024); } catch (error) { blockers.push(`runtime.${key}: ${errorText(error)}`); }
   }
+  if (runtime.shell) {
+    try { readLockedShellManifest(runtime.shell); } catch (error) { blockers.push(`runtime.shell: ${errorText(error)}`); }
+  }
   for (const [kind, reference] of Object.entries(runtime.evidence)) {
     if (!reference) blockers.push(`runtime.evidence.${kind} is missing.`);
     else try { checkedFile(reference, MAX_CONFIGURATION_BYTES); } catch (error) { blockers.push(`runtime.evidence.${kind}: ${errorText(error)}`); }
@@ -325,7 +352,8 @@ export function runtimeProfileInput(configuration: WorkbenchConfiguration) {
   const binary = (ref: RuntimeFileReference) => ({ path: ref.path, version: ref.version, sha256: ref.sha256 });
   return { profileId: runtime.profileId, osBuild: runtime.osBuild, arch: runtime.arch,
     node: binary(runtime.node), helper: binary(runtime.helper), worker: binary(runtime.worker),
-    pi: { ...binary(runtime.pi), package: runtime.pi.package }, policySha256: runtime.policySha256,
+    pi: { ...binary(runtime.pi), package: runtime.pi.package }, policyVariant: runtime.policyVariant ?? 'lpac-strict-v1', policySha256: runtime.policySha256,
+    ...(runtime.shell ? { shell: { ...binary(runtime.shell), kind: runtime.shell.kind, manifest: { path: runtime.shell.manifest.path, sha256: runtime.shell.manifest.sha256 } } } : {}),
     evidence: Object.values(runtime.evidence).map(ref => ({ ...ref! })),
   };
 }

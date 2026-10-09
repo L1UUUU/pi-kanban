@@ -18,7 +18,8 @@ export function planMaterial(plan: PlanInput): AgentMaterial {
 }
 export interface SourceSnapshot {
   schemaVersion: 1; demandId: string; head: string | null;
-  files: { path: string; sha256: string; bytes: number }[];
+  changes: string[];
+  files: { path: string; sha256: string; bytes: number; executable: boolean }[];
 }
 export interface StoredArtifact {
   ref: ArtifactRef; projectId: string; demandId: string; kind: AgentMaterial['kind']; runId: string; bytes: number;
@@ -103,11 +104,11 @@ export class ProductionEvidence {
           requireFact(stat.isFile() && stat.nlink === 1, 'SOURCE_UNSAFE', 'Source must contain ordinary non-linked files only.');
           const body = readRegular(file, 1024 * 1024); bytes += body.length;
           requireFact(bytes <= 32 * 1024 * 1024, 'SOURCE_TOO_LARGE', 'Source data exceeds the 32 MiB run scope.');
-          files.push({ path: relative, sha256: hash(body), bytes: body.length });
+          files.push({ path: relative, sha256: hash(body), bytes: body.length, executable: process.platform !== 'win32' && (stat.mode & 0o111) !== 0 });
         }
       }
     };
-    walk(root, ''); return { schemaVersion: 1, demandId, head: inspection.head, files };
+    walk(root, ''); return { schemaVersion: 1, demandId, head: inspection.head, changes: inspection.changes, files };
   }
   sourceMaterial(demandId: string): AgentMaterial {
     const content = canonicalJson(this.source(demandId)); return { id: `source-scope:${demandId}`, kind: 'source', sha256: hash(content), content };

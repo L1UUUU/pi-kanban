@@ -8,6 +8,7 @@ import { RuntimeError } from './types.ts';
 import type { LaunchRequest,RunRecord,RuntimeDriver,ProcessIdentity,Observation } from './types.ts';
 import { VerifiedRuntimeProfile,assertVerifiedProfile } from './profile.ts';
 import { PrivateFrameDecoder,encodePrivateFrame } from './pipe-frames.ts';
+import { readLockedShellManifest } from './shell-profile.ts';
 import { appContainerProfileName } from './appcontainer-name.ts';
 import { NativeRecoveryStore } from './native-recovery.ts';
 import { validateNativeCheckReceipt } from './native-check.ts';
@@ -16,7 +17,7 @@ export type { NativeCheckResult } from './native-check.ts';
 
 export interface WindowsRunBootstrap {
   profileName:string;scratch:string;aclEvidence:string;privateChannelEvidence:string;
-  processLimit:number;memoryLimitBytes:number;workerInit:Record<string,unknown>;
+  processLimit:number;memoryLimitBytes:number;diskLimitBytes:number;fileLimit:number;minimumFreeBytes:number;diskPollMs:number;workerInit:Record<string,unknown>;
   resourceAuthorizationId:string;readonlyRuntimeRoots:string[];
 }
 type PendingCheck={id:string;args:string[];maxOutputBytes:number;resolve:(value:NativeCheckResult)=>void;reject:(error:Error)=>void;timer:ReturnType<typeof setTimeout>};
@@ -56,7 +57,7 @@ export class VerifiedWindowsDriver implements RuntimeDriver {
   private nativeEvent(control:Control,frame:Uint8Array){
     const event=JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(frame)) as Record<string,unknown>;
     if(event.type==='native.started'){
-      if(event.generation!==control.run.generation||!Number.isSafeInteger(event.pid)||Number(event.pid)<1||typeof event.birth!=='string'||!/^\d+$/.test(event.birth))throw new RuntimeError('NATIVE_IDENTITY_MISMATCH','Invalid native process identity');
+      if(event.policyVariant!==(this.profile.config.policyVariant??'lpac-strict-v1')||event.generation!==control.run.generation||!Number.isSafeInteger(event.pid)||Number(event.pid)<1||typeof event.birth!=='string'||!/^\d+$/.test(event.birth))throw new RuntimeError('NATIVE_IDENTITY_MISMATCH','Invalid native process identity');
       if(control.identity)throw new RuntimeError('NATIVE_IDENTITY_MISMATCH','Duplicate native launch identity');
       control.identity={pid:Number(event.pid),birth:event.birth,generation:control.run.generation,controlId:control.run.runId,driver:this.id};
       this.recovery?.bind(control.run.runId,control.identity);
@@ -68,14 +69,17 @@ export class VerifiedWindowsDriver implements RuntimeDriver {
       if(!check)throw new RuntimeError('NATIVE_CHECK_INVALID','No pending native check matches this receipt');
       const receipt=validateNativeCheckReceipt(event,{requestId:check.id,generation:control.run.generation,args:check.args,maxOutputBytes:check.maxOutputBytes});
       clearTimeout(check.timer);control.check=null;
-      check.resolve({...receipt,nativeEvidence:{...receipt.nativeEvidence,profileId:this.profile.config.profileId,osBuild:this.profile.config.osBuild,nodeSha256:this.profile.config.node.sha256,helperSha256:this.profile.config.helper.sha256,workerSha256:this.profile.config.worker.sha256,piSha256:this.profile.config.pi.sha256,policySha256:this.profile.config.policySha256}});
+      check.resolve({...receipt,nativeEvidence:{...receipt.nativeEvidence,profileId:this.profile.config.profileId,osBuild:this.profile.config.osBuild,nodeSha256:this.profile.config.node.sha256,helperSha256:this.profile.config.helper.sha256,workerSha256:this.profile.config.worker.sha256,piSha256:this.profile.config.pi.sha256,policySha256:this.profile.config.policySha256,shellSha256:this.profile.config.shell?.sha256??null,shellManifestSha256:this.profile.config.shell?.manifest.sha256??null}});
     }else if(event.type==='native.resources'){
       if(event.generation!==control.run.generation||!Number.isSafeInteger(event.status)||!['provision','revoke'].includes(String(event.phase)))throw new RuntimeError('NATIVE_RESOURCE_INVALID','Invalid scoped resource evidence');
       control.resources.status=Number(event.status);if(event.phase==='provision')control.resources.provisioned=event.status===0;else control.resources.revoked=event.status===0;
+    }else if(event.type==='native.disk-observation'){
+      if(event.generation!==control.run.generation||!Number.isSafeInteger(event.status)||event.hardQuota!==false||!Number.isSafeInteger(event.bytes)||!Number.isSafeInteger(event.entries))throw new RuntimeError('NATIVE_DISK_INVALID','Invalid sampled disk observation');
+      if(event.status!==0)void this.stopHandler?.(control.run.runId,'native-disk-policy-exceeded').catch(()=>{});
     }else if(event.type==='native.worker-log'){
       if(event.generation!==control.run.generation||typeof event.bytesBase64!=='string'||event.bytesBase64.length>6000)throw new RuntimeError('NATIVE_LOG_INVALID','Invalid bounded Worker diagnostic');
       // Worker logs are deliberately not authority for lifecycle or check status.
-    }else if(event.type==='native.recovery'){
+    }else if(event.type==='native.recovery'||event.type==='native.finalizing'){
       if(event.generation!==control.run.generation||!Number.isSafeInteger(event.status))throw new RuntimeError('NATIVE_RECOVERY_INVALID','Invalid native receipt status');
     }else if(event.type==='native.limit'){void this.stopHandler?.(control.run.runId,String(event.reason)).catch(()=>{});}
     else if(event.type==='native.launch-failed'||event.type==='native.error'){control.observation={state:'unknown',generation:control.run.generation,activePids:[],proof:JSON.stringify(event)};}
@@ -86,6 +90,7 @@ export class VerifiedWindowsDriver implements RuntimeDriver {
     this.preflight(run);const config=this.profile.config,boot=this.bootstrap(run);
     if(boot.profileName!==appContainerProfileName(run.demandId,run.role,run.generation)||!boot.aclEvidence||!boot.privateChannelEvidence||!boot.resourceAuthorizationId||!boot.readonlyRuntimeRoots?.length)throw new RuntimeError('RUN_ACL_UNVERIFIED','Per-generation identity and actual ACL/channel evidence required');
     const recovery=this.recovery?.prepare(run,config)??{recoveryReceiptPath:'',recoveryKey:'',recoveryContextSha256:''};
+    const shell=config.shell?readLockedShellManifest(config.shell):null;
     const helper=spawn(config.helper.path,[],{windowsHide:true,stdio:['pipe','pipe','pipe'],env:{SystemRoot:process.env.SystemRoot??'C:\\Windows',SystemDrive:process.env.SystemDrive,USERPROFILE:process.env.USERPROFILE,LOCALAPPDATA:process.env.LOCALAPPDATA,APPDATA:process.env.APPDATA}});
     const control:Control={helper,run,identity:null,observation:null,exit:false,native:new PrivateFrameDecoder(),worker:new PrivateFrameDecoder(),waiters:new Set(),resources:{provisioned:false,revoked:false,status:null},check:null,stopping:false};this.controls.set(run.runId,control);
     helper.on('error',()=>{control.exit=true;this.changed(control);});helper.on('close',()=>{control.exit=true;if(control.check){clearTimeout(control.check.timer);control.check.reject(new RuntimeError('NATIVE_CHECK_UNKNOWN','Native helper exited before command receipt'));control.check=null;}this.changed(control);});
@@ -94,14 +99,31 @@ export class VerifiedWindowsDriver implements RuntimeDriver {
     let pending=0;helper.stdout.on('data',(chunk:Buffer)=>{try{for(const frame of control.worker.push(chunk)){if(++pending>4)throw new RuntimeError('WORKER_BACKPRESSURE','Worker request concurrency exceeded');
       void this.workerHandler!(run,frame).catch(()=>this.stopHandler?.(run.runId,'worker-channel-failure')).finally(()=>{pending--;});}}
       catch{void this.stopHandler?.(run.runId,'worker-channel-failure').catch(()=>{});}});
-    this.command(control,{...recovery,type:'launch',version:1,demand:run.demandId,role:run.role,generation:run.generation,profileName:boot.profileName,
+    try{this.command(control,{...recovery,type:'launch',version:1,policyVariant:config.policyVariant??'lpac-strict-v1',demand:run.demandId,role:run.role,generation:run.generation,profileName:boot.profileName,
       nodeExecutable:config.node.path,workerEntry:config.worker.path,workspace:run.workspace,scratch:boot.scratch,nodeSha256:config.node.sha256,workerSha256:config.worker.sha256,
-      policyEvidence:config.policySha256,aclEvidence:boot.aclEvidence,privateChannelEvidence:boot.privateChannelEvidence,timeoutMs:run.timeoutMs,processLimit:boot.processLimit,memoryLimitBytes:boot.memoryLimitBytes,outputLimitBytes:run.maxOutputBytes,resourceAuthorizationId:boot.resourceAuthorizationId,readonlyRuntimeRoots:boot.readonlyRuntimeRoots});
+      policyEvidence:config.policySha256,aclEvidence:boot.aclEvidence,privateChannelEvidence:boot.privateChannelEvidence,timeoutMs:run.timeoutMs,processLimit:boot.processLimit,memoryLimitBytes:boot.memoryLimitBytes,outputLimitBytes:run.maxOutputBytes,resourceAuthorizationId:boot.resourceAuthorizationId,readonlyRuntimeRoots:[...new Set([...boot.readonlyRuntimeRoots,...(shell?.files.map(file=>file.path)??[])])],shellExecutable:config.shell?.path??'',shellRootPath:shell?.rootPath??'',shellSha256:config.shell?.sha256??'',shellFiles:shell?.files??[],diskLimitBytes:boot.diskLimitBytes,fileLimit:boot.fileLimit,minimumFreeBytes:boot.minimumFreeBytes,diskPollMs:boot.diskPollMs});
     await this.wait(control,()=>!!control.identity||!!control.observation,10000);
     if(!control.identity||!control.resources.provisioned)throw new RuntimeError('NATIVE_LAUNCH_UNCONFIRMED',control.observation?.proof??'Native launch has no confirmed process identity');
     this.sendWorkerFrame(run.runId,boot.workerInit);return control.identity;
+    }catch(error){
+      // The exact helper may still finish a delayed launch. Queue stop and close
+      // only its authenticated control pipe; native EOF owns zero/revoke proof.
+      control.stopping=true;
+      try{if(!control.exit)this.command(control,{type:'stop'});}catch{}
+      if(!helper.stdin.destroyed)helper.stdin.end();
+      await this.wait(control,()=>control.exit||control.observation?.state==='stopped',12000);
+      try{const receipt=this.recovery?.observe(run,config);if(receipt)this.recovered.add(run.runId);}catch{}
+      throw error;
+    }
   }
-  async runNodeCheck(runId:string,args:string[],limits:{timeoutMs:number;maxOutputBytes:number},requestId:string=randomUUID()):Promise<NativeCheckResult>{
+  async runNodeCheck(runId:string,args:string[],limits:{timeoutMs:number;maxOutputBytes:number},requestId:string=randomUUID()):Promise<NativeCheckResult>{return this.runCheck(runId,args,limits,requestId,'run-node');}
+  async runShellCheck(runId:string,args:string[],limits:{timeoutMs:number;maxOutputBytes:number},requestId:string=randomUUID()):Promise<NativeCheckResult>{
+    if(!this.profile.config.shell)throw new RuntimeError('SHELL_UNAVAILABLE','No verified locked Git Bash profile');
+    if(!Array.isArray(args)||args.length!==1||typeof args[0]!=='string'||!args[0]||args[0].includes('\0')||args[0].length>8192)throw new RuntimeError('SHELL_SCOPE_DENIED','One bounded script is required; startup flags are fixed by the Host');
+    readLockedShellManifest(this.profile.config.shell);
+    return this.runCheck(runId,['--noprofile','--norc','-c',args[0]],limits,requestId,'run-shell');
+  }
+  private async runCheck(runId:string,args:string[],limits:{timeoutMs:number;maxOutputBytes:number},requestId:string,type:'run-node'|'run-shell'):Promise<NativeCheckResult>{
     const control=this.controls.get(runId);
     if(!control||control.exit||control.stopping||!control.identity||!control.resources.provisioned||control.resources.revoked)throw new RuntimeError('NATIVE_CHECK_UNAVAILABLE','No matching running native Job');
     if(control.check)throw new RuntimeError('CHECK_CAPACITY','One native check is already running in this Job');
@@ -113,7 +135,7 @@ export class VerifiedWindowsDriver implements RuntimeDriver {
     return new Promise((resolve,reject)=>{
       const timer=setTimeout(()=>{control.check=null;void this.stopHandler?.(runId,'native-check-receipt-timeout').catch(()=>{});reject(new RuntimeError('NATIVE_CHECK_UNKNOWN','No native exit receipt before deadline'));},limits.timeoutMs+15000);timer.unref();
       control.check={id:requestId,args:[...args],maxOutputBytes,resolve,reject,timer};
-      try{this.command(control,{type:'run-node',requestId,args,timeoutMs:limits.timeoutMs,maxOutputBytes});}
+      try{this.command(control,{type,requestId,args,timeoutMs:limits.timeoutMs,maxOutputBytes});}
       catch(error){clearTimeout(timer);control.check=null;reject(error);}
     });
   }
@@ -133,6 +155,7 @@ export class VerifiedWindowsDriver implements RuntimeDriver {
     const control=this.controls.get(run.runId);if(!control||control.exit)return this.observe(run);
     if(!run.identity||JSON.stringify(control.identity)!==JSON.stringify(run.identity))return this.observe(run);
     control.stopping=true;control.observation=null;this.command(control,{type:'stop'});await this.wait(control,()=>control.observation?.state==='stopped',12000);
+    if(control.exit)return this.observe(run);
     return control.observation??{state:'unknown',generation:run.generation,activePids:[],proof:'Native stop unconfirmed; retain lease'};
   }
 }

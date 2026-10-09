@@ -2,6 +2,16 @@ import type { ConfigurationSummary, Demand, ModelAuthorizationCommand, ProviderC
 
 export const LOCAL_RESOURCE_SCOPE = 'demand-worktree-private-runtime-v1' as const;
 
+/** Configuration disclosure only; selection is never evidence of verified isolation. */
+export function runtimePolicyDisclosure(value?: unknown): { id: string; label: string; detail: string } {
+  const id = value === undefined ? 'lpac-strict-v1' : typeof value === 'string' ? value : '未识别策略';
+  const detail = '仅显示当前配置选择。能否运行仍须针对本策略、实际系统和锁定程序核验原生证据。';
+  if (id === 'lpac-strict-v1') return { id, label: '严格 LPAC · 网络禁止', detail };
+  if (id === 'lpac-registry-read-no-network-v2') return { id, label: 'LPAC · 系统注册表读取 · 网络仍禁止', detail };
+  return { id, label: '未知隔离策略 · 尚不可判定', detail: '未识别的策略不能用作隔离或网络限制已核验的依据。请核对 Host 配置。' };
+}
+
+
 /** Display guard only. Host independently validates the file, finite grant and exact decision. */
 export function modelAuthorizationUnavailable(state: ViewState, demand?: Demand, now = Date.now()): string | null {
   return modelConfigurationUnavailable(state, demand, now, false);

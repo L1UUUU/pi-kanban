@@ -30,7 +30,8 @@ unlimited, approved, a default provider, a working method or verified isolation.
 }
 ```
 
-All listed keys are required. Unknown keys are rejected, including `authorized`,
+All listed keys are required, except the backward-compatible optional
+`runtime.shell` and `runtime.policyVariant` fields described below. Unknown keys are rejected, including `authorized`,
 `verified`, `executionEnabled`, `apiKey`, arbitrary headers, and authorization
 IDs inside the provider configuration. Current schema version is exactly `1`.
 
@@ -39,6 +40,15 @@ Leave `methods.planning` null until the actual source and all its declared
 transitive dependencies are available. The implementation and review stages may
 use separately and explicitly named candidate methods. A logical method name or
 a passing fixture is not evidence that the actual user method was validated.
+
+This repository supplies two new, explicitly named candidates:
+[implementation-candidate-v1](../methods/implementation-candidate-v1.md) and
+[review-candidate-v1](../methods/review-candidate-v1.md). They implement the
+documented scope, verification and independent-review conventions as text methods;
+they are not the user's preexisting methods and have not been evaluated with a
+paid model. Select and hash them explicitly if desired, with `dependencies: []`.
+The Host's report adapter supplies the concrete role-specific protocol separately,
+so external methods do not need to guess report fields or native evidence IDs.
 
 ## Exact method sources
 
@@ -96,7 +106,7 @@ Method bodies and credential values are not included in the UI summary.
 
 ## Runtime input and independent native evidence
 
-A non-null `runtime` has these required fields:
+A non-null `runtime` has these fields (required unless marked optional):
 
 - `profileId`: stable identifier.
 - `osBuild`: exact Windows release string, or null.
@@ -105,6 +115,17 @@ A non-null `runtime` has these required fields:
   semantic `version`, and `sha256`. Node must pin a Node 24 version.
 - `pi`: null, or the same file-reference fields plus
   `package: "@earendil-works/pi-coding-agent"` and an exact version.
+- `shell`: null, or an explicitly locked Git Bash executable and manifest as
+  described below. Older schema-v1 documents may omit this field; parsing
+  canonicalizes omission to null. There is no default shell or PATH discovery.
+- `policyVariant`: optional exact enum `lpac-strict-v1` or
+  `lpac-registry-read-no-network-v2`. Omission canonicalizes to `lpac-strict-v1`.
+  Null, unknown values and automatic selection are rejected. The second policy
+  explicitly adds the native registry-read capability while retaining network
+  denial; it is never selected after a strict-policy failure. Its selection is
+  preserved in settings, the configuration digest, the UI summary and the native
+  verifier input. Signed evidence must bind that exact policy; old strict-policy
+  evidence cannot authorize the registry-read variant.
 - `policySha256`: exact lowercase SHA-256, or null.
 - `evidence`: required object with `privateChannel`, `filesystem`, `processTree`
   and `network`. Each is null or an explicit `{id,path,sha256}` file reference.
@@ -116,7 +137,7 @@ not evidence inferred from their filenames or claimed version strings.
 
 `runtimeProfileInput(config)` transforms the values to the native verifier’s
 input: it removes the display IDs on binary locks and lists the four evidence
-references. `verifyWindowsRuntimeProfile(input, trustedEvidenceRoot)` owns the
+references. `verifyWindowsRuntimeProfile(input, trustedEvidenceRoot, trustAnchor)` owns the
 separate machine/artifact/probe verification. Only that verifier may construct
 an executable verified-profile instance. Evidence must originate in the
 Host-owned evidence directory and apply to the exact machine and artifact
@@ -129,6 +150,102 @@ network, IPC, descendant-stop, reparse or role-transition behavior.
 coordinator must independently establish current isolation, workspace, grant,
 method, private-channel and process-control prerequisites before a launch.
 There is no unrestricted-platform fallback.
+
+### Independently trusted native evidence
+
+The runtime verifier requires Ed25519-signed observations from a separately
+trusted Host recorder. An adjacent public key, a user-edited all-pass JSON file,
+or an artifact hash alone cannot establish that trust. The two-argument verifier
+form deliberately remains closed.
+
+An operator-provisioned Host installation supplies the fixed file
+`windows-evidence-trust.json` with `schemaVersion: 1`, `keyId`, `publicKeyPem` and
+`recorderSha256`. Its digest is independently pinned at trusted application
+startup. `PI_KANBAN_RUNTIME_TRUST_DIR` and `PI_KANBAN_RUNTIME_TRUST_SHA256` select
+that installation directory and exact digest; these fields are never accepted
+from renderer IPC, project configuration, a Worker, or an adjacent digest file.
+Only public verification material belongs in this file. Signing keys must stay
+with the independently controlled recorder and are never created or imported by
+configuration loading.
+
+Evidence binds the exact OS build, runtime artifacts, policy variant and optional
+shell manifest. It must cover permitted work, role restrictions, cross-demand
+and shared-Git denial, Host/private-channel boundaries, real network denial,
+descendant termination, helper closure, reparse handling and role transition.
+Changing a bound artifact or capability policy invalidates the old evidence.
+The repository's CI recorder reports partial observations with
+`releaseAuthorized: false`; its output is intentionally insufficient to enable
+production. Target-machine validation and independent release authorization
+remain required.
+
+### Optional locked Git Bash
+
+The shell is an additional explicit runtime artifact. This example is a schema
+illustration only; substitute the selected installation's exact version and
+hashes. Importing it neither runs Bash nor authorizes a command.
+
+```json
+{
+  "id": "approved-git-bash",
+  "kind": "git-bash",
+  "path": "C:\\ApprovedGit\\usr\\bin\\bash.exe",
+  "version": "5.2.37",
+  "sha256": "<64 lowercase hexadecimal characters>",
+  "manifest": {
+    "id": "approved-git-bash-artifacts",
+    "path": "C:\\WorkbenchHost\\git-bash-manifest.json",
+    "sha256": "<64 lowercase hexadecimal characters>"
+  }
+}
+```
+
+The separately hashed UTF-8 JSON manifest has exactly this structure:
+
+```json
+{
+  "schemaVersion": 1,
+  "rootPath": "C:\\ApprovedGit",
+  "files": [
+    {
+      "path": "C:\\ApprovedGit\\usr\\bin\\bash.exe",
+      "sha256": "<same executable SHA-256 as runtime.shell>"
+    },
+    {
+      "path": "C:\\ApprovedGit\\usr\\bin\\msys-2.0.dll",
+      "sha256": "<exact dependency SHA-256>"
+    }
+  ]
+}
+```
+
+This abbreviated example is not a complete Git for Windows dependency list.
+List every approved executable, DLL and other runtime file required by the
+selected installation and supported commands. Entries are exact regular files;
+the manifest must include the selected Bash executable with its matching hash.
+Every entry must be strictly inside the explicit canonical installation root.
+The root must be a directory below the filesystem root. It defines containment
+only and does not grant access to that directory, its parents, or unlisted
+files. The manifest itself may be stored outside the installation root as
+Host-managed metadata.
+
+The manifest is bounded separately to 4 MiB and at most 512 entries; it is never
+embedded into or allowed to enlarge the 128 KiB settings file. Each listed
+artifact is bounded to 256 MiB, with a 1 GiB total. Inspection verifies the
+manifest and all listed hashes, rejects duplicate paths, traversal, aliases,
+symlinks and junctions, and never scans PATH or launches a process. A changed
+manifest or dependency invalidates the lock even if Bash itself is unchanged.
+Unknown fields, credential values, authorization flags and custom launch
+arguments are not supported.
+
+`runtimeProfileInput` passes the exact executable and manifest locks to the
+independent native verifier without display IDs. Missing/null shell is omitted
+from the native profile and cannot enable shell tools. A configured shell stays
+unverified until authenticated evidence covers its exact executable, manifest,
+dependencies and actual Git Bash probe on the current Windows host. A generic
+process-spawn result, a version string or synthetic fixture is not such proof.
+The native runner fixes startup arguments to disable profile and rc-file
+loading; arbitrary shell fallback is unsupported. Separate role, workspace,
+process-tree, resource-budget and command checks still apply before use.
 
 ## Provider selection and finite proposal
 
@@ -232,6 +349,8 @@ before its separate authorization action.
 It covers missing settings, strict schema/no authorization flags, dependency
 hashing and stale files, missing/oversized/invalid-text materials, symlink and
 junction aliases, no global resource discovery, pinned runtime hashes, unknown
+shell kinds and version ranges, manifest bounds, dependency mutations,
+missing executable entries, duplicate and outside-root shell paths, unknown
 provider prerequisites, endpoint/credential-reference validation, finite
 limits, separate trusted decision checks, stable summaries, atomic persistence,
 revision conflicts and corrupted state.

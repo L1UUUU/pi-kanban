@@ -10,7 +10,9 @@
  */
 import { createPublicKey, verify } from 'node:crypto';
 import { RuntimeError } from './types.ts';
+import type { LockedShellRuntime } from './shell-profile.ts';
 
+export type WindowsRuntimePolicyVariant = 'lpac-strict-v1' | 'lpac-registry-read-no-network-v2';
 export const WINDOWS_RECORDER_ID = 'pi-kanban-windows-host-recorder-v1';
 export const REQUIRED_WINDOWS_PROBES = [
   'implementation-own-write', 'review-source-read-only', 'cross-demand-denied',
@@ -18,6 +20,7 @@ export const REQUIRED_WINDOWS_PROBES = [
   'network-denied', 'descendant-stop', 'kill-on-helper-close',
   'node-pi-compatibility', 'reparse-denied', 'role-transition-clean',
 ] as const;
+export const REQUIRED_WINDOWS_SHELL_PROBES = ['git-bash-compatibility'] as const;
 export const MAX_WINDOWS_EVIDENCE_BYTES = 1024 * 1024;
 const signatureDomain = Buffer.from('pi-kanban.windows-runtime-evidence.v1\0', 'utf8');
 const digestPattern = /^[a-f0-9]{64}$/;
@@ -37,6 +40,8 @@ export interface WindowsEvidenceBindings {
   worker: WindowsEvidenceBinaryBinding;
   pi: WindowsEvidenceBinaryBinding & { package: '@earendil-works/pi-coding-agent' };
   policySha256: string;
+  policyVariant?: WindowsRuntimePolicyVariant;
+  shell?: LockedShellRuntime | null;
 }
 export interface WindowsEvidenceReport {
   schemaVersion: 2;
@@ -122,6 +127,12 @@ export function verifyWindowsEvidence(bytes: Uint8Array, expected: ExpectedWindo
       typeof recorder.recordedAt !== 'string' || !Number.isFinite(Date.parse(recorder.recordedAt)) || new Date(recorder.recordedAt).toISOString() !== recorder.recordedAt)
     throw new RuntimeError('EVIDENCE_RECORDER_MISMATCH', 'Evidence recorder provenance does not match the pinned Host recorder');
   const bindings = record(report.bindings);
+  // A legacy omission establishes only the original strict policy. Registry-read
+  // candidates need newly captured, signed evidence for their explicit variant.
+  const expectedVariant = expected.policyVariant === undefined ? 'lpac-strict-v1' : expected.policyVariant;
+  const actualVariant = bindings.policyVariant === undefined ? 'lpac-strict-v1' : bindings.policyVariant;
+  if ((expectedVariant !== 'lpac-strict-v1' && expectedVariant !== 'lpac-registry-read-no-network-v2') || actualVariant !== expectedVariant)
+    throw new RuntimeError('EVIDENCE_INAPPLICABLE', 'Evidence policy variant differs from the explicitly locked runtime');
   if (typeof expected.policySha256 !== 'string' || !digestPattern.test(expected.policySha256) || bindings.policySha256 !== expected.policySha256)
     throw new RuntimeError('EVIDENCE_INAPPLICABLE', 'Evidence was produced for a different policy');
   for (const name of ['node', 'helper', 'worker', 'pi'] as const) {
@@ -132,6 +143,23 @@ export function verifyWindowsEvidence(bytes: Uint8Array, expected: ExpectedWindo
     if (!digestPattern.test(String(wanted.sha256))) throw new RuntimeError('EVIDENCE_INAPPLICABLE', `${name} digest is invalid`);
     if (name === 'pi' && (wanted.package !== '@earendil-works/pi-coding-agent' || actual.package !== wanted.package))
       throw new RuntimeError('EVIDENCE_INAPPLICABLE', 'Evidence must bind the official Pi package');
+  }
+  // Older Node-only profiles omit shell; omission and null both mean no shell authority.
+  // Neither may be reused after adding Git Bash, and shell evidence cannot authorize its removal.
+  const wantedShell = expected.shell ?? null, actualShell = bindings.shell ?? null;
+  if ((wantedShell === null) !== (actualShell === null))
+    throw new RuntimeError('EVIDENCE_INAPPLICABLE', 'Evidence shell presence differs from the locked runtime');
+  if (wantedShell !== null) {
+    const actual = record(actualShell), wanted = record(wantedShell);
+    if (wanted.kind !== 'git-bash' || actual.kind !== wanted.kind)
+      throw new RuntimeError('EVIDENCE_INAPPLICABLE', 'Evidence must bind the exact Git Bash runtime kind');
+    for (const field of ['path', 'version', 'sha256'] as const)
+      if (!text(wanted[field]) || actual[field] !== wanted[field]) throw new RuntimeError('EVIDENCE_INAPPLICABLE', `shell ${field} differs from the exact artifact lock`);
+    const actualManifest = record(actual.manifest), wantedManifest = record(wanted.manifest);
+    for (const field of ['path', 'sha256'] as const)
+      if (!text(wantedManifest[field]) || actualManifest[field] !== wantedManifest[field]) throw new RuntimeError('EVIDENCE_INAPPLICABLE', `shell manifest ${field} differs from the exact artifact lock`);
+    if (!digestPattern.test(String(wanted.sha256)) || !digestPattern.test(String(wantedManifest.sha256)))
+      throw new RuntimeError('EVIDENCE_INAPPLICABLE', 'Exact shell executable and manifest digests are required');
   }
   if (!Array.isArray(report.probes) || !report.probes.length || report.probes.length > 128) throw new RuntimeError('EVIDENCE_INCOMPLETE', 'Bounded actual probe observations are required');
   const seen = new Set<string>();
@@ -145,7 +173,8 @@ export function verifyWindowsEvidence(bytes: Uint8Array, expected: ExpectedWindo
 }
 
 /** Run after authenticating every report. Partial reports cannot remove any mandatory probe. */
-export function requireWindowsProbeCoverage(probeIds: Iterable<string>): void {
-  const covered = new Set(probeIds), missing = REQUIRED_WINDOWS_PROBES.filter(id => !covered.has(id));
+export function requireWindowsProbeCoverage(probeIds: Iterable<string>, shellEnabled = false): void {
+  const required = shellEnabled ? [...REQUIRED_WINDOWS_PROBES, ...REQUIRED_WINDOWS_SHELL_PROBES] : REQUIRED_WINDOWS_PROBES;
+  const covered = new Set(probeIds), missing = required.filter(id => !covered.has(id));
   if (missing.length) throw new RuntimeError('EVIDENCE_INCOMPLETE', `Unverified probes: ${missing.join(', ')}`);
 }

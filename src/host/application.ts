@@ -68,7 +68,7 @@ export class HostApplication {
     this.production = createProductionServices({ store: this.store, workflow: this.workflow, configuration: () => this.configuration.load(), workspace: () => this.workspace, knowledge: this.knowledge, budget: this.budget, stateDirectory: join(configDirectory, 'runtime'), evidenceTrustAnchor, localCommitAuthor: demandId => { const demand = this.store.getDemand(demandId); if (!demand.grant?.localCommit) return null; const row = this.store.db.prepare('SELECT author_json FROM host_local_commit_authorities WHERE demand_id=? AND plan_id=?').get(demandId, demand.grant.planId); return row ? JSON.parse(String(row.author_json)) : null; } });
     this.coordinator = new ExecutionCoordinator(this.store, this.workflow, this.production.driver, this.production.prerequisites);
     this.production.bindCoordinator(this.coordinator);
-    this.knowledgeLifecycle = new HostKnowledgeLifecycle({ store: this.store, workflow: this.workflow, knowledge: this.knowledge, workspace: () => this.workspace, evidence: this.production.evidence,
+    this.knowledgeLifecycle = new HostKnowledgeLifecycle({ store: this.store, workflow: this.workflow, knowledge: this.knowledge, workspace: () => this.workspace, evidence: this.production.evidence, verifyBaselineChecks: request => this.production.verifyBaselineChecks(request),
       stopped: demandId => !this.store.listRuns(demandId).some(run => run.status !== 'stopped') && !this.coordinator.supervisor.list().some(run => run.demandId === demandId && run.state !== 'stopped') && this.production.auxiliaryStatus().safe });
   }
   /** Host-only lazy service: absent Windows Git configuration does not prevent
@@ -101,15 +101,18 @@ export class HostApplication {
     const result = d.results.find(r => r.id === d.activeResultId);
     const runs = this.store.listRuns(d.id);
     const run = runs.at(-1);
+    let binding: ReturnType<WorkspaceService['getBinding']>;
+    try { binding = this.workspace.getBinding(d.id); } catch { binding = null; }
     return {
       id: d.id, projectId: d.projectId, title: d.title, description: d.description, version: d.revision, phase: d.phase, control: d.control,
-      plan: plan ? { id: plan.id, scope: plan.scope, ready: plan.ready, confirmed: d.confirmedPlanId === plan.id, specPath: plan.spec.location, requiredChecks: plan.requiredChecks.map(c => c.name), unresolvedQuestions: [...plan.unresolvedQuestions] } : undefined,
-      result: result ? { id: result.id, contentId: result.contentId, notes: result.notes, createdAt: result.createdAt, codeRef: result.K.location, knowledgeRefs: result.N.map(n => n.id), accepted: d.acceptances.some(a => a.resultId === result.id && a.decision === 'accepted') } : undefined,
+      plan: plan ? { id: plan.id, scope: plan.scope, ready: plan.ready, confirmed: d.confirmedPlanId === plan.id, specPath: plan.spec.location, spec: structuredClone(plan.spec), tickets: structuredClone(plan.tickets), boundaryReviewEvidence: plan.boundaryReview ? structuredClone(plan.boundaryReview.evidence) : undefined, requiredChecks: plan.requiredChecks.map(c => c.name), unresolvedQuestions: [...plan.unresolvedQuestions] } : undefined,
+      result: result ? { id: result.id, contentId: result.contentId, notes: result.notes, createdAt: result.createdAt, codeRef: result.K.location, codeArtifact: structuredClone(result.K), knowledgeArtifacts: structuredClone(result.N), reviewEvidence: structuredClone(result.review.evidence), knowledgeRefs: result.N.map(n => n.id), accepted: d.acceptances.some(a => a.resultId === result.id && a.decision === 'accepted') } : undefined,
       activeContentId: d.activeContentId, methodSnapshot: structuredClone(d.methodSnapshot), findings: structuredClone(d.findings), workflowBlockers: [...d.blockedReasons],
       blockers: [...d.blockedReasons, ...(d.planningStarted && d.control === 'active' && !result ? this.production.diagnostics(d.id).blockers : [])],
       activities: this.store.history(d.id).slice(-200).map((h, index) => ({ id: `${d.id}-${index}`, kind: 'workflow', title: h.kind, timestamp: h.createdAt, status: 'complete' })),
       messages: d.messages.map(m => ({ id: m.id, role: 'user', text: m.text, state: m.state })),
-      checks: d.checks.map(c => ({ id: c.id, name: plan?.requiredChecks.find(r => r.id === c.requirementId)?.name ?? c.requirementId, status: c.status, evidence: c.evidence.location, contentId: c.contentId })),
+      checks: d.checks.map(c => ({ id: c.id, name: plan?.requiredChecks.find(r => r.id === c.requirementId)?.name ?? c.requirementId, status: c.status, evidence: c.evidence.location, artifact: structuredClone(c.evidence), contentId: c.contentId })),
+      workspacePath: binding?.worktreePath, branch: binding?.branch,
       knowledgeLifecycle: this.knowledgeLifecycle.snapshot(d.id),
       knowledge: result?.N.map(n => ({ id: n.id, title: n.id, status: 'candidate', detail: '本轮版本已保存；接受成果与取得跨需求复用资格是不同事实。' })) ?? [],
       runState: run ? run.status === 'starting' ? 'queued' : run.status : this.store.outbox('pending').some(o => o.demandId === d.id && o.kind === 'start-run') ? 'queued' : 'idle',
@@ -275,6 +278,16 @@ export class HostApplication {
     await this.coordinator.flushStops();
     await this.coordinator.observeCompletedRuns();
     return this.shutdown();
+  }
+  readArtifact(input: unknown) {
+    const params = record(input), demandId = id(params.demandId), artifactId = id(params.artifactId, 'artifact identifier');
+    this.store.getDemand(demandId);
+    const ref = this.production.evidence.reference(demandId, artifactId);
+    if (ref.digest !== text(params.digest, 'artifact digest', 64)) throw new ProtocolError('ARTIFACT_CHANGED', 'Read the exact immutable artifact revision selected on screen.');
+    const material = this.production.evidence.read(demandId, ref), offset = params.offset ?? 0;
+    if (!Number.isSafeInteger(offset) || Number(offset) < 0 || Number(offset) > material.content.length) throw new ProtocolError('INVALID_OFFSET', 'Artifact page offset is outside the exact content.');
+    const start = Number(offset), end = Math.min(start + 16_384, material.content.length);
+    return { id: ref.id, digest: ref.digest, kind: material.kind, text: material.content.slice(start, end), totalCharacters: material.content.length, offset: start, nextOffset: end < material.content.length ? end : null };
   }
   async knowledgeAction(input: unknown): Promise<ViewState> {
     if (this.#closing) throw new ProtocolError('APP_STOPPING', 'Application exit is in progress.');

@@ -92,8 +92,20 @@ if (params.has('knowledge')) {
     proposals: [{ proposalId: 'synthetic-baseline-proposal', demandId: target.id, formalTarget: 'main', sourceCommit: 'c'.repeat(40), expectedHead: 'b'.repeat(40), expectedBaseline: 'a'.repeat(40), createdAt: '2026-10-08T00:00:00Z' }], blockers: [],
   };
   if (params.get('knowledge') === 'unbound') { target.knowledgeLifecycle.remote = undefined; target.knowledgeLifecycle.observations = []; }
-  if (params.get('knowledge') === 'baseline' || params.get('knowledge') === 'integrated') { target.result = undefined; target.phase = 'blocked'; target.runState = 'stopped'; }
+  if (params.get('knowledge') === 'baseline' || params.get('knowledge') === 'integrated' || params.get('knowledge') === 'conflict') { target.result = undefined; target.phase = 'blocked'; target.runState = 'stopped'; }
+  if (params.get('knowledge') === 'conflict') target.knowledgeLifecycle.proposals[0]!.author = { name: 'Synthetic Original', email: 'original@example.invalid' };
+  if (params.get('knowledge') === 'conflict') target.knowledgeLifecycle.proposals[0]!.result = { operationId: 'synthetic-baseline-proposal', sourceCommit: 'c'.repeat(40), head: 'b'.repeat(40), state: 'conflict', conflicts: ['src/synthetic.ts'], capabilityVerified: false };
   if (params.get('knowledge') === 'integrated') target.knowledgeLifecycle.proposals[0]!.result = { operationId: 'synthetic-baseline-proposal', sourceCommit: 'c'.repeat(40), head: 'd'.repeat(40), state: 'integrated-awaiting-verification', conflicts: [], capabilityVerified: false };
+}
+if (params.has('artifacts')) {
+  const target = state.demands[0]!;
+  target.plan!.spec = { id: 'synthetic-spec-artifact', digest: '1'.repeat(64), location: 'synthetic-only' };
+  target.plan!.tickets = { id: 'synthetic-tickets-artifact', digest: '2'.repeat(64), location: 'synthetic-only' };
+  target.plan!.boundaryReviewEvidence = { id: 'synthetic-boundary-artifact', digest: '3'.repeat(64), location: 'synthetic-only' };
+  target.result!.reviewEvidence = { id: 'synthetic-review-artifact', digest: '4'.repeat(64), location: 'synthetic-only' };
+  target.result!.codeArtifact = { id: 'synthetic-source-artifact', digest: '5'.repeat(64), location: 'synthetic-only' };
+  target.result!.knowledgeArtifacts = [{ id: 'synthetic-knowledge-artifact', digest: '6'.repeat(64), location: 'synthetic-only' }];
+  target.checks![0]!.artifact = { id: 'synthetic-check-artifact', digest: '7'.repeat(64), location: 'synthetic-only' };
 }
 const latency = Math.min(1000, Math.max(0, Number(params.get('latency')) || 0));
 const waitForSyntheticResponse = () => new Promise<void>(resolve => setTimeout(resolve, latency));
@@ -119,6 +131,7 @@ const previewBridge: WorkbenchBridge = {
   },
   authorizeModel: async input => { window.dispatchEvent(new CustomEvent('pi-kanban:synthetic-command', { detail: { kind: 'authorize-model', ...structuredClone(input) } })); await waitForSyntheticResponse(); throw new Error('合成配置仅用于审阅 UI，不会创建真实模型授权、发送资料或产生费用。'); },
   knowledgeAction: async input => { window.dispatchEvent(new CustomEvent('pi-kanban:synthetic-command', { detail: { kind: 'knowledge-action', ...structuredClone(input) } })); await waitForSyntheticResponse(); throw new Error('合成知识预览不会改变真实复用资格、访问远端或整合基线。'); },
+  readArtifact: async input => { await waitForSyntheticResponse(); const text = `合成产物 ${input.artifactId}\n` + '合成正文：核对实际方案、任务与独立证据。\n'.repeat(850); const offset = input.offset ?? 0; const page = text.slice(offset, offset + 16_384); window.dispatchEvent(new CustomEvent('pi-kanban:synthetic-artifact-read', { detail: structuredClone(input) })); return { id: input.artifactId, digest: input.digest, kind: 'synthetic-artifact', text: page, offset, totalCharacters: text.length, nextOffset: offset + page.length < text.length ? offset + page.length : null }; },
   createProject: async () => { throw new Error('合成预览不能选择真实项目。请从桌面应用接入本地目录。'); },
   createDemand: async input => { await waitForSyntheticResponse(); state.demands.push({ ...input, id: `synthetic-${crypto.randomUUID()}`, version: 1, phase: 'idea', control: 'active', runState: 'idle', blockers: [], activities: [], messages: [] }); return publish(); },
   command: async input => { window.dispatchEvent(new CustomEvent('pi-kanban:synthetic-command', { detail: structuredClone(input) })); await waitForSyntheticResponse(); throw new Error('合成 UI 预览不执行授权、验收或运行控制。请在真实桌面 Host 中操作。'); },

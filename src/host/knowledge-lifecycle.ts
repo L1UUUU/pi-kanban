@@ -24,6 +24,7 @@ export type KnowledgeAction = LifecycleControl & (
 export interface BaselineProposal {
   proposalId: string; demandId: string; formalTarget: string; sourceCommit: string; expectedHead: string;
   expectedBaseline: string|null; createdAt: string; result?: BaselineUpdateResult;
+  author?: { name: string; email: string };
 }
 export interface KnowledgeLifecycleView {
   candidates: { revisionId: string; artifactId: string; resultId: string; title: string; sourceKind: SourceKind; statementKind: string; status: 'candidate'|'verified'|'ineligible'; body: string; roles: KnowledgeRole[]; modulePaths: string[] }[];
@@ -37,9 +38,17 @@ export interface KnowledgeLifecycleView {
 }
 interface CandidateOrigin { revisionId: string; resultId: string; artifactId: string; sourceRevisionId?: string }
 interface NativeCheck { provenance: string; requestId: string; runtimeRunId: string; generation: string; sourceBefore: string; sourceAfter: string; environment: string; reason: string; exitCode: number|null }
+export interface BaselineCheckRequest { demandId: string; operationId: string; expectedHead: string; templateResultId: string; checkIds: string[]; requestId?: string }
+export interface BaselineCheckVerification {
+  head: string; sourceDigest: string; environment: string; evidenceRefs: string[];
+  provenance: 'native-helper-command-observation'|'synthetic-native-receipt'; stopped: boolean;
+}
 export interface KnowledgeLifecycleOptions {
   store: WorkbenchStore; workflow: WorkflowService; knowledge: KnowledgeService; workspace: () => WorkspaceService;
   evidence: ProductionEvidence; stopped: (demandId: string) => boolean;
+  /** Host-only check runner; executes selected historical recipes anew on the
+   * integrated readonly snapshot, observes the native job and revokes access. */
+  verifyBaselineChecks?: (input: BaselineCheckRequest) => Promise<BaselineCheckVerification>;
   /** Tests can inject GET responses, which are permanently marked non-production. */
   remoteTransport?: ReadOnlyTransport;
 }
@@ -78,9 +87,9 @@ export class HostKnowledgeLifecycle {
     return author.id;
   }
   /** Source/Review identity comes from durable Host registries, never model booleans. */
-  private result(demand: Demand, resultId: string): DeliveryResult {
+  private result(demand: Demand, resultId: string, historicalRecipe=false): DeliveryResult {
     const result=demand.results.find(r=>r.id===resultId);
-    insist(result && !demand.invalidatedContentIds.includes(result.contentId),'RESULT_UNAVAILABLE','This exact result is unavailable or invalidated.');
+    insist(result && (historicalRecipe || !demand.invalidatedContentIds.includes(result.contentId)),'RESULT_UNAVAILABLE','This exact result is unavailable or invalidated.');
     const content=demand.contents.find(c=>c.id===result.contentId);
     insist(content && canonicalJson(content.code)===canonicalJson(result.K) && canonicalJson(content.knowledge)===canonicalJson(result.N),'RESULT_CHANGED','Result C/N differs from its immutable content.');
     const implementation=this.options.store.getRun(content.createdByRun), review=this.options.store.getRun(result.review.runId);
@@ -104,6 +113,7 @@ export class HostKnowledgeLifecycle {
   /** Called after production ticks; hypotheses remain local until a user classifies and verifies them. */
   captureResults(): void {
     for(const demand of this.options.store.listDemands()) for(const result of demand.results) {
+      if(result.N.every(ref=>this.db.prepare('SELECT 1 FROM host_knowledge_origins WHERE revision_id=?').get(key('candidate',[demand.id,result.id,ref]))))continue;
       try { this.capture(demand,this.result(demand,result.id)); } catch { /* Display inspection reports missing trusted evidence; never promote it. */ }
     }
   }
@@ -134,9 +144,14 @@ export class HostKnowledgeLifecycle {
   }
   private sourceTree(demand: Demand, result: DeliveryResult): string {
     const source=this.source(demand,result), workspace=this.options.workspace(), project=workspace.getProject(demand.projectId);
+    insist(Array.isArray(source.changes) && source.changes.length===0,'CONTENT_UNCOMMITTED','The independently reviewed source must be an exact clean committed snapshot, including file modes.');
     const files=workspace.git.filesAt(project.anchorPath,source.head!);
+    const fileModes=new Map(files.map(file=>[file.path,file.mode]));
     insist(canonicalJson(files.map(f=>f.path).sort())===canonicalJson(source.files.map(f=>f.path).sort()),'CONTENT_UNCOMMITTED','The reviewed source includes uncommitted or ignored files absent from its commit.');
-    for(const file of source.files) insist(digest(workspace.git.readFile(project.anchorPath,source.head!,file.path))===file.sha256,'CONTENT_UNCOMMITTED','The reviewed bytes differ from the committed source.');
+    for(const file of source.files) {
+      insist(digest(workspace.git.readFile(project.anchorPath,source.head!,file.path))===file.sha256,'CONTENT_UNCOMMITTED','The reviewed bytes differ from the committed source.');
+      if(process.platform!=='win32')insist(file.executable===(fileModes.get(file.path)==='100755'),'CONTENT_UNCOMMITTED','The reviewed executable mode differs from the committed source.');
+    }
     return workspace.git.commitInfo(project.anchorPath,source.head!).tree;
   }
   private checks(demand: Demand, result: DeliveryResult, ids: string[]): { environment: string; refs: string[] } {
@@ -231,6 +246,9 @@ export class HostKnowledgeLifecycle {
       const recovering=this.db.prepare('SELECT 1 FROM workspace_intents WHERE operation_id=? AND kind=?').get(proposal.proposalId,'baseline');
       if(!recovering) insist(binding && workspace.git.head(binding.worktreePath)===proposal.expectedHead && binding.currentBaseline===proposal.expectedBaseline,'STALE_BASELINE','The proposal HEAD or baseline changed; prepare a new proposal.');
       const author=record(input.author), identity={name:text(author.name,'commit author',200),email:text(author.email,'commit email',320)};
+      insist(!proposal.author || canonicalJson(proposal.author)===canonicalJson(identity),'BASELINE_AUTHOR_CHANGED','Reconciliation must retain the originally approved commit author.');
+      proposal.author=identity;
+      this.db.prepare('UPDATE host_baseline_proposals SET body=? WHERE proposal_id=?').run(canonicalJson(proposal),proposal.proposalId);
       // Persist a workflow blocker before Git side effects so no queued run can start on unchecked integration.
       demand=this.options.workflow.blockDemand(demand.id,'BASELINE_VERIFICATION_REQUIRED',`Baseline operation ${proposal.proposalId} needs exact post-integration checks.`);
       if(demand.activeContentId && !demand.invalidatedContentIds.includes(demand.activeContentId))demand=this.options.workflow.invalidateCurrentContent(demand.id,`Explicit baseline integration ${proposal.proposalId} changes the prior reviewed content; revise the plan or produce a new authorized result before capability verification.`);
@@ -240,10 +258,20 @@ export class HostKnowledgeLifecycle {
       const row=this.db.prepare('SELECT body FROM host_baseline_proposals WHERE proposal_id=? AND demand_id=?').get(text(input.operationId,'operation',160),demand.id);
       insist(row,'PROPOSAL_MISSING','Baseline operation is unavailable.');const proposal=JSON.parse(String(row.body)) as BaselineProposal;
       insist(proposal.result?.state==='integrated-awaiting-verification' && proposal.result.head && this.options.stopped(demand.id),'UPDATE_INCOMPLETE','Complete integration and stop all processes before final verification.');
-      const result=this.result(demand,text(input.resultId,'result',160)), source=this.source(demand,result), actual=this.checks(demand,result,strings(input.checkIds,'checks',128));
-      insist(source.head===proposal.result.head,'CAPABILITY_UNVERIFIED','Post-integration checks must cover the actual integrated commit.');this.sourceTree(demand,result);
-      proposal.result=workspace.verifyBaseline({operationId:proposal.proposalId,expectedHead:proposal.result.head,capabilitiesVerified:true,evidenceRefs:actual.refs});
+      insist(demand.control==='active','UPDATE_PROTECTED','An active demand is required to run fresh baseline checks.');
+      const result=this.result(demand,text(input.resultId,'check template result',160),true), checkIds=strings(input.checkIds,'check recipes',128);
+      this.checks(demand,result,checkIds); // Validate independent historical recipe origins only.
+      const runner=this.options.verifyBaselineChecks;insist(runner,'BASELINE_CHECK_UNAVAILABLE','A verified native check-only runner is required; prior results cannot verify newly integrated code.');
+      const expected=this.options.evidence.sourceMaterial(demand.id), source=JSON.parse(expected.content) as SourceSnapshot;
+      insist(source.head===proposal.result.head,'CONTENT_DRIFT','Integrated HEAD changed before fresh capability checks.');
+      const actual=await runner({demandId:demand.id,operationId:proposal.proposalId,expectedHead:proposal.result.head,templateResultId:result.id,checkIds,requestId});
+      demand=this.current(input);
+      insist(actual.provenance==='native-helper-command-observation' && actual.stopped && this.options.stopped(demand.id),'CAPABILITY_UNVERIFIED','Fresh genuine native checks and complete process stop/resource revocation are required.');
+      insist(actual.head===proposal.result.head && actual.sourceDigest===expected.sha256 && this.options.evidence.sourceMaterial(demand.id).sha256===expected.sha256,'CONTENT_DRIFT','Integrated source changed during fresh capability verification.');
+      insist(actual.environment.length>0 && actual.evidenceRefs.length>0,'CAPABILITY_UNVERIFIED','Fresh checks must retain exact environment and actual native receipts.');
+      proposal.result=workspace.verifyBaseline({operationId:proposal.proposalId,expectedHead:proposal.result.head,capabilitiesVerified:true,evidenceRefs:actual.evidenceRefs});
       this.db.prepare('UPDATE host_baseline_proposals SET body=? WHERE proposal_id=?').run(canonicalJson(proposal),proposal.proposalId);
+      demand=this.options.workflow.clearHostBlocker(demand.id,'BASELINE_VERIFICATION_REQUIRED',`Baseline operation ${proposal.proposalId} needs exact post-integration checks.`);
     } else throw new Error('Unsupported knowledge lifecycle action.');
     this.options.store.transaction(()=>{
       const latest=this.options.store.getDemand(demand.id);

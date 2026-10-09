@@ -339,3 +339,70 @@ test('renderer: implementation author consent is default-off and never confirms 
   assert.match(implementationUnavailable(target, state({ demands: [{ ...target, version: 8 }] }))!, /版本已变化/);
   assert.throws(() => makeImplementationAuthorization({ ...target, plan: { ...target.plan!, confirmed: false } }, { localCommit: false, authorName: '', authorEmail: '' }, 'request'), /单独确认/);
 });
+test('renderer: conflicted baseline retains the same reviewed proposal for explicit reconciliation', () => {
+  const view = lifecycle(); view.proposals[0]!.result = { operationId: 'synthetic-proposal', sourceCommit: 'c'.repeat(40), head: 'b'.repeat(40), state: 'conflict', conflicts: ['src/synthetic.ts'], capabilityVerified: false };
+  const target = demand({ runState: 'stopped', knowledgeLifecycle: view });
+  const review = { action: 'apply-baseline' as const, demand: target, proposalId: 'synthetic-proposal' };
+  assert.equal(knowledgeUnavailable(review, state({ demands: [target] })), null);
+  assert.equal(makeKnowledgeAction(review, { reviewed: true, authorName: 'Synthetic', authorEmail: 'synthetic@example.invalid' }, 'retry').action, 'apply-baseline');
+});
+test('renderer: new implementation knowledge cannot imply acceptance of a pending result', () => {
+  const view = lifecycle(); view.resultMaterials[0]!.accepted = false;
+  const target = demand({ knowledgeLifecycle: view });
+  assert.match(knowledgeUnavailable({ action: 'qualify', demand: target, revisionId: 'synthetic-kr1' }, state({ demands: [target] }))!, /先接受此精确成果/);
+});
+
+import { validateArtifactPage } from '../src/desktop/renderer/artifact-model.ts';
+test('renderer: artifact pages bind exact immutable identity, digest and contiguous bounded ranges', () => {
+  const review = { demandId: 'synthetic-demand', version: 7, title: 'Synthetic spec', artifact: { id: 'synthetic-spec', digest: 'a'.repeat(64), location: 'not-used-by-renderer' } };
+  const first = { id: review.artifact.id, digest: review.artifact.digest, kind: 'spec', text: 'abc', totalCharacters: 5, offset: 0, nextOffset: 3 };
+  assert.doesNotThrow(() => validateArtifactPage(review, first, 0));
+  assert.doesNotThrow(() => validateArtifactPage(review, { ...first, text: 'de', offset: 3, nextOffset: null }, 3, 5));
+  for (const patch of [{ id: 'other' }, { digest: 'b'.repeat(64) }, { offset: 2 }, { nextOffset: 0 }, { nextOffset: 4 }, { nextOffset: null }, { totalCharacters: 2 }, { text: 'x'.repeat(16385), totalCharacters: 17000, nextOffset: 16385 }]) assert.throws(() => validateArtifactPage(review, { ...first, ...patch }, 0));
+  assert.throws(() => validateArtifactPage(review, first, 0, 6), /分页不完整/);
+});
+test('renderer: artifact content is inert text and never an arbitrary filesystem or URL request', () => {
+  const source = readFileSync(new URL('../src/desktop/renderer/ArtifactViewer.tsx', import.meta.url), 'utf8');
+  assert.doesNotMatch(source, /dangerouslySetInnerHTML|window\.open|fetch\(|artifact\.location/);
+  assert.match(source, /artifactId: review\.artifact\.id, digest: review\.artifact\.digest, offset/);
+  assert.match(source, /epoch\.current !== generation/);
+});
+
+import { buildSync } from 'esbuild';
+import { createRequire } from 'node:module';
+import { fileURLToPath } from 'node:url';
+test('renderer: rendered select labels bind unique controls without including option text', () => {
+  // Render the actual TSX forms without a browser. CI additionally verifies exact
+  // accessible names and interaction through getByLabel(..., { exact: true }).
+  const compiled = buildSync({ stdin: { resolveDir: fileURLToPath(new URL('..', import.meta.url)), loader: 'tsx', contents: `
+    import React from 'react';
+    import { renderToStaticMarkup } from 'react-dom/server';
+    import { DecisionForm } from './src/desktop/renderer/Decisions.tsx';
+    import { KnowledgeForm } from './src/desktop/renderer/Knowledge.tsx';
+    export const render = (target, state, config) => [
+      renderToStaticMarkup(React.createElement(DecisionForm, { review: {kind:'switch-method',demand:target,configuration:config}, state, offline:false, pending:false, error:null, onSubmit:()=>{}, close:()=>{} })),
+      ...[{action:'save-candidate',resultId:'synthetic-r1',artifactId:'synthetic-n1'},{action:'qualify',revisionId:'synthetic-kr1'},{action:'verify-baseline',proposalId:'synthetic-proposal'}].map(review => renderToStaticMarkup(React.createElement(KnowledgeForm, {review:{...review,demand:target},state,offline:false,pending:false,error:null,onSubmit:()=>{},close:()=>{}})))
+    ];` }, bundle: true, platform: 'node', format: 'cjs', write: false, logLevel: 'silent' }).outputFiles[0]!.text;
+  const compiledModule: { exports: Record<string, unknown> } = { exports: {} };
+  new Function('require', 'module', 'exports', compiled)(createRequire(import.meta.url), compiledModule, compiledModule.exports);
+  const render = compiledModule.exports.render as (target: Demand, state: ViewState, config: ConfigurationSummary) => string[];
+  const target = demand({ runState: 'stopped', knowledgeLifecycle: lifecycle() });
+  const html = render(target, state({ demands: [target] }), configuration()).join('\n');
+  for (const label of ['切换阶段', '来源分类', '陈述类型', '真实合入观察', '先前检查的来源成果']) {
+    assert.match(html, new RegExp(`<label for="([^"]+)">${label}</label><select id="\\1"`), `${label} must label exactly its associated select`);
+  }
+  assert.doesNotMatch(html, /<label[^>]*>[^<]*<select/, 'Select options must not be descendants of their label');
+});
+
+import { runtimePolicyDisclosure } from '../src/desktop/renderer/configuration-model.ts';
+test('renderer: runtime policy selection discloses registry access and network prohibition without claiming verification', () => {
+  const strict = runtimePolicyDisclosure();
+  assert.equal(strict.id, 'lpac-strict-v1'); assert.match(strict.label, /严格 LPAC.*网络禁止/);
+  assert.deepEqual(runtimePolicyDisclosure('lpac-strict-v1'), strict);
+  const registry = runtimePolicyDisclosure('lpac-registry-read-no-network-v2');
+  assert.equal(registry.id, 'lpac-registry-read-no-network-v2'); assert.match(registry.label, /系统注册表读取.*网络仍禁止/);
+  for (const policy of [strict, registry]) { assert.match(policy.detail, /仅显示当前配置选择/); assert.match(policy.detail, /仍须.*核验原生证据/); assert.doesNotMatch(policy.label, /已核验|已启用|自动/); }
+  const unknown = runtimePolicyDisclosure('synthetic-unknown');
+  assert.equal(unknown.id, 'synthetic-unknown'); assert.match(unknown.label, /未知隔离策略/); assert.doesNotMatch(unknown.label, /网络禁止/);
+  assert.notEqual(runtimePolicyDisclosure(null).id, strict.id, 'Only an omitted variant defaults to strict');
+});

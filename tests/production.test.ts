@@ -126,28 +126,31 @@ import type { BoundedProviderTransport } from '../src/runtime/model-broker.ts';
 
 class SyntheticNativePort {
   readonly id = 'synthetic-production-composition'; readonly isolation = 'synthetic-process-supervision-only' as const;
-  nativeCalls = 0; launches: { run: RunRecord; init: WorkerInit }[] = []; bootstraps: WindowsRunBootstrap[] = []; replies: unknown[] = []; stopped = new Set<string>();
+  nativeCalls = 0; shellCalls = 0; onShellCheck?: () => void; launches: { run: RunRecord; init: WorkerInit }[] = []; bootstraps: WindowsRunBootstrap[] = []; replies: unknown[] = []; stopped = new Set<string>();
   handler!: (run: RunRecord, frame: Uint8Array) => Promise<void>;
   bootstrap: (run: RunRecord) => WindowsRunBootstrap;
   constructor(bootstrap: (run: RunRecord) => WindowsRunBootstrap) { this.bootstrap = bootstrap; }
   setStopHandler(_handler: (id: string, reason: string) => Promise<void>) {}
   setWorkerFrameHandler(handler: (run: RunRecord, frame: Uint8Array) => Promise<void>) { this.handler = handler; }
   preflight() {}
-  async launch(run: RunRecord): Promise<ProcessIdentity> { const bootstrap = this.bootstrap(run); this.bootstraps.push(bootstrap); const init = bootstrap.workerInit as unknown as WorkerInit; this.launches.push({ run, init }); return { pid: 7000 + this.launches.length, birth: 'SYNTHETIC-BIRTH', generation: run.generation, controlId: run.runId, driver: this.id }; }
+  async launch(run: RunRecord): Promise<ProcessIdentity> { const bootstrap = this.bootstrap(run); this.bootstraps.push(bootstrap); const init = bootstrap.workerInit as unknown as WorkerInit; const launch = { run, init }; this.launches.push(launch); if (init.checkOnly) await this.emit(launch, { type: 'worker.ready', sessionId: init.sessionId }); return { pid: 7000 + this.launches.length, birth: 'SYNTHETIC-BIRTH', generation: run.generation, controlId: run.runId, driver: this.id }; }
   async runNodeCheck(_runId: string, _args: string[], _limits: { timeoutMs: number; maxOutputBytes: number }, requestId: string = randomUUID()) { this.nativeCalls++; return { requestId, exitCode: 0, output: 'Synthetic native check output.', reason: 'exited' as const, nativeEvidence: { synthetic: true } }; }
+  async runShellCheck(_runId: string, args: string[], _limits: { timeoutMs: number; maxOutputBytes: number }, requestId: string = randomUUID()) { assert.equal(args.length, 1); this.shellCalls++; this.onShellCheck?.(); return { requestId, exitCode: 0, output: 'Synthetic locked Git Bash output.', reason: 'exited' as const, nativeEvidence: { synthetic: true, arguments: ['--noprofile', '--norc', '-c', args[0]] } }; }
   sendWorkerFrame(_id: string, value: unknown) { this.replies.push(value); }
   getResourceEvidence(id: string) { return { provisioned: this.launches.some(item => item.run.runId === id), revoked: this.stopped.has(id), status: 0 }; }
   async stop(run: RunRecord): Promise<Observation> { this.stopped.add(run.runId); return this.observe(run); }
   async observe(run: RunRecord): Promise<Observation> { return { state: this.stopped.has(run.runId) ? 'stopped' : 'alive', generation: run.generation, activePids: this.stopped.has(run.runId) ? [] : [7001], proof: 'SYNTHETIC process and ACL observation; no real isolation.' }; }
   async emit(launch: { run: RunRecord; init: WorkerInit }, body: Record<string, unknown>) { return this.handler(launch.run, Buffer.from(JSON.stringify({ version: 1, runId: launch.run.runId, ...(body.type === 'model.request' ? {} : { runtimeRunId: launch.run.runId }), generation: launch.run.generation, capability: launch.init.capability, ...body }))); }
 }
-function syntheticComposition(t: test.TestContext, localCommitAuthor?: ProductionOptions['localCommitAuthor']) {
+function syntheticComposition(t: test.TestContext, localCommitAuthor?: ProductionOptions['localCommitAuthor'], shell = false) {
   const f = fixture(t); const configuration = f.configuration; configuration.provider = provider();
   const runtimeRoot = join(f.root, 'runtime-files'); mkdirSync(runtimeRoot);
   const nodeRoot = join(runtimeRoot, 'node'), workerRoot = join(runtimeRoot, 'worker'); mkdirSync(nodeRoot); mkdirSync(workerRoot);
   const binary = (path: string) => { writeFileSync(path, 'SYNTHETIC binary bytes'); return { path, version: '24.0.0', sha256: hash('SYNTHETIC binary bytes') }; };
   const profile: LockedRuntimeProfile = { profileId: 'synthetic-profile', osBuild: 'SYNTHETIC-OS', arch: 'x64', node: binary(join(nodeRoot, 'node.exe')), helper: binary(join(runtimeRoot, 'helper.exe')), worker: binary(join(workerRoot, 'main.mjs')), pi: { ...binary(join(runtimeRoot, 'pi.json')), package: '@earendil-works/pi-coding-agent' }, policySha256: 'a'.repeat(64), evidence: [] };
+  if (shell) { const root = join(runtimeRoot, 'git-bash'); mkdirSync(root); const executable = binary(join(root, 'bash.exe')), library = binary(join(root, 'runtime.dll')), path = join(runtimeRoot, 'shell-manifest.json'), content = JSON.stringify({ schemaVersion: 1, rootPath: root, files: [executable, library].map(({ path, sha256 }) => ({ path, sha256 })) }); writeFileSync(path, content); profile.shell = { ...executable, version: '5.2.37', kind: 'git-bash', manifest: { path, sha256: hash(content) } }; }
   configuration.runtime = { profileId: profile.profileId, osBuild: profile.osBuild, arch: 'x64', node: { id: 'node', ...profile.node }, helper: { id: 'helper', ...profile.helper }, worker: { id: 'worker', ...profile.worker }, pi: { id: 'pi', ...profile.pi }, policySha256: profile.policySha256, evidence: { privateChannel: null, filesystem: null, processTree: null, network: null } };
+  if (profile.shell) configuration.runtime.shell = { id: 'shell', ...profile.shell, manifest: { id: 'shell-manifest', ...profile.shell.manifest } };
   f.configuration = configuration;
   const drivers: SyntheticNativePort[] = []; const calls: string[] = [];
   const transport: BoundedProviderTransport = { mode: 'synthetic-no-network', provider: 'openai', modelId: 'gpt-4.1-mini', destination: 'https://api.openai.com/v1/responses', async send(request) { calls.push(request.requestId); return { text: 'Synthetic planner/reviewer observation.', usage: { tokens: 20, costMicros: 10, source: 'SYNTHETIC-NO-NETWORK' } }; } };
@@ -208,7 +211,7 @@ test('synthetic composition: stopped source handoff starts isolated review and f
   await f.settled(reviewer, boundary); await f.production.tick();
   f.workflow.execute({ type: 'authorize-implementation', requestId: randomUUID(), demandId: 'demand', expectedRevision: f.store.getDemand('demand').revision, planId: 'plan1', confirmDesign: true }, f.user); f.authorize('grant2');
   await f.production.tick(); const implementation = primary.launches[1]!; assert.ok(implementation, JSON.stringify(f.production.diagnostics('demand'))); assert.equal(implementation.init.role, 'implementation'); await f.ready(primary, implementation);
-  writeFileSync(join(f.binding.worktreePath, 'code.txt'), 'Synthetic generated implementation.');
+  await generatedWrite(f, primary, implementation, 'code.txt', 'Synthetic generated implementation.');
   await f.report(primary, implementation, { type: 'content-ready', content: { id: 'content1', planId: 'plan1', code: { id: 'code1', digest: 'pending', location: 'current-worktree' }, knowledge: [], maintenance: 'not-needed', deliveryNotes: 'Synthetic immutable result.' } });
   assert.equal(f.store.getDemand('demand').activeContentId, undefined, 'A live writer cannot establish stable content.');
   await f.settled(primary, implementation); assert.equal(f.store.getDemand('demand').activeContentId, 'content1');
@@ -251,17 +254,17 @@ test('restart records stop intent for durable boundary rows without pretending a
   assert.equal(restarted.auxiliaryStatus().safe, false); assert.equal(f.store.getDemand('demand').plans[0]!.ready, false);
 });
 
-async function enterReview(f: ReturnType<typeof syntheticComposition>, options: { localCommit?: boolean; beforeHandoff?: (primary: SyntheticNativePort, implementation: { run: RunRecord; init: WorkerInit }) => void } = {}) {
+async function enterReview(f: ReturnType<typeof syntheticComposition>, options: { localCommit?: boolean; beforeImplementation?: () => void; beforeHandoff?: (primary: SyntheticNativePort, implementation: { run: RunRecord; init: WorkerInit }) => void | Promise<void> } = {}) {
   await f.production.tick(); const primary = f.drivers[0]!, planning = primary.launches[0]!; await f.ready(primary, planning);
   await f.report(primary, planning, { type: 'plan-draft', plan: { id: 'p', scope: 'Only this requested feature', spec: pendingRef('s'), tickets: pendingRef('t'), requiredChecks: [{ id: 'test', name: 'Check requested feature', source: 'demand' }], unresolvedQuestions: [] }, artifactBodies: [{ id: 's', kind: 'plan', text: 'Exact requested behavior.' }, { id: 't', kind: 'plan', text: 'Bounded tickets.' }] });
   await f.settled(primary, planning); const boundaryDriver = f.drivers[1]!, boundary = boundaryDriver.launches[0]!; await f.ready(boundaryDriver, boundary);
   const context = String(f.store.db.prepare('SELECT context_id FROM host_boundary_runs WHERE domain_run_id=?').get(planning.init.domainRunId)!.context_id);
   await f.report(boundaryDriver, boundary, { type: 'plan-ready', planId: 'p', boundaryReview: { contextId: context, planningContextId: f.store.getRun(planning.init.domainRunId).contextId, evidence: pendingRef('b'), unresolvedBlockingFindings: [] }, artifactBodies: [{ id: 'b', kind: 'check-evidence', text: 'Independent boundary observations.' }] });
   await f.settled(boundaryDriver, boundary); await f.production.tick();
-  f.workflow.execute({ type: 'authorize-implementation', requestId: randomUUID(), demandId: 'demand', planId: 'p', confirmDesign: true, localCommit: options.localCommit }, f.user); f.authorize('grant2');
+  f.workflow.execute({ expectedRevision: f.store.getDemand('demand').revision, type: 'authorize-implementation', requestId: randomUUID(), demandId: 'demand', planId: 'p', confirmDesign: true, localCommit: options.localCommit }, f.user); options.beforeImplementation?.(); f.authorize('grant2');
   await f.production.tick(); const implementation = primary.launches[1]!; assert.ok(implementation, JSON.stringify(f.production.diagnostics('demand'))); await f.ready(primary, implementation);
-  writeFileSync(join(f.binding.worktreePath, 'code.txt'), 'Synthetic feature implementation.');
-  options.beforeHandoff?.(primary, implementation);
+  await generatedWrite(f, primary, implementation, 'code.txt', 'Synthetic feature implementation.');
+  await options.beforeHandoff?.(primary, implementation);
   await f.report(primary, implementation, { type: 'content-ready', content: { id: 'c', planId: 'p', code: { id: 'code', digest: 'pending', location: 'current-worktree' }, knowledge: [], maintenance: 'not-needed', deliveryNotes: 'Feature implemented.' } });
   await f.settled(primary, implementation); await f.production.tick();
   const review = primary.launches[2]!; assert.ok(review, JSON.stringify(f.production.diagnostics('demand'))); await f.ready(primary, review); return { primary, review };
@@ -284,7 +287,7 @@ test('late source drift invalidates queued native checks and review before a res
   await f.report(primary, review, { type: 'check', check: { id: 'check', contentId: 'c', requirementId: 'test', status: 'passed', evidence: check, environment: 'Worker cannot select this' } });
   await f.report(primary, review, { type: 'review', reviewId: 'r', contentId: 'c', evidence: pendingRef('r-evidence'), knowledgeReviewed: true, findings: [], artifactBodies: [{ id: 'r-evidence', kind: 'check-evidence', text: 'Observed exact source before external drift.' }] });
   writeFileSync(join(f.binding.worktreePath, 'code.txt'), 'External change after reports.');
-  await assert.rejects(f.settled(primary, review), /Native check does not cover/); await f.production.tick();
+  await assert.rejects(f.settled(primary, review), /Source differs/); await f.production.tick();
   assert.equal(f.store.getDemand('demand').results.length, 0); assert.equal(f.store.getDemand('demand').checks.length, 0); assert.equal(f.production.prerequisites.verifyWorkspaceAfterStop('demand'), false);
 });
 
@@ -311,8 +314,10 @@ test('model data preparation preserves only role-authorized explicitly selected 
   const readIds = f.store.db.prepare('SELECT revision_id FROM knowledge_reads').all().map(row => row.revision_id); assert.ok(readIds.includes('selected')); assert.ok(!readIds.includes('foreign'));
 });
 
-async function completeReview(f: ReturnType<typeof syntheticComposition>, primary: SyntheticNativePort, review: { run: RunRecord; init: WorkerInit }) {
-  const check = await nativeCheck(f, primary, review);
+async function completeReview(f: ReturnType<typeof syntheticComposition>, primary: SyntheticNativePort, review: { run: RunRecord; init: WorkerInit }, shell = false) {
+  let check: { id: string; digest: string; location: string };
+  if (shell) { await primary.emit(review, { type: 'worker.shell-request', requestId: randomUUID(), toolCallId: 'shell-template', args: ['printf synthetic-baseline'] }); const reply = primary.replies.at(-1) as { ok: boolean; value: { evidence: typeof check } }; assert.equal(reply.ok, true); check = reply.value.evidence; }
+  else check = await nativeCheck(f, primary, review);
   await f.report(primary, review, { type: 'check', check: { id: 'pass', contentId: 'c', requirementId: 'test', status: 'passed', evidence: check, environment: 'ignored' } });
   await f.report(primary, review, { type: 'review', reviewId: 'r', contentId: 'c', evidence: pendingRef('r-evidence'), knowledgeReviewed: true, findings: [], artifactBodies: [{ id: 'r-evidence', kind: 'check-evidence', text: 'Independent verified result.' }] });
   await f.settled(primary, review); await f.production.tick();
@@ -322,7 +327,7 @@ async function completeReview(f: ReturnType<typeof syntheticComposition>, primar
 test('return reasons are explicitly approved and carried with the exact returned result into fresh rework', async t => {
   const f = syntheticComposition(t), { primary, review } = await enterReview(f); await completeReview(f, primary, review);
   const result = f.store.getDemand('demand').activeResultId!;
-  f.workflow.execute({ type: 'return-result', requestId: randomUUID(), demandId: 'demand', resultId: result, reason: 'Keep the approved scope; correct the specified edge case.' }, f.user);
+  f.workflow.execute({ expectedRevision: f.store.getDemand('demand').revision, type: 'return-result', requestId: randomUUID(), demandId: 'demand', resultId: result, reason: 'Keep the approved scope; correct the specified edge case.' }, f.user);
   const proposed = f.production.requiredModelData('demand'); assert.ok(proposed.some(item => item.id === 'user-decisions:demand')); assert.ok(proposed.some(item => item.id === 'code'));
   await f.production.tick(); assert.equal(primary.launches.length, 3, 'New user reasons are not automatically covered by old generated-context permission.');
   f.authorize('grant3'); await f.production.tick(); const rework = primary.launches[3]!; assert.ok(rework, JSON.stringify(f.production.diagnostics('demand')));
@@ -334,8 +339,8 @@ test('return reasons are explicitly approved and carried with the exact returned
 test('stopped profile changes replace both native drivers and retain bounded revision instructions', async t => {
   const f = syntheticComposition(t), { primary, review } = await enterReview(f); await completeReview(f, primary, review);
   const result = f.store.getDemand('demand').activeResultId!;
-  f.workflow.execute({ type: 'return-result', requestId: randomUUID(), demandId: 'demand', resultId: result, reason: 'Return before revising the plan.' }, f.user);
-  f.workflow.execute({ type: 'revise-plan', requestId: randomUUID(), demandId: 'demand', previousPlanId: 'p', reason: 'Only adjust the requested edge case.' }, f.user);
+  f.workflow.execute({ expectedRevision: f.store.getDemand('demand').revision, type: 'return-result', requestId: randomUUID(), demandId: 'demand', resultId: result, reason: 'Return before revising the plan.' }, f.user);
+  f.workflow.execute({ expectedRevision: f.store.getDemand('demand').revision, type: 'revise-plan', requestId: randomUUID(), demandId: 'demand', previousPlanId: 'p', reason: 'Only adjust the requested edge case.' }, f.user);
   f.configuration.runtime!.policySha256 = 'b'.repeat(64); f.authorize('grant3'); await f.production.tick();
   const replacement = f.drivers[2]!, planning = replacement?.launches[0]!; assert.ok(planning, JSON.stringify(f.production.diagnostics('demand'))); assert.equal(planning.init.role, 'planning');
   assert.match(planning.init.materials.find(item => item.id === 'user-decisions:demand')!.content, /Only adjust the requested edge case/);
@@ -369,7 +374,7 @@ test('requested local commit preserves user-staged data and does not freeze part
   const f = syntheticComposition(t, () => ({ name: 'Explicit Synthetic Author', email: 'explicit@example.invalid' }));
   await assert.rejects(enterReview(f, { localCommit: true, beforeHandoff() {
     writeFileSync(join(f.binding.worktreePath, 'user.txt'), 'Preexisting user staging must survive.'); git(f.binding.worktreePath, 'add', 'user.txt');
-  } }), /staged work is preserved/);
+  } }), /Source differs|staged work is preserved/);
   assert.equal(git(f.binding.worktreePath, 'diff', '--cached', '--name-only'), 'user.txt'); assert.equal(git(f.binding.worktreePath, 'rev-parse', 'HEAD'), f.binding.head);
   assert.equal(f.store.getDemand('demand').contents.length, 0); assert.equal(f.store.db.prepare("SELECT count(*) AS n FROM workspace_intents WHERE kind='commit'").get()!.n, 0);
 });
@@ -377,4 +382,112 @@ test('requested local commit preserves user-staged data and does not freeze part
 test('unrequested local commit never reads an author and remains honestly uncommitted', async t => {
   let authorReads = 0; const f = syntheticComposition(t, () => { authorReads++; return { name: 'Unused', email: 'unused@example.invalid' }; });
   await enterReview(f); assert.equal(authorReads, 0); assert.equal(git(f.binding.worktreePath, 'rev-parse', 'HEAD'), f.binding.head); assert.ok(git(f.binding.worktreePath, 'status', '--porcelain').includes('code.txt'));
+});
+
+async function generatedWrite(f: ReturnType<typeof syntheticComposition>, driver: SyntheticNativePort, launch: { run: RunRecord; init: WorkerInit }, path: string, content: string) {
+  const requestId = randomUUID(); await driver.emit(launch, { type: 'worker.write-request', requestId, toolCallId: 'write-tool', path, sha256: hash(content), bytes: Buffer.byteLength(content) });
+  assert.equal((driver.replies.at(-1) as { ok: boolean }).ok, true, JSON.stringify(driver.replies.at(-1)));
+  writeFileSync(join(f.binding.worktreePath, path), content);
+  await driver.emit(launch, { type: 'worker.write-complete', requestId });
+  assert.equal((driver.replies.at(-1) as { ok: boolean }).ok, true, JSON.stringify(driver.replies.at(-1)));
+}
+
+test('invalidated selected knowledge stops the existing model session before another provider operation', async t => {
+  const f = syntheticComposition(t), revision = f.knowledge.saveCandidate({ revisionId: 'revoked', knowledgeId: 'revoked-item', projectId: 'project', demandId: 'demand', createdBy: 'prior-author', title: 'Revoked fact', tags: [], body: 'No longer eligible', sourceKind: 'existing-fact', materialKind: 'knowledge', statementKind: 'fact', formalTarget: 'main', roles: ['planner'], modulePaths: [] });
+  f.configuration.provider!.data.push({ id: 'knowledge:revoked', sha256: revision.object.sha256 }); f.authorize('knowledge-grant'); await f.production.tick();
+  const driver = f.drivers[0]!, planning = driver.launches[0]!; await f.ready(driver, planning); assert.equal(f.calls.length, 1);
+  f.knowledge.invalidate({ revisionId: 'revoked', reason: 'Fact is wrong', evidenceRef: 'explicit-revocation' });
+  await driver.emit(planning, { type: 'model.request', sessionId: planning.init.sessionId, sequence: 2, purpose: 'prompt', context: { messages: [{ role: 'user', content: 'No longer eligible', timestamp: 2 }] } });
+  assert.equal(f.calls.length, 1); assert.equal((driver.replies.at(-1) as { error: string }).error, 'KNOWLEDGE_CONTEXT_REVOKED'); assert.equal(driver.stopped.has(planning.run.runId), true);
+});
+
+test('read-only external source changes never acquire generated-context transmission authority', async t => {
+  const f = syntheticComposition(t); await f.production.tick(); const driver = f.drivers[0]!, planning = driver.launches[0]!;
+  writeFileSync(join(f.binding.worktreePath, 'code.txt'), 'Unapproved external edit'); await f.ready(driver, planning);
+  assert.equal(f.calls.length, 0); assert.equal((driver.replies.at(-1) as { error: string }).error, 'READ_ONLY_SOURCE_CHANGED'); assert.equal(driver.stopped.has(planning.run.runId), true);
+});
+
+test('unproven implementation mutations stop egress even after a legitimate controlled write', async t => {
+  const f = syntheticComposition(t);
+  await assert.rejects(enterReview(f, { async beforeHandoff(primary, implementation) {
+    writeFileSync(join(f.binding.worktreePath, 'external.txt'), 'UNAPPROVED external data');
+    await primary.emit(implementation, { type: 'model.request', sessionId: implementation.init.sessionId, sequence: 2, purpose: 'prompt', context: { messages: [{ role: 'user', content: 'UNAPPROVED external data', timestamp: 2 }] } });
+  } }), /Source differs/);
+  assert.equal(f.calls.length, 3); assert.equal(f.store.getDemand('demand').contents.length, 0);
+});
+
+async function integrateNewBaseline(f: ReturnType<typeof syntheticComposition>, shell = false) {
+  const { primary, review } = await enterReview(f, { localCommit: true }); await completeReview(f, primary, review, shell);
+  const result = f.store.getDemand('demand').activeResultId!;
+  writeFileSync(join(f.repo, 'new-baseline.txt'), 'New formal capability input.'); git(f.repo, 'add', 'new-baseline.txt'); git(f.repo, 'commit', '-m', 'Synthetic formal advance');
+  const sourceCommit = git(f.repo, 'rev-parse', 'HEAD'), operationId = 'baseline-integration';
+  const integrated = f.workspace.updateBaseline({ operationId, demandId: 'demand', sourceCommit, formalTarget: 'main', updateAuthorized: true, writerStopped: true, controlState: 'active', author: { name: 'Explicit Integration Author', email: 'integration@example.invalid' } });
+  f.workflow.invalidateCurrentContent('demand', 'Baseline source needs fresh verification.');
+  return { demandId: 'demand', operationId, expectedHead: integrated.head!, templateResultId: result, checkIds: ['pass'] };
+}
+
+test('baseline check-only lane reexecutes native recipes at integrated HEAD without model traffic and retains synthetic provenance', async t => {
+  const f = syntheticComposition(t, () => ({ name: 'Explicit Synthetic Author', email: 'explicit@example.invalid' })), input = await integrateNewBaseline(f), calls = f.calls.length;
+  const result = await f.production.verifyBaselineChecks(input);
+  assert.equal(f.calls.length, calls); assert.equal(result.head, input.expectedHead); assert.equal(result.sourceDigest, f.production.evidence.sourceMaterial('demand').sha256); assert.equal(result.provenance, 'synthetic-native-receipt'); assert.equal(result.stopped, true); assert.equal(result.evidenceRefs.length, 1);
+  const lane = f.drivers.at(-1)!, launch = lane.launches[0]!; assert.equal(launch.init.checkOnly, true); assert.equal(launch.init.role, 'check'); assert.equal(launch.run.writes, false); assert.equal(launch.run.highResource, true); assert.equal(lane.nativeCalls, 1); assert.equal(lane.stopped.has(launch.run.runId), true); assert.equal(f.production.auxiliaryStatus().safe, true);
+  assert.equal(f.store.db.prepare('SELECT count(*) AS n FROM host_native_check_lease').get()!.n, 0);
+  assert.deepEqual(await f.production.verifyBaselineChecks(input), result); assert.equal(lane.nativeCalls, 1, 'Exact completed local verification is idempotent.');
+});
+
+test('paused baseline checks stop promptly without being killed by expected baseline-verification blockers', async t => {
+  const f = syntheticComposition(t, () => ({ name: 'Explicit Synthetic Author', email: 'explicit@example.invalid' })), input = await integrateNewBaseline(f), original = SyntheticNativePort.prototype.runNodeCheck;
+  let release!: () => void, started!: () => void; const runningCheck = new Promise<void>(resolve => { started = resolve; });
+  SyntheticNativePort.prototype.runNodeCheck = async function (...args) { if (this.launches[0]?.init.checkOnly) { started(); await new Promise<void>(resolve => { release = resolve; }); } return original.apply(this, args); };
+  t.after(() => { SyntheticNativePort.prototype.runNodeCheck = original; });
+  const pending = f.production.verifyBaselineChecks(input); const rejection = assert.rejects(pending, /Baseline control/); await runningCheck;
+  const lane = f.drivers.at(-1)!, launch = lane.launches[0]!;
+  await f.production.tick(); assert.equal(lane.stopped.has(launch.run.runId), false, 'Expected source-verification blockers do not cancel the authorized check-only lane.');
+  f.workflow.execute({ expectedRevision: f.store.getDemand('demand').revision, type: 'pause', requestId: randomUUID(), demandId: 'demand' }, f.user); await f.production.tick(); assert.equal(lane.stopped.has(launch.run.runId), true);
+  release(); await rejection; assert.equal(f.production.auxiliaryStatus().safe, true); assert.equal(f.store.db.prepare("SELECT count(*) AS n FROM host_baseline_checks WHERE status='complete'").get()!.n, 0);
+});
+
+test('exact controlled deletion is observed under the Worker token and supports later model context', async t => {
+  const f = syntheticComposition(t);
+  await enterReview(f, { async beforeHandoff(primary, implementation) {
+    await generatedWrite(f, primary, implementation, 'remove.txt', 'Exact generated file to remove.');
+    const requestId = randomUUID(); await primary.emit(implementation, { type: 'worker.write-request', action: 'delete', requestId, toolCallId: 'delete-tool', path: 'remove.txt', sha256: null, bytes: 0 }); assert.equal((primary.replies.at(-1) as { ok: boolean }).ok, true);
+    rmSync(join(f.binding.worktreePath, 'remove.txt')); await primary.emit(implementation, { type: 'worker.write-complete', requestId }); assert.equal((primary.replies.at(-1) as { ok: boolean }).ok, true);
+    await primary.emit(implementation, { type: 'model.request', sessionId: implementation.init.sessionId, sequence: 2, purpose: 'prompt', context: { messages: [{ role: 'user', content: 'Exact generated file was removed.', timestamp: 2 }] } }); assert.equal((primary.replies.at(-1) as { ok: boolean }).ok, true);
+    const receipt = JSON.parse(String(f.store.db.prepare('SELECT body FROM host_generated_writes WHERE request_id=?').get(requestId)!.body)); assert.equal(receipt.action, 'delete'); assert.equal(receipt.status, 'verified');
+  } });
+  assert.equal(f.calls.length, 5);
+});
+
+test('locked Git Bash uses the native receipt lane and exact dependency files without granting runtime directories', async t => {
+  const f = syntheticComposition(t, undefined, true), { primary, review } = await enterReview(f); assert.equal(review.init.shellEnabled, true);
+  const requestId = randomUUID(); await primary.emit(review, { type: 'worker.shell-request', requestId, toolCallId: 'shell-tool', args: ['printf synthetic'] });
+  const reply = primary.replies.at(-1) as { ok: boolean; value: { evidence: { id: string; digest: string; location: string } } }; assert.equal(reply.ok, true); assert.equal(primary.shellCalls, 1);
+  const receipt = JSON.parse(f.production.evidence.read('demand', reply.value.evidence).content); assert.equal(receipt.executable, 'git-bash'); assert.deepEqual(receipt.args, ['printf synthetic']); assert.deepEqual(receipt.nativeEvidence.arguments, ['--noprofile', '--norc', '-c', 'printf synthetic']);
+  assert.ok(primary.bootstraps[0]!.readonlyRuntimeRoots.some(path => path.endsWith('runtime.dll'))); assert.ok(primary.bootstraps[0]!.readonlyRuntimeRoots.every(path => !path.endsWith('git-bash')));
+});
+
+test('shell-generated source mutation stops model transmission instead of becoming an approved write', async t => {
+  const f = syntheticComposition(t, undefined, true);
+  await assert.rejects(enterReview(f, { async beforeHandoff(primary, implementation) {
+    primary.onShellCheck = () => writeFileSync(join(f.binding.worktreePath, 'code.txt'), 'Unproven shell-generated source');
+    await primary.emit(implementation, { type: 'worker.shell-request', requestId: randomUUID(), toolCallId: 'shell-write', args: ['attempt synthetic mutation'] });
+    assert.equal((primary.replies.at(-1) as { error: string }).error, 'UNPROVEN_SOURCE_MUTATION'); assert.equal(primary.stopped.has(implementation.run.runId), true);
+  } }), /Source differs/);
+  assert.equal(f.calls.length, 3); assert.equal(f.store.getDemand('demand').contents.length, 0);
+});
+
+test('read-approved preexisting user files never become local commit authority', async t => {
+  const f = syntheticComposition(t, () => ({ name: 'Explicit Synthetic Author', email: 'explicit@example.invalid' }));
+  await assert.rejects(enterReview(f, { localCommit: true, beforeImplementation() { writeFileSync(join(f.binding.worktreePath, 'user-owned.txt'), 'Existing user work approved for reading only.'); } }), /Unrelated preexisting dirty files/);
+  assert.equal(git(f.binding.worktreePath, 'rev-parse', 'HEAD'), f.binding.head); assert.equal(readFileSync(join(f.binding.worktreePath, 'user-owned.txt'), 'utf8'), 'Existing user work approved for reading only.');
+  assert.equal(f.store.getDemand('demand').contents.length, 0); assert.equal(f.store.db.prepare("SELECT count(*) AS n FROM workspace_intents WHERE kind='commit'").get()!.n, 0);
+});
+
+test('fresh baseline replay preserves the locked Git Bash recipe instead of substituting Node', async t => {
+  const f = syntheticComposition(t, () => ({ name: 'Explicit Synthetic Author', email: 'explicit@example.invalid' }), true), input = await integrateNewBaseline(f, true), calls = f.calls.length;
+  const verified = await f.production.verifyBaselineChecks(input), lane = f.drivers.at(-1)!;
+  assert.equal(lane.shellCalls, 1); assert.equal(lane.nativeCalls, 0); assert.equal(f.calls.length, calls);
+  const ref = f.production.evidence.reference('demand', verified.evidenceRefs[0]!), receipt = JSON.parse(f.production.evidence.read('demand', ref).content);
+  assert.equal(receipt.executable, 'git-bash'); assert.deepEqual(receipt.args, ['printf synthetic-baseline']); assert.equal(receipt.head, input.expectedHead); assert.equal(verified.stopped, true);
 });

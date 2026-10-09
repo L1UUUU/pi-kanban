@@ -1,10 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash, generateKeyPairSync, randomUUID, sign } from 'node:crypto';
-import { mkdtempSync, writeFileSync, rmSync, symlinkSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, rmSync, symlinkSync, mkdirSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { verifyWindowsEvidence, requireWindowsProbeCoverage, validateWindowsEvidenceTrustAnchor, REQUIRED_WINDOWS_PROBES, WINDOWS_RECORDER_ID, MAX_WINDOWS_EVIDENCE_BYTES } from '../src/runtime/evidence-auth.ts';
+import { verifyWindowsEvidence, requireWindowsProbeCoverage, validateWindowsEvidenceTrustAnchor, REQUIRED_WINDOWS_PROBES, REQUIRED_WINDOWS_SHELL_PROBES, WINDOWS_RECORDER_ID, MAX_WINDOWS_EVIDENCE_BYTES } from '../src/runtime/evidence-auth.ts';
 import type { WindowsEvidenceReport, ExpectedWindowsEvidence, WindowsEvidenceTrustAnchor, WindowsEvidenceEnvelope } from '../src/runtime/evidence-auth.ts';
 import { verifyWindowsRuntimeProfile, VerifiedRuntimeProfile, assertVerifiedProfile, loadInstalledWindowsEvidenceTrust, INSTALLED_WINDOWS_EVIDENCE_TRUST_FILE } from '../src/runtime/profile.ts';
 
@@ -106,7 +106,7 @@ test('trust accepts only bounded Ed25519 public material, never private or diffe
   const validated = validateWindowsEvidenceTrustAnchor(trust); assert.deepEqual(validated, trust); assert.ok(Object.isFrozen(validated));
 });
 function installation(t: test.TestContext) {
-  const root = mkdtempSync(join(tmpdir(), 'synthetic-recorder-trust-'));
+  const root = realpathSync.native(mkdtempSync(join(tmpdir(), 'synthetic-recorder-trust-')));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const path = join(root, INSTALLED_WINDOWS_EVIDENCE_TRUST_FILE), content = bytes({ schemaVersion: 1, ...trust });
   writeFileSync(path, content); return { root, path, content };
@@ -145,4 +145,56 @@ test('authentic-looking evidence never bypasses native platform gate or default 
   const platformSupported = process.platform === 'win32' && process.arch === 'x64';
   assert.throws(() => verifyWindowsRuntimeProfile(input, tmpdir()), { code: platformSupported ? 'EVIDENCE_TRUST_REQUIRED' : 'WINDOWS_PROFILE_REQUIRED' });
   if (!platformSupported) assert.throws(() => verifyWindowsRuntimeProfile(input, tmpdir(), trust), { code: 'WINDOWS_PROFILE_REQUIRED' });
+});
+
+
+test('Git Bash evidence binds executable, version, kind and manifest exactly, including shell presence', () => {
+  const { report, expected } = fixture();
+  const shell = { ...binary('bash.exe'), kind: 'git-bash' as const, manifest: { path: 'C:\\Synthetic\\shell-manifest.json', sha256: 'd'.repeat(64) } };
+  expected.shell = shell; report.bindings.shell = structuredClone(shell);
+  report.probes.push({ id: 'git-bash-compatibility', passed: true, observation: 'SYNTHETIC shell parser fixture only.' });
+  assert.deepEqual(verifyWindowsEvidence(bytes(envelope(report)), expected, trust).bindings.shell, shell);
+  for (const field of ['path', 'version', 'sha256', 'kind'] as const) {
+    const altered = structuredClone(report); (altered.bindings.shell as unknown as Record<string, string>)[field] += '-changed';
+    assert.throws(() => verifyWindowsEvidence(bytes(envelope(altered)), expected, trust), { code: 'EVIDENCE_INAPPLICABLE' });
+  }
+  for (const field of ['path', 'sha256'] as const) {
+    const altered = structuredClone(report); altered.bindings.shell!.manifest[field] += '-changed';
+    assert.throws(() => verifyWindowsEvidence(bytes(envelope(altered)), expected, trust), { code: 'EVIDENCE_INAPPLICABLE' });
+  }
+  for (const disabled of [null, undefined]) {
+    const altered = structuredClone(report); altered.bindings.shell = disabled;
+    assert.throws(() => verifyWindowsEvidence(bytes(envelope(altered)), expected, trust), { code: 'EVIDENCE_INAPPLICABLE' });
+    assert.throws(() => verifyWindowsEvidence(bytes(envelope(report)), { ...expected, shell: disabled }, trust), { code: 'EVIDENCE_INAPPLICABLE' });
+  }
+});
+test('Node-only profiles retain their existing probe gate; enabling Git Bash adds its actual compatibility probe', () => {
+  const { report, expected } = fixture();
+  for (const shell of [null, undefined]) {
+    const altered = structuredClone(report); altered.bindings.shell = shell;
+    verifyWindowsEvidence(bytes(envelope(altered)), { ...expected, shell }, trust);
+  }
+  requireWindowsProbeCoverage(REQUIRED_WINDOWS_PROBES, false);
+  assert.throws(() => requireWindowsProbeCoverage(REQUIRED_WINDOWS_PROBES, true), { code: 'EVIDENCE_INCOMPLETE' });
+  requireWindowsProbeCoverage([...REQUIRED_WINDOWS_PROBES, ...REQUIRED_WINDOWS_SHELL_PROBES], true);
+});
+
+
+test('legacy strict signatures cannot authorize the registry-read candidate or a substituted policy variant', () => {
+  const { report, expected } = fixture();
+  const strict = 'lpac-strict-v1' as const, registry = 'lpac-registry-read-no-network-v2' as const;
+  // Missing variant is backwards compatible with strict only, in either direction.
+  verifyWindowsEvidence(bytes(envelope(report)), { ...expected, policyVariant: strict }, trust);
+  const strictReport = { ...report, bindings: { ...report.bindings, policyVariant: strict } };
+  verifyWindowsEvidence(bytes(envelope(strictReport)), expected, trust);
+  assert.throws(() => verifyWindowsEvidence(bytes(envelope(report)), { ...expected, policyVariant: registry }, trust), { code: 'EVIDENCE_INAPPLICABLE' });
+  assert.throws(() => verifyWindowsEvidence(bytes(envelope(strictReport)), { ...expected, policyVariant: registry }, trust), { code: 'EVIDENCE_INAPPLICABLE' });
+  const candidateReport = { ...report, bindings: { ...report.bindings, policyVariant: registry } };
+  assert.throws(() => verifyWindowsEvidence(bytes(envelope(candidateReport)), expected, trust), { code: 'EVIDENCE_INAPPLICABLE' });
+  assert.throws(() => verifyWindowsEvidence(bytes(envelope(candidateReport)), { ...expected, policyVariant: strict }, trust), { code: 'EVIDENCE_INAPPLICABLE' });
+  verifyWindowsEvidence(bytes(envelope(candidateReport)), { ...expected, policyVariant: registry }, trust);
+  for (const policyVariant of [null, '', 'unrestricted-network', false]) {
+    const invalidReport = { ...report, bindings: { ...report.bindings, policyVariant } };
+    assert.throws(() => verifyWindowsEvidence(bytes(envelope(invalidReport)), expected, trust), { code: 'EVIDENCE_INAPPLICABLE' });
+  }
 });

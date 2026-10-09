@@ -11,7 +11,7 @@ import type { Demand, Methods, RunAttempt, Stage, WorkerReport } from '../domain
 import { KnowledgeService } from '../knowledge/index.ts';
 import type { KnowledgeRole } from '../knowledge/index.ts';
 import { WorkspaceService, canonicalJson } from '../workspace/index.ts';
-import { noLinks } from '../workspace/paths.ts';
+import { noLinks, sourcePath } from '../workspace/paths.ts';
 import { ModelBudgetLedger } from '../runtime/budget.ts';
 import type { ModelGrant } from '../runtime/budget.ts';
 import { ModelBroker } from '../runtime/model-broker.ts';
@@ -21,15 +21,18 @@ import { verifyWindowsRuntimeProfile } from '../runtime/profile.ts';
 import type { VerifiedRuntimeProfile, LockedRuntimeProfile, WindowsEvidenceTrustAnchor } from '../runtime/profile.ts';
 import { VerifiedWindowsDriver } from '../runtime/verified-windows-driver.ts';
 import { appContainerProfileName } from '../runtime/appcontainer-name.ts';
-import type { WindowsRunBootstrap } from '../runtime/verified-windows-driver.ts';
+import type { WindowsRunBootstrap, NativeCheckResult } from '../runtime/verified-windows-driver.ts';
+import { readLockedShellManifest } from '../runtime/shell-profile.ts';
 import { RuntimeError } from '../runtime/types.ts';
 import type { RuntimeDriver, RunRecord, Observation } from '../runtime/types.ts';
 import { loadMethods, runtimeProfileInput } from './configuration.ts';
 import type { WorkbenchConfiguration, ProviderConfiguration } from './configuration.ts';
 import type { ExecutionPrerequisites } from './coordinator.ts';
+import type { BaselineCheckRequest, BaselineCheckVerification } from './knowledge-lifecycle.ts';
 import { ExecutionCoordinator } from './coordinator.ts';
 import { RuntimeSupervisor } from '../runtime/supervisor.ts';
 import { ProductionEvidence, hash, planMaterial } from './evidence.ts';
+import type { SourceSnapshot } from './evidence.ts';
 
 function insist(value: unknown, code: string, message: string): asserts value { if (!value) throw new RuntimeError(code, message); }
 function reason(error: unknown): string { return error instanceof RuntimeError ? `${error.code}: ${error.message}` : 'HOST_RESOURCE_UNAVAILABLE: A required local resource could not be verified.'; }
@@ -114,11 +117,11 @@ export interface ProductionOptions {
   resolveCredential?: (reference: string) => string;
 }
 export interface ProductionDiagnostics { executionEnabled: boolean; blockers: string[]; profileVerified: boolean; budgetAvailable: boolean; workspaceVerified: boolean }
-interface ActiveChannel { run: RunAttempt; runtime: RunRecord; init: WorkerInit; endpoint: HostPiBrokerEndpoint; abort: AbortController; ready: boolean; settled: boolean; modelObserved: boolean; pending: WorkerReport[]; handoffs: string[]; grantId: string; boundary: boolean; contextId: string; }
+interface ActiveChannel { run: RunAttempt; runtime: RunRecord; init: WorkerInit; sourceScope: AgentMaterial; pendingWrite?: { requestId: string; action: 'write'|'delete'; path: string; sha256: string|null; bytes: number; before: SourceSnapshot }; endpoint: HostPiBrokerEndpoint; abort: AbortController; ready: boolean; settled: boolean; modelObserved: boolean; pending: WorkerReport[]; handoffs: string[]; grantId: string; boundary: boolean; contextId: string; }
 
 /** Executable composition, with an intentionally denied state whenever a real prerequisite
  * is missing. This factory never manufactures an executable profile or model grant. */
-type NativeDriverPort = RuntimeDriver & Pick<VerifiedWindowsDriver, 'setStopHandler' | 'setWorkerFrameHandler' | 'sendWorkerFrame' | 'getResourceEvidence' | 'runNodeCheck'>;
+type NativeDriverPort = RuntimeDriver & Pick<VerifiedWindowsDriver, 'setStopHandler' | 'setWorkerFrameHandler' | 'sendWorkerFrame' | 'getResourceEvidence' | 'runNodeCheck'> & { runShellCheck?: (runId: string, args: string[], limits: { timeoutMs: number; maxOutputBytes: number }, requestId?: string) => Promise<NativeCheckResult> };
 export interface SyntheticProductionAdapters {
   profile: LockedRuntimeProfile;
   createDriver: (bootstrap: (run: RunRecord) => WindowsRunBootstrap) => NativeDriverPort;
@@ -133,11 +136,14 @@ export function createProductionServices(options: ProductionOptions) { return co
 function composeProductionServices(options: ProductionOptions, synthetic?: SyntheticProductionAdapters) {
   const evidence = new ProductionEvidence(options.store.db, options.workspace);
   const channels = new Map<string, ActiveChannel>();
+  const checkLanes = new Map<string, { driver: NativeDriverPort; supervisor: RuntimeSupervisor; authorize: () => void }>();
   let coordinator: ExecutionCoordinator | undefined, native: NativeDriverPort | undefined, profile: VerifiedRuntimeProfile | undefined, profileDigest = '';
   options.store.db.exec(`CREATE TABLE IF NOT EXISTS host_boundary_runs(domain_run_id TEXT PRIMARY KEY,plan_id TEXT NOT NULL,context_id TEXT NOT NULL,runtime_run_id TEXT,status TEXT NOT NULL,body TEXT);
     CREATE TABLE IF NOT EXISTS host_native_revocations(run_id TEXT PRIMARY KEY,evidence TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS host_native_check_lease(singleton INTEGER PRIMARY KEY CHECK(singleton=1),runtime_run_id TEXT NOT NULL,request_id TEXT NOT NULL);
-    CREATE TABLE IF NOT EXISTS host_native_checks(request_id TEXT PRIMARY KEY,runtime_run_id TEXT NOT NULL,domain_run_id TEXT NOT NULL,artifact_id TEXT NOT NULL,body TEXT NOT NULL);`);
+    CREATE TABLE IF NOT EXISTS host_native_checks(request_id TEXT PRIMARY KEY,runtime_run_id TEXT NOT NULL,domain_run_id TEXT NOT NULL,artifact_id TEXT NOT NULL,body TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS host_generated_writes(request_id TEXT PRIMARY KEY,runtime_run_id TEXT NOT NULL,body TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS host_baseline_checks(operation_key TEXT PRIMARY KEY,runtime_run_id TEXT,body TEXT NOT NULL,status TEXT NOT NULL);`);
   let boundaryNative: NativeDriverPort | undefined, boundarySupervisor: RuntimeSupervisor | undefined;
   let stopHandler: ((runId: string, reason: string) => Promise<void>) | undefined;
   const stateDirectory = resolve(options.stateDirectory);
@@ -153,8 +159,8 @@ function composeProductionServices(options: ProductionOptions, synthetic?: Synth
     for (const stage of ['planning', 'implementation', 'review'] as const) if (loaded.methods[stage]) evidence.freezeMethod(loaded.methods[stage]!, loaded.materials[stage]);
     return loaded.methods;
   }
-  function makeNative(): NativeDriverPort {
-    const candidate = synthetic ? synthetic.createDriver(bootstrap) : new VerifiedWindowsDriver(profile!, bootstrap, join(stateDirectory, 'native-recovery'));
+  function makeNative(bootstrapper: (run: RunRecord) => WindowsRunBootstrap = bootstrap): NativeDriverPort {
+    const candidate = synthetic ? synthetic.createDriver(bootstrapper) : new VerifiedWindowsDriver(profile!, bootstrapper, join(stateDirectory, 'native-recovery'));
     insist(!synthetic || candidate.isolation === 'synthetic-process-supervision-only', 'SYNTHETIC_DRIVER_REQUIRED', 'Synthetic composition cannot launch a real native driver.'); return candidate;
   }
   function makeTransport(configuration: ProviderConfiguration) {
@@ -185,7 +191,7 @@ function composeProductionServices(options: ProductionOptions, synthetic?: Synth
     async observe(run) { const target = recoveryDriver(run), result = target ? await target.observe(run) : unknown(run); retainRevocation(run.runId, target); return result; },
     async recoverUnregistered(run) { const target = recoveryDriver(run), result = target?.recoverUnregistered ? await target.recoverUnregistered(run) : unknown(run); retainRevocation(run.runId, target); return result; },
   };
-  function recoveryDriver(run: RunRecord): NativeDriverPort | undefined { try { return (run.role === 'boundary-review' ? boundaryNative : native) ?? refreshNative(); } catch { return undefined; } }
+  function recoveryDriver(run: RunRecord): NativeDriverPort | undefined { try { return (run.role === 'check' ? checkLanes.get(run.runId)?.driver : run.role === 'boundary-review' ? boundaryNative : native) ?? refreshNative(); } catch { return undefined; } }
   function retainRevocation(id: string, driver: NativeDriverPort | undefined): void { const resource = driver?.getResourceEvidence(id); if (resource?.provisioned && resource.revoked && resource.status === 0) { options.store.db.prepare('INSERT OR IGNORE INTO host_native_revocations VALUES(?,?)').run(id, canonicalJson(resource)); options.store.db.prepare('DELETE FROM host_native_check_lease WHERE runtime_run_id=?').run(id); } }
   function unknown(run: RunRecord): Observation { return { state: 'unknown', generation: run.generation, activePids: [], proof: 'No matching verified native controller; absence is not process-tree evidence.' }; }
   function selectGrant(demandId: string, role: string): ModelGrant {
@@ -230,6 +236,8 @@ function composeProductionServices(options: ProductionOptions, synthetic?: Synth
     const materials = evidence.method(method);
     const input = canonicalJson({ title: demand.title, description: demand.description, messages: demand.messages.map(message => ({ id: message.id, text: message.text, kind: message.kind })) });
     materials.push({ id: `demand-input:${demand.id}`, kind: 'plan', sha256: hash(input), content: input });
+    const projectChecks = canonicalJson({ projectId: demand.projectId, requiredChecks: options.store.getProject(demand.projectId).baseChecks });
+    materials.push({ id: `project-checks:${demand.projectId}`, kind: 'plan', sha256: hash(projectChecks), content: projectChecks });
     materials.push(...decisionMaterials(demand));
     const source = evidence.sourceMaterial(demand.id); materials.push(source);
     const plan = demand.plans.find(plan => plan.id === demand.activePlanId);
@@ -283,6 +291,7 @@ function composeProductionServices(options: ProductionOptions, synthetic?: Synth
     if (!demandId) return { executionEnabled: false, blockers: [...blockers, 'Select a demand to verify its frozen methods, dedicated worktree, and finite data/model approval.'], profileVerified, budgetAvailable, workspaceVerified };
     try {
       const demand = options.store.getDemand(demandId), stage = stageFor(demand);
+      insist(!(coordinator?.supervisor.list() ?? []).some(run => run.demandId === demandId && run.role === 'check' && run.state !== 'stopped'), 'LOCAL_CHECK_PENDING', 'Fresh baseline capability checks occupy this exact source; no Agent session may start concurrently.');
       if (stage === 'implementation' && demand.grant?.localCommit) commitAuthor(demand.id);
       evidence.method(demand.methodSnapshot[stage]!);
       const source = evidence.sourceMaterial(demandId); workspaceVerified = !!source.sha256;
@@ -306,6 +315,18 @@ function composeProductionServices(options: ProductionOptions, synthetic?: Synth
     insist(runtime && ['launch_intent', 'running'].includes(runtime.state) && runtime.stopReason === null, 'RUNTIME_STOPPING', 'Durable runtime stop intent forbids further model requests.');
     insist(!channel.abort.signal.aborted && (channel.boundary ? ['starting', 'running', 'stopped'].includes(run.status) : ['starting', 'running'].includes(run.status)) && demand.control === 'active' && !demand.blockedReasons.length && run.generation === channel.run.generation && run.cycle === demand.cycle && (!run.planId || run.planId === demand.activePlanId) && (!run.contentId || run.contentId === demand.activeContentId), 'RUN_AUTHORITY_CHANGED', 'This model context no longer belongs to the current active authorized generation.');
   }
+  function verifyLiveInputs(channel: ActiveChannel): void {
+    insist(!channel.pendingWrite, 'SOURCE_WRITE_PENDING', 'A source mutation has not yet received independent Host verification.');
+    const source = evidence.sourceMaterial(channel.run.demandId);
+    insist(source.sha256 === channel.sourceScope.sha256, channel.runtime.writes ? 'UNPROVEN_SOURCE_MUTATION' : 'READ_ONLY_SOURCE_CHANGED', 'Source differs from approved inputs or Host-observed controlled writes. Stop and explicitly review external or command-generated changes before further model transmission.');
+    const selected = channel.init.materials.filter(material => material.id.startsWith('knowledge:'));
+    if (!selected.length) return;
+    const demand = options.store.getDemand(channel.run.demandId), binding = options.workspace().getBinding(demand.id)!, project = options.workspace().getProject(demand.projectId);
+    const role: KnowledgeRole = channel.boundary || channel.run.stage === 'review' ? 'reviewer' : channel.run.stage === 'planning' ? 'planner' : 'implementer';
+    const manifest = options.knowledge.createContext({ runId: `revalidate-${randomUUID()}`, projectId: demand.projectId, demandId: demand.id, role, baseline: binding.currentBaseline, formalTarget: project.formalTarget, environment: nativeEnvironment(channel.runtime), allowedRevisionIds: selected.map(material => material.id.slice('knowledge:'.length)), purpose: 'Revalidate exact selected knowledge before outbound model operation' });
+    insist(manifest.revisionIds.length === selected.length, 'KNOWLEDGE_CONTEXT_REVOKED', 'Selected knowledge was invalidated or lost its exact role/baseline/environment eligibility. Rebuild the session before further transmission.');
+    for (const material of selected) { const item = options.knowledge.read(manifest.contextId, material.id.slice('knowledge:'.length)); insist(item.object.sha256 === material.sha256 && hash(item.body) === material.sha256, 'KNOWLEDGE_CONTEXT_CHANGED', 'Selected knowledge changed since this session was approved.'); }
+  }
   function bootstrap(runtime: RunRecord): WindowsRunBootstrap {
     insist(coordinator && profile, 'HOST_CHANNEL_UNBOUND', 'Bind the coordinator before native launch.');
     const run = options.store.getRun(runtime.grantId), demand = options.store.getDemand(run.demandId), boundary = runtime.role === 'boundary-review', grant = selectGrant(run.demandId, runtime.role);
@@ -317,32 +338,31 @@ function composeProductionServices(options: ProductionOptions, synthetic?: Synth
     const scratch = join(stateDirectory, 'runs', runtime.runId); noLinks(scratch, true); mkdirSync(scratch, { recursive: true, mode: 0o700 }); noLinks(scratch);
     const sessionDir = join(scratch, 'session'); mkdirSync(sessionDir, { mode: 0o700 });
     const init: WorkerInit = { version: 1, type: 'worker.init', runId: runtime.runId, generation: runtime.generation, domainRunId: run.id, domainGeneration: run.generation, demandId: run.demandId, role: runtime.role,
-      workspace: runtime.workspace, scratch, sessionDir, sessionId: randomUUID(), capability: randomBytes(32).toString('hex'), materials,
+      workspace: runtime.workspace, scratch, sessionDir, sessionId: randomUUID(), capability: randomBytes(32).toString('hex'), materials, shellEnabled: !!profile.config.shell,
       prompt: `Carry out only the ${runtime.role} task in the supplied frozen method and approved inputs. Use controlled_report for immutable evidence. Artifact bodies may be supplied as artifactBodies:[{id,kind,text}] alongside the report; references can use {id,digest:'pending',location:'host-artifact'} and the Host replaces only registered matching bodies. Check evidence must use the exact evidence reference returned by a completed controlled_node tool. Only native receipts with reason exited and exitCode zero can support passed checks. All existing references use pi-object:<SHA256>:<UTF8 byte count>. For content-ready use code.location="current-worktree" and the Host will capture source only after actual process-tree stop. plan-ready requires an actually observed separate boundary review; never invent its identity or evidence. Report blocked if a required capability or independent review is unavailable. User controls and permissions are Host-owned.`,
       model: { provider: transport.provider, id: transport.modelId, contextWindow: transport.model.contextWindow, maxTokens: Math.min(8192, transport.model.maxTokens) },
       compaction: { enabled: false, reserveTokens: 8192, keepRecentTokens: 4096 }, retry: { enabled: false, maxRetries: 0, baseDelayMs: 0 }, limits: { maxFileBytes: 1024 * 1024, commandTimeoutMs: 120_000, maxOutputBytes: 1024 * 1024 } };
     let endpoint!: HostPiBrokerEndpoint, channel!: ActiveChannel;
-    const broker = new ModelBroker({ ledger: options.budget, transport, realChannelVerified: !synthetic, readMaterial: async id => endpoint.readMaterial(id), authorizeRun: (id, demandId, role) => { insist(id === runtime.runId && demandId === run.demandId && role === runtime.role, 'CHANNEL_IDENTITY_DENIED', 'Broker run scope mismatch.'); assertRun(channel); } });
+    const broker = new ModelBroker({ ledger: options.budget, transport, realChannelVerified: !synthetic, readMaterial: async id => endpoint.readMaterial(id), authorizeRun: (id, demandId, role) => { insist(id === runtime.runId && demandId === run.demandId && role === runtime.role, 'CHANNEL_IDENTITY_DENIED', 'Broker run scope mismatch.'); assertRun(channel); verifyLiveInputs(channel); } });
     endpoint = new HostPiBrokerEndpoint({ db: options.store.db, ledger: options.budget, broker, binding: { runId: runtime.runId, generation: runtime.generation, sessionId: init.sessionId, capability: init.capability, grantId: grant.id, role: runtime.role, reserveTokens: transport.reserveTokens, reserveCostMicros: transport.reserveCostMicros },
       authorizeRun: () => assertRun(channel), authorizeContext: async (material: BrokerMaterial) => {
         assertRun(channel); insist(channel.ready && profile && (boundary ? boundaryNative : native)?.getResourceEvidence(runtime.runId)?.provisioned === true, 'WORKER_NOT_READY', 'Native private Worker context has not been observed ready.');
         const current = selectGrant(run.demandId, runtime.role); insist(current.id === grant.id, 'MODEL_GRANT_CHANGED', 'The bound grant cannot be silently replaced.'); approvedMaterials(current, materials);
         insist((current as ModelGrant & { contextPolicy?: string }).contextPolicy === 'approved-run-derived-v1', 'CONTEXT_PERMISSION_MISSING', 'Generated run context was not explicitly approved.');
-        const currentSource = evidence.sourceMaterial(run.demandId);
-        insist(runtime.writes || currentSource.sha256 === materials.find(input => input.id === currentSource.id)?.sha256, 'READ_ONLY_SOURCE_CHANGED', 'Source changed outside the exact approved read-only session.');
+        verifyLiveInputs(channel);
         insist(Buffer.byteLength(material.text) <= MAX_CONTEXT_BYTES, 'CONTEXT_TOO_LARGE', 'Generated context exceeds the bounded data channel.');
         return { decisionId: current.decisionId };
       } });
     if (boundary) init.prompt = `Artifact references may use {id,digest:'pending',location:'host-artifact'} matching artifactBodies. Independently review the exact current plan ${run.planId} against the supplied source, scope and review method. You have a new empty read-only session with context ${contextId}; planning context is ${run.contextId}. No planner conversation or summaries are supplied. Report plan-ready only after checking boundary, tickets, acceptance/check coverage, scope, and unresolved questions, with boundaryReview:{contextId:'${contextId}',planningContextId:'${run.contextId}',evidence:<registered artifact ref>,unresolvedBlockingFindings:[]}. Include artifactBodies:[{id,kind:'check-evidence',text}] with concrete review observations and references. Report blocked if any unresolved blocker exists. Never claim to have run a check without an observed controlled_node result.`;
-    channel = { run, runtime, init, endpoint, abort: new AbortController(), ready: false, settled: false, modelObserved: false, pending: [], handoffs: [], grantId: grant.id, boundary, contextId }; channels.set(runtime.runId, channel);
+    channel = { run, runtime, init, sourceScope: materials.find(material => material.id === `source-scope:${run.demandId}`)!, endpoint, abort: new AbortController(), ready: false, settled: false, modelObserved: false, pending: [], handoffs: [], grantId: grant.id, boundary, contextId }; channels.set(runtime.runId, channel);
     evidence.recordRun(boundary ? { ...run, id: `boundary-${runtime.runId}`, stage: 'review', contextId } : run, { materials, source: materials.find(m => m.id === `source-scope:${run.demandId}`)!, role: runtime.role, sessionId: init.sessionId, runtimeRunId: runtime.runId, generation: runtime.generation });
     if (boundary) options.store.db.prepare('UPDATE host_boundary_runs SET runtime_run_id=?,body=? WHERE domain_run_id=?').run(runtime.runId, canonicalJson({ materials, source: materials.find(m => m.kind === 'source'), sessionId: init.sessionId }), run.id);
     // Compatibility field name: these are exact pinned files, never parent
     // directories. Native ACLs grant only these files and ancestor traversal.
-    const roots = [...new Set([profile.config.node.path, profile.config.worker.path])];
+    const roots = [...new Set([profile.config.node.path, profile.config.worker.path, ...(profile.config.shell ? readLockedShellManifest(profile.config.shell).files.map(file => file.path) : [])])];
     for (const file of roots) { noLinks(file); for (const protectedPath of [stateDirectory, ...options.store.listProjects().map(project => project.rootPath)]) { const rel = relative(protectedPath, file); insist(rel.startsWith('..') || isAbsolute(rel), 'RUNTIME_ROOT_UNSAFE', 'Pinned runtime files must remain outside mutable project source and Host state.'); } }
     return { profileName: appContainerProfileName(runtime.demandId, runtime.role, runtime.generation), scratch,
-      aclEvidence: profile.evidenceDigests.join(','), privateChannelEvidence: profile.evidenceDigests.join(','), processLimit: 8, memoryLimitBytes: 1024 * 1024 * 1024, workerInit: init as unknown as Record<string, unknown>,
+      aclEvidence: profile.evidenceDigests.join(','), privateChannelEvidence: profile.evidenceDigests.join(','), processLimit: 8, memoryLimitBytes: 1024 * 1024 * 1024, diskLimitBytes: 1024 * 1024 * 1024, fileLimit: 100_000, minimumFreeBytes: 256 * 1024 * 1024, diskPollMs: 250, workerInit: init as unknown as Record<string, unknown>,
       resourceAuthorizationId: grant.decisionId, readonlyRuntimeRoots: roots } as WindowsRunBootstrap;
   }
   function ingestReport(channel: ActiveChannel, input: unknown): WorkerReport {
@@ -386,6 +406,8 @@ function composeProductionServices(options: ProductionOptions, synthetic?: Synth
     const paths = changes.map(change => change.slice(3)).sort();
     insist(paths.length <= 1024 && paths.join('').length <= 24_000, 'LOCAL_COMMIT_SCOPE_TOO_LARGE', 'The exact local-commit path list exceeds its finite command bound.');
     if (!paths.length) return; // No invented empty commit or new baseline.
+    const generated = new Set(options.store.db.prepare('SELECT body FROM host_generated_writes WHERE runtime_run_id=?').all(channel.runtime.runId).map(row => JSON.parse(String(row.body)) as { status: string; path: string }).filter(write => write.status === 'verified').map(write => write.path));
+    insist(paths.every(path => generated.has(path)), 'LOCAL_COMMIT_UNRELATED_DIRTY', 'Unrelated preexisting dirty files are preserved. Reading approved source does not grant permission to commit it; only this run\'s verified generated-write paths may enter the local commit.');
     const expectedFiles = Object.fromEntries(paths.map(path => [path, files.get(path) ?? null]));
     const operationId = `content-${hash(`${channel.run.id}:${channel.run.generation}`).slice(0, 40)}`;
     workspace.commit({ operationId, demandId: demand.id, expectedHead: binding.head, paths, expectedFiles, message: `Save verified demand implementation (${demand.id})`, author, commitAuthorized: true, writerStopped: true });
@@ -399,6 +421,12 @@ function composeProductionServices(options: ProductionOptions, synthetic?: Synth
     retainRevocation(channel.runtime.runId, channel.boundary ? boundaryNative : native);
     insist(options.store.db.prepare('SELECT 1 FROM host_native_revocations WHERE run_id=?').get(channel.runtime.runId), 'NATIVE_REVOCATION_UNVERIFIED', 'Terminal artifacts require durable successful native resource revocation.');
     if (aborted) { channel.pending.length = 0; channel.handoffs.length = 0; options.workflow.blockDemand(channel.run.demandId, 'WORKER_ABORTED', 'An aborted session cannot establish a completed stage handoff.'); return; }
+    try { verifyLiveInputs(channel); }
+    catch (error) {
+      options.workflow.blockDemand(channel.run.demandId, 'TERMINAL_INPUTS_CHANGED', error instanceof Error ? error.message : 'Terminal inputs could not be verified.');
+      if (channel.run.stage === 'planning') options.store.db.prepare("UPDATE host_boundary_runs SET status='failed' WHERE domain_run_id=? AND status!='complete'").run(channel.run.id);
+      throw error;
+    }
     for (const queued of channel.pending) {
       if (queued.type === 'content-ready' && options.store.getDemand(channel.run.demandId).grant?.localCommit) {
         try {
@@ -463,7 +491,9 @@ function composeProductionServices(options: ProductionOptions, synthetic?: Synth
     if (value.type === 'model.request') {
       const request = parsePiModelFrame(frame);
       try { const response = await channel.endpoint.handle(frame, channel.abort.signal); channel.modelObserved = true; targetDriver.sendWorkerFrame(runtime.runId, { sequence: request.sequence, ok: true, value: response }); }
-      catch (error) { targetDriver.sendWorkerFrame(runtime.runId, { sequence: request.sequence, ok: false, error: error instanceof RuntimeError ? error.code : 'MODEL_CHANNEL_ERROR' }); }
+      catch (error) { targetDriver.sendWorkerFrame(runtime.runId, { sequence: request.sequence, ok: false, error: error instanceof RuntimeError ? error.code : 'MODEL_CHANNEL_ERROR' });
+        if (error instanceof RuntimeError && ['UNPROVEN_SOURCE_MUTATION', 'READ_ONLY_SOURCE_CHANGED', 'KNOWLEDGE_CONTEXT_REVOKED', 'KNOWLEDGE_CONTEXT_CHANGED', 'SOURCE_WRITE_PENDING'].includes(error.code)) { channel.abort.abort(); options.workflow.blockDemand(channel.run.demandId, error.code, error.message); if (channel.run.stage === 'planning') options.store.db.prepare("UPDATE host_boundary_runs SET status='failed' WHERE domain_run_id=? AND status!='complete'").run(channel.run.id); await (channel.boundary ? boundarySupervisor! : coordinator!.supervisor).stop(runtime.runId, error.code); retainRevocation(runtime.runId, targetDriver); }
+      }
       return;
     }
     insist(value.generation === runtime.generation && (value.runId === runtime.runId || value.runtimeRunId === runtime.runId), 'CHANNEL_IDENTITY_DENIED', 'Worker event identity mismatch.');
@@ -471,11 +501,41 @@ function composeProductionServices(options: ProductionOptions, synthetic?: Synth
     if (value.type === 'worker.event') return; // Worker telemetry never proves subprocess completion.
     if (value.type === 'worker.settled') { insist(value.sessionId === channel.init.sessionId && !channel.settled && typeof value.aborted === 'boolean', 'SESSION_IDENTITY_DENIED', 'Unknown or replayed terminal event.'); await settle(channel, value.aborted); return; }
     insist(equal(value.capability, channel.init.capability), 'CHANNEL_CAPABILITY_DENIED', 'Private capability mismatch.');
-    if (value.type === 'worker.check-request') {
+    if (value.type === 'worker.write-request' || value.type === 'worker.write-complete') {
+      const requestId = value.requestId;
+      try {
+        assertRun(channel); insist(channel.ready && channel.modelObserved && runtime.writes && runtime.role === 'implementation' && typeof requestId === 'string' && /^[a-zA-Z0-9-]{1,200}$/.test(requestId), 'SOURCE_WRITE_DENIED', 'A bounded generated write requires the current observed implementation session.');
+        if (value.type === 'worker.write-request') {
+          verifyLiveInputs(channel);
+          const action = value.action ?? 'write'; insist(action === 'write' || action === 'delete', 'SOURCE_WRITE_DENIED', 'Only single-file write or delete is supported.');
+          insist(typeof value.path === 'string' && !value.path.split('/').some(part => ['.git', '.local'].includes(part.toLowerCase())) && (action === 'delete' ? value.sha256 === null && value.bytes === 0 : typeof value.sha256 === 'string' && /^[a-f0-9]{64}$/.test(value.sha256)) && Number.isSafeInteger(value.bytes) && Number(value.bytes) >= 0 && Number(value.bytes) <= channel.init.limits.maxFileBytes, 'SOURCE_WRITE_DENIED', 'Only an exact bounded relative source mutation may be authorized.');
+          const path = sourcePath(value.path), before = evidence.source(channel.run.demandId);
+          insist(action !== 'delete' || before.files.some(file => file.path === path), 'SOURCE_DELETE_DENIED', 'Only one exact existing ordinary source file may be deleted; recursive deletion is not supported.');
+          insist(!options.store.db.prepare('SELECT 1 FROM host_generated_writes WHERE request_id=?').get(requestId), 'SOURCE_WRITE_REPLAY', 'A generated mutation request cannot be repeated.');
+          channel.pendingWrite = { requestId, action, path, sha256: value.sha256 as string|null, bytes: Number(value.bytes), before };
+          options.store.db.prepare('INSERT INTO host_generated_writes VALUES(?,?,?)').run(requestId, runtime.runId, canonicalJson({ status: 'authorized', action, generation: runtime.generation, before: channel.sourceScope.sha256, path, sha256: value.sha256, bytes: value.bytes }));
+          targetDriver.sendWorkerFrame(runtime.runId, { type: 'worker.write-result', requestId, ok: true, value: { status: 'authorized' } });
+        } else {
+          const pending = channel.pendingWrite; insist(pending && pending.requestId === requestId, 'SOURCE_WRITE_REPLAY', 'No exact pending generated mutation exists.');
+          const after = evidence.source(channel.run.demandId), changed = after.files.find(file => file.path === pending.path), previous = pending.before.files.find(file => file.path === pending.path);
+          const exactTarget = pending.action === 'delete' ? !changed && !!previous : changed?.sha256 === pending.sha256 && changed.bytes === pending.bytes && changed.executable === (previous?.executable ?? false);
+          insist(after.head === pending.before.head && exactTarget && canonicalJson(after.files.filter(file => file.path !== pending.path)) === canonicalJson(pending.before.files.filter(file => file.path !== pending.path)) && canonicalJson(after.changes.filter(change => change.slice(3) !== pending.path)) === canonicalJson(pending.before.changes.filter(change => change.slice(3) !== pending.path)), 'UNPROVEN_SOURCE_MUTATION', 'Source differs from the single exact authorized generated mutation.');
+          const next = evidence.sourceMaterial(channel.run.demandId); insist(next.content === canonicalJson(after), 'UNPROVEN_SOURCE_MUTATION', 'Source changed during mutation verification.');
+          options.store.db.prepare('UPDATE host_generated_writes SET body=? WHERE request_id=? AND runtime_run_id=?').run(canonicalJson({ status: 'verified', action: pending.action, generation: runtime.generation, before: channel.sourceScope.sha256, after: next.sha256, path: pending.path, sha256: pending.sha256, bytes: pending.bytes }), requestId, runtime.runId);
+          channel.sourceScope = next; channel.pendingWrite = undefined;
+          targetDriver.sendWorkerFrame(runtime.runId, { type: 'worker.write-result', requestId, ok: true, value: { status: 'verified', sourceDigest: next.sha256 } });
+        }
+      } catch (error) { targetDriver.sendWorkerFrame(runtime.runId, { type: 'worker.write-result', requestId, ok: false, error: error instanceof RuntimeError ? error.code : 'SOURCE_WRITE_UNVERIFIED' }); channel.abort.abort(); options.workflow.blockDemand(channel.run.demandId, 'SOURCE_WRITE_UNVERIFIED', 'Generated source mutation could not be independently verified; explicitly review current source before restarting.'); await coordinator!.supervisor.stop(runtime.runId, 'source-write-unverified'); retainRevocation(runtime.runId, targetDriver); }
+      return;
+    }
+    if (value.type === 'worker.check-request' || value.type === 'worker.shell-request') {
       assertRun(channel);
+      verifyLiveInputs(channel);
       insist(channel.ready && channel.modelObserved, 'MODEL_OBSERVATION_REQUIRED', 'Native tools require an observed model operation in this exact session.');
       insist(typeof value.requestId === 'string' && /^[a-zA-Z0-9-]{1,200}$/.test(value.requestId) && typeof value.toolCallId === 'string' && value.toolCallId.length <= 200 && Array.isArray(value.args) && value.args.length > 0 && value.args.length <= 64 && value.args.every(arg => typeof arg === 'string' && !arg.includes('\0') && arg.length <= 8192) && value.args.join('').length <= 32768, 'CHECK_SCOPE_DENIED', 'Only a bounded Node argument vector is accepted.');
       const requestId = value.requestId, args = value.args as string[];
+      const shell = value.type === 'worker.shell-request';
+      insist(!shell || (channel.init.shellEnabled && targetDriver.runShellCheck && args.length === 1 && args[0]!.length > 0), 'SHELL_UNAVAILABLE', 'Only one bounded script in the exact configured locked Git Bash may execute.');
       let leased = false;
       try {
         insist(!options.store.db.prepare('SELECT 1 FROM host_native_check_lease').get(), 'CHECK_CAPACITY', 'Another native check owns the single global check slot; wait for its observed completion.');
@@ -483,12 +543,12 @@ function composeProductionServices(options: ProductionOptions, synthetic?: Synth
         const sourceBefore = evidence.sourceMaterial(channel.run.demandId);
         if (!runtime.writes) insist(channel.init.materials.some(material => material.id === sourceBefore.id && material.sha256 === sourceBefore.sha256), 'CHECK_CONTENT_CHANGED', 'Read-only checks require the exact initial source scope.');
         options.store.db.prepare('INSERT INTO host_native_check_lease VALUES(1,?,?)').run(runtime.runId, requestId); leased = true;
-        const observation = await targetDriver.runNodeCheck(runtime.runId, args, { timeoutMs: 120_000, maxOutputBytes: 524_288 }, requestId);
+        const observation = shell ? await targetDriver.runShellCheck!(runtime.runId, args, { timeoutMs: 120_000, maxOutputBytes: 524_288 }, requestId) : await targetDriver.runNodeCheck(runtime.runId, args, { timeoutMs: 120_000, maxOutputBytes: 524_288 }, requestId);
         insist(observation.requestId === requestId && ['exited', 'timeout', 'output-limit', 'descendants-survived', 'launch-failed'].includes(observation.reason), 'NATIVE_CHECK_INVALID', 'Native receipt does not match the requested operation.');
         const { outputBase64: _duplicateOutput, ...nativeEvidence } = observation.nativeEvidence;
         const sourceAfter = evidence.sourceMaterial(channel.run.demandId);
-        insist(runtime.writes || sourceBefore.sha256 === sourceAfter.sha256, 'CHECK_CONTENT_CHANGED', 'Source changed during the read-only native check.');
-        const record = { provenance: synthetic ? 'synthetic-native-receipt' : 'native-helper-command-observation', runtimeRunId: runtime.runId, generation: runtime.generation, environment: nativeEnvironment(runtime), sourceBefore: sourceBefore.sha256, sourceAfter: sourceAfter.sha256, toolCallId: value.toolCallId, args, requestId, exitCode: observation.exitCode, reason: observation.reason, output: observation.output, nativeEvidence: { ...nativeEvidence, outputSha256: hash(observation.output) } };
+        insist(sourceBefore.sha256 === sourceAfter.sha256, 'UNPROVEN_SOURCE_MUTATION', 'Command-generated source changes need explicit user review; they cannot silently enter model context.');
+        const record = { provenance: synthetic ? 'synthetic-native-receipt' : 'native-helper-command-observation', executable: shell ? 'git-bash' : 'node', runtimeRunId: runtime.runId, generation: runtime.generation, environment: nativeEnvironment(runtime), sourceBefore: sourceBefore.sha256, sourceAfter: sourceAfter.sha256, toolCallId: value.toolCallId, args, requestId, exitCode: observation.exitCode, reason: observation.reason, output: observation.output, nativeEvidence: { ...nativeEvidence, outputSha256: hash(observation.output) } };
         const demand = options.store.getDemand(channel.run.demandId);
         const ref = evidence.save({ id: `native-check-${requestId}`, projectId: demand.projectId, demandId: demand.id, runId: channel.run.id, kind: 'check-evidence', text: canonicalJson(record) });
         options.store.db.prepare('INSERT INTO host_native_checks VALUES(?,?,?,?,?)').run(requestId, runtime.runId, channel.run.id, ref.id, canonicalJson(record));
@@ -506,6 +566,7 @@ function composeProductionServices(options: ProductionOptions, synthetic?: Synth
     }
     if (value.type === 'worker.stop-required') { if (channel.boundary) { channel.abort.abort(); await boundarySupervisor!.stop(runtime.runId, 'worker-tool-stop-required'); } else await coordinator!.stopDomainRun(channel.run.id, 'worker-tool-stop-required'); return; }
     insist(value.type === 'worker.report' && channel.ready && !channel.settled, 'FRAME_TYPE_DENIED', 'Unknown Worker frame or already settled session.');
+    if ((value.report as { type?: string } | undefined)?.type !== 'blocked') verifyLiveInputs(channel);
     const reportType = (value.report as { type?: string } | undefined)?.type;
     insist(channel.modelObserved || reportType === 'blocked', 'MODEL_OBSERVATION_REQUIRED', 'Artifacts and Worker self-report alone cannot establish stage progress.');
     const report = ingestReport(channel, value.report);
@@ -561,21 +622,92 @@ function composeProductionServices(options: ProductionOptions, synthetic?: Synth
     classifyExit(run) { const channel = [...channels.values()].find(channel => channel.run.id === run.id);
       return channel?.settled && channel.modelObserved && channel.handoffs.length ? { outcome: 'handoff', evidence: `Authenticated native terminal context ${channel.init.sessionId}; verified reports: ${channel.handoffs.join(', ')}.` } : { outcome: 'unknown', evidence: 'No verified terminal model/tool handoff for this exact native generation.' }; },
   };
-  function auxiliaryStatus(): { safe: boolean; blockers: string[] } { const runs = coordinator?.supervisor.list().filter(run => run.role === 'boundary-review') ?? []; const unresolved = runs.filter(run => run.state !== 'stopped' || !options.store.db.prepare('SELECT 1 FROM host_native_revocations WHERE run_id=?').get(run.runId)); return { safe: unresolved.length === 0, blockers: unresolved.map(run => `Independent boundary review ${run.demandId}: ${run.state}; complete native stop/resource revocation is required.`) }; }
+  async function verifyBaselineChecks(input: BaselineCheckRequest): Promise<BaselineCheckVerification> {
+    insist(coordinator, 'HOST_CHANNEL_UNBOUND', 'The native check lane requires the Host coordinator.'); refreshNative();
+    const demand = options.store.getDemand(input.demandId), workspace = options.workspace(), binding = workspace.getBinding(demand.id);
+    insist(binding && demand.control === 'active' && options.store.listRuns(demand.id).every(run => run.status === 'stopped') && coordinator.supervisor.list().filter(run => run.demandId === demand.id).every(run => run.state === 'stopped'), 'BASELINE_CHECK_BUSY', 'Fresh baseline checks require active user control and all previous demand execution stopped.');
+    const intent = options.store.db.prepare("SELECT data FROM workspace_intents WHERE operation_id=? AND kind='baseline' AND status='complete'").get(input.operationId);
+    const baseline = intent ? JSON.parse(String(intent.data)) as { request: { demandId: string }; result: { head: string } } : undefined;
+    insist(baseline?.request.demandId === demand.id && baseline.result.head === input.expectedHead && binding.head === input.expectedHead, 'BASELINE_CHECK_SCOPE', 'The exact committed integration operation must match this demand and HEAD.');
+    insist(Array.isArray(input.checkIds) && input.checkIds.length > 0 && input.checkIds.length <= 16 && new Set(input.checkIds).size === input.checkIds.length, 'BASELINE_CHECK_SCOPE', 'Select one to sixteen exact prior check recipes.');
+    const result = demand.results.find(result => result.id === input.templateResultId); insist(result, 'BASELINE_CHECK_SCOPE', 'The selected historical result is unavailable.');
+    const recipes = input.checkIds.map(id => {
+      const check = result.E.find(check => check.id === id); insist(check?.status === 'passed', 'BASELINE_CHECK_SCOPE', 'Each selected passed check must belong to the exact historical result.');
+      const rows = options.store.db.prepare('SELECT body,domain_run_id FROM host_native_checks WHERE artifact_id=?').all(check.evidence.id).filter(row => options.store.listRuns(demand.id).some(run => run.id === row.domain_run_id && run.stage === 'review' && run.contentId === result.contentId));
+      insist(rows.length === 1, 'CHECK_EXECUTION_UNVERIFIED', 'The recipe must originate in one exact native review run for this demand content.'); const row = rows[0]!;
+      const observed = JSON.parse(String(row.body)) as { provenance: string; executable?: string; args: string[]; reason: string; exitCode: number|null; sourceBefore: string; sourceAfter: string };
+      insist(evidence.read(demand.id, check.evidence).content === row.body && observed.provenance === (synthetic ? 'synthetic-native-receipt' : 'native-helper-command-observation') && observed.reason === 'exited' && observed.exitCode === 0 && observed.sourceBefore === result.K.digest && observed.sourceAfter === result.K.digest && Array.isArray(observed.args), 'CHECK_EXECUTION_UNVERIFIED', 'A bounded immutable successful native recipe for the old exact source is required.');
+      insist(observed.executable === undefined || ['node', 'git-bash'].includes(observed.executable), 'BASELINE_CHECK_SCOPE', 'Recipe executable kind is not supported.');
+      insist(observed.executable !== 'git-bash' || profile!.config.shell, 'SHELL_UNAVAILABLE', 'The selected shell recipe requires an exact locked Git Bash profile.');
+      return { check, args: observed.args, executable: observed.executable ?? 'node' };
+    });
+    const source = evidence.sourceMaterial(demand.id); insist(JSON.parse(source.content).head === input.expectedHead && workspace.git.status(binding.worktreePath).length === 0, 'BASELINE_CHECK_CONTENT_CHANGED', 'The freshly integrated source must be the exact clean committed HEAD.');
+    const environment = currentKnowledgeEnvironment(), key = `baseline-${hash(canonicalJson({ input, source: source.sha256, environment })).slice(0, 40)}`;
+    const prior = options.store.db.prepare('SELECT * FROM host_baseline_checks WHERE operation_key=?').get(key);
+    if (prior) { insist(prior.status === 'complete' && !!options.store.db.prepare('SELECT 1 FROM host_native_revocations WHERE run_id=?').get(String(prior.runtime_run_id)), 'BASELINE_CHECK_UNRESOLVED', 'A prior check attempt is unresolved; verify its native stop before retrying.'); return JSON.parse(String(prior.body)) as BaselineCheckVerification; }
+    insist(!options.store.db.prepare('SELECT 1 FROM host_native_check_lease').get(), 'CHECK_CAPACITY', 'Another command owns the finite native check slot.');
+    options.store.db.prepare('INSERT INTO host_baseline_checks VALUES(?,NULL,?,?)').run(key, canonicalJson(input), 'launching');
+    let ready = false, runtime: RunRecord | undefined, laneSupervisor!: RuntimeSupervisor;
+    const authorizeCurrent = () => { const current = options.store.getDemand(demand.id); insist(current.control === 'active' && current.revision === demand.revision && evidence.sourceMaterial(demand.id).sha256 === source.sha256 && options.workspace().getBinding(demand.id)?.head === input.expectedHead && currentKnowledgeEnvironment() === environment, 'BASELINE_CHECK_AUTHORITY_CHANGED', 'Baseline control, exact source or environment changed during local checks.'); };
+    const laneDriver = makeNative(run => {
+      authorizeCurrent(); const scratch = join(stateDirectory, 'runs', run.runId); noLinks(scratch, true); mkdirSync(scratch, { recursive: true, mode: 0o700 }); noLinks(scratch); const sessionDir = join(scratch, 'session'); mkdirSync(sessionDir, { mode: 0o700 });
+      const init: WorkerInit = { version: 1, type: 'worker.init', runId: run.runId, generation: run.generation, demandId: demand.id, domainRunId: key, domainGeneration: 1, role: 'check', checkOnly: true, workspace: binding.worktreePath, scratch, sessionDir, sessionId: randomUUID(), capability: randomBytes(32).toString('hex'), prompt: 'Host-authorized native checks only. No model operation.', materials: [source], model: { provider: 'disabled', id: 'no-model', contextWindow: 1024, maxTokens: 1 }, compaction: { enabled: false, reserveTokens: 1, keepRecentTokens: 1 }, retry: { enabled: false, maxRetries: 0, baseDelayMs: 0 }, limits: { maxFileBytes: 1024 * 1024, commandTimeoutMs: 120_000, maxOutputBytes: 524_288 } };
+      checkLanes.set(run.runId, { driver: laneDriver, supervisor: laneSupervisor, authorize: authorizeCurrent });
+      options.store.db.prepare('UPDATE host_baseline_checks SET runtime_run_id=? WHERE operation_key=?').run(run.runId, key);
+      laneDriver.setWorkerFrameHandler(async (bound, frame) => { const value = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(frame)) as Record<string, unknown>; insist(!ready && value.type === 'worker.ready' && value.runId === bound.runId && value.generation === bound.generation && value.sessionId === init.sessionId, 'BASELINE_WORKER_CHANNEL_DENIED', 'The check-only Worker may report its exact ready identity once; model and report frames are forbidden.'); ready = true; });
+      return { profileName: appContainerProfileName(run.demandId, run.role, run.generation), scratch, aclEvidence: profile!.evidenceDigests.join(','), privateChannelEvidence: profile!.evidenceDigests.join(','), processLimit: 8, memoryLimitBytes: 1024 * 1024 * 1024, diskLimitBytes: 1024 * 1024 * 1024, fileLimit: 100_000, minimumFreeBytes: 256 * 1024 * 1024, diskPollMs: 250, workerInit: init as unknown as Record<string, unknown>, resourceAuthorizationId: input.operationId, readonlyRuntimeRoots: [...new Set([profile!.config.node.path, profile!.config.worker.path, ...(profile!.config.shell ? readLockedShellManifest(profile!.config.shell).files.map(file => file.path) : [])])] };
+    });
+    laneDriver.setWorkerFrameHandler(async () => { throw new RuntimeError('BASELINE_WORKER_CHANNEL_DENIED', 'No bound check-only Worker exists.'); });
+    laneSupervisor = new RuntimeSupervisor(options.store.db, laneDriver, request => { authorizeCurrent(); insist(request.role === 'check' && !request.writes && request.highResource && request.grantId === key, 'BASELINE_CHECK_SCOPE', 'Only this explicitly requested readonly local check lane is authorized.'); });
+    laneDriver.setStopHandler(async (id, why) => { await laneSupervisor.stop(id, why); retainRevocation(id, laneDriver); });
+    const evidenceRefs: string[] = [];
+    try {
+      runtime = await laneSupervisor.launch({ demandId: demand.id, grantId: key, role: 'check', writes: false, highResource: true, workspace: binding.worktreePath, profileId: profile!.config.profileId, timeoutMs: Math.min(30 * 60_000, recipes.length * 135_000 + 15_000), maxOutputBytes: 16 * 1024 * 1024 });
+      const deadline = Date.now() + 10_000;
+      while (!ready && Date.now() < deadline) { authorizeCurrent(); await new Promise(resolve => setTimeout(resolve, 20)); }
+      insist(ready, 'BASELINE_WORKER_NOT_READY', 'The bounded check-only Worker never became ready.');
+      for (const { check, args, executable } of recipes) {
+        authorizeCurrent(); insist(laneSupervisor.isDispatchAllowed(runtime.runId) && !options.store.db.prepare('SELECT 1 FROM host_native_check_lease').get(), 'CHECK_CAPACITY', 'The native command lane is stopped or already occupied.');
+        const requestId = randomUUID(); options.store.db.prepare('INSERT INTO host_native_check_lease VALUES(1,?,?)').run(runtime.runId, requestId);
+        insist(executable !== 'git-bash' || laneDriver.runShellCheck, 'SHELL_UNAVAILABLE', 'Locked Git Bash command adapter is unavailable.');
+        const observed = executable === 'git-bash' ? await laneDriver.runShellCheck!(runtime.runId, args, { timeoutMs: 120_000, maxOutputBytes: 524_288 }, requestId) : await laneDriver.runNodeCheck(runtime.runId, args, { timeoutMs: 120_000, maxOutputBytes: 524_288 }, requestId);
+        authorizeCurrent(); insist(observed.requestId === requestId && observed.reason === 'exited' && observed.exitCode === 0, 'BASELINE_CHECK_FAILED', 'A freshly executed baseline capability check did not pass.');
+        const { outputBase64: _duplicate, ...nativeEvidence } = observed.nativeEvidence;
+        const body = canonicalJson({ provenance: synthetic ? 'synthetic-native-receipt' : 'native-helper-command-observation', executable, runtimeRunId: runtime.runId, generation: runtime.generation, requestId, args, templateCheckId: check.id, operationId: input.operationId, head: input.expectedHead, sourceBefore: source.sha256, sourceAfter: source.sha256, environment, reason: observed.reason, exitCode: observed.exitCode, output: observed.output, nativeEvidence: { ...nativeEvidence, outputSha256: hash(observed.output) } });
+        const ref = evidence.save({ id: `native-check-${requestId}`, projectId: demand.projectId, demandId: demand.id, runId: key, kind: 'check-evidence', text: body });
+        options.store.db.prepare('INSERT INTO host_native_checks VALUES(?,?,?,?,?)').run(requestId, runtime.runId, key, ref.id, body); evidenceRefs.push(ref.id);
+        options.store.db.prepare('DELETE FROM host_native_check_lease WHERE request_id=?').run(requestId);
+      }
+      const stopped = await laneSupervisor.stop(runtime.runId, 'baseline-checks-complete'); retainRevocation(runtime.runId, laneDriver);
+      insist(stopped.state === 'stopped' && !!options.store.db.prepare('SELECT 1 FROM host_native_revocations WHERE run_id=?').get(runtime.runId), 'BASELINE_CHECK_STOP_UNVERIFIED', 'Check results require complete native stop and revoked resources.'); authorizeCurrent();
+      const verification: BaselineCheckVerification = { head: input.expectedHead, sourceDigest: source.sha256, environment, evidenceRefs, provenance: synthetic ? 'synthetic-native-receipt' : 'native-helper-command-observation', stopped: true };
+      options.store.db.prepare("UPDATE host_baseline_checks SET body=?,status='complete' WHERE operation_key=?").run(canonicalJson(verification), key); return verification;
+    } catch (error) {
+      runtime ??= laneSupervisor.list().find(run => run.grantId === key);
+      if (runtime) { await laneSupervisor.stop(runtime.runId, 'baseline-check-failed'); retainRevocation(runtime.runId, laneDriver); }
+      options.store.db.prepare("UPDATE host_baseline_checks SET status='failed' WHERE operation_key=?").run(key); throw error;
+    }
+  }
+  function auxiliaryStatus(): { safe: boolean; blockers: string[] } { const runs = coordinator?.supervisor.list().filter(run => ['boundary-review', 'check'].includes(run.role)) ?? []; const unresolved = runs.filter(run => run.state !== 'stopped' || !options.store.db.prepare('SELECT 1 FROM host_native_revocations WHERE run_id=?').get(run.runId)); return { safe: unresolved.length === 0, blockers: unresolved.map(run => `Independent ${run.role} ${run.demandId}: ${run.state}; complete native stop/resource revocation is required.`) }; }
   async function stopAllAuxiliary(reason = 'user-stop'): Promise<void> {
     // Durable rows remain authoritative after Host restart. Missing live handles
     // still receive stop intent and remain unknown/occupied, never disappear.
-    for (const runtime of coordinator?.supervisor.list().filter(run => run.role === 'boundary-review') ?? []) {
+    for (const runtime of coordinator?.supervisor.list().filter(run => ['boundary-review', 'check'].includes(run.role)) ?? []) {
       channels.get(runtime.runId)?.abort.abort();
-      if (boundarySupervisor && channels.has(runtime.runId)) await boundarySupervisor.stop(runtime.runId, reason);
+      if (checkLanes.has(runtime.runId)) await checkLanes.get(runtime.runId)!.supervisor.stop(runtime.runId, reason);
+      else if (boundarySupervisor && channels.has(runtime.runId)) await boundarySupervisor.stop(runtime.runId, reason);
       else await coordinator!.supervisor.stop(runtime.runId, reason);
-      retainRevocation(runtime.runId, boundaryNative);
+      retainRevocation(runtime.runId, recoveryDriver(runtime));
     }
   }
   async function tick(): Promise<void> {
-    for (const runtime of coordinator?.supervisor.list().filter(run => run.role === 'boundary-review' && run.state !== 'stopped' && !channels.has(run.runId)) ?? []) {
+    for (const runtime of coordinator?.supervisor.list().filter(run => ['boundary-review', 'check'].includes(run.role) && run.state !== 'stopped' && !channels.has(run.runId)) ?? []) {
       const demand = options.store.getDemand(runtime.demandId);
-      if (demand.control !== 'active' || demand.blockedReasons.length) await coordinator!.supervisor.stop(runtime.runId, 'recovered-workflow-control-changed');
+      if (runtime.role === 'check') {
+        const lane = checkLanes.get(runtime.runId);
+        if (!lane) await coordinator!.supervisor.stop(runtime.runId, 'recovered-check-requires-stop');
+        else try { lane.authorize(); } catch { await lane.supervisor.stop(runtime.runId, 'baseline-check-authority-changed'); retainRevocation(runtime.runId, lane.driver); }
+      } else if (demand.control !== 'active' || demand.blockedReasons.length) await coordinator!.supervisor.stop(runtime.runId, 'recovered-workflow-control-changed');
     }
     for (const channel of channels.values()) if (channel.boundary && boundarySupervisor) {
       const demand = options.store.getDemand(channel.run.demandId);
@@ -584,6 +716,6 @@ function composeProductionServices(options: ProductionOptions, synthetic?: Synth
     }
     await coordinator?.tick();
   }
-  return { synthetic: !!synthetic, driver, prerequisites, evidence, prepareDemand, tick, stopAllAuxiliary, auxiliaryStatus, diagnostics, captureMethods, requiredModelData, currentKnowledgeEnvironment, bindCoordinator(value: ExecutionCoordinator) { insist(!coordinator || coordinator === value, 'COORDINATOR_CONFLICT', 'Production services are already bound.'); coordinator = value; } };
+  return { synthetic: !!synthetic, driver, prerequisites, evidence, prepareDemand, tick, stopAllAuxiliary, auxiliaryStatus, diagnostics, captureMethods, requiredModelData, currentKnowledgeEnvironment, verifyBaselineChecks, bindCoordinator(value: ExecutionCoordinator) { insist(!coordinator || coordinator === value, 'COORDINATOR_CONFLICT', 'Production services are already bound.'); coordinator = value; } };
 }
 export type ProductionServices = ReturnType<typeof createProductionServices>;

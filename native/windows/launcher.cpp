@@ -20,6 +20,11 @@ struct Sid {
   PSID value = nullptr;
   ~Sid() { if (value) FreeSid(value); }
 };
+struct RegistryReadCapability {
+  PSID* groups=nullptr;PSID* capabilities=nullptr;DWORD group_count=0,capability_count=0;SID_AND_ATTRIBUTES entry{};
+  DWORD Initialize(){if(!DeriveCapabilitySidsFromName(L"registryRead",&groups,&group_count,&capabilities,&capability_count))return GetLastError();if(capability_count!=1)return ERROR_INVALID_DATA;entry.Sid=capabilities[0];entry.Attributes=SE_GROUP_ENABLED;return ERROR_SUCCESS;}
+  ~RegistryReadCapability(){if(groups){for(DWORD i=0;i<group_count;i++)LocalFree(groups[i]);LocalFree(groups);}if(capabilities){for(DWORD i=0;i<capability_count;i++)LocalFree(capabilities[i]);LocalFree(capabilities);}}
+};
 struct Attributes {
   std::vector<unsigned char> bytes;
   LPPROC_THREAD_ATTRIBUTE_LIST list = nullptr;
@@ -107,12 +112,18 @@ std::wstring AppContainerProfileName(const std::wstring& demand,const std::wstri
   const wchar_t hex[]=L"0123456789abcdef";std::wstring name=L"pi-kanban-";for(size_t i=0;i<24;i++){name+=hex[digest[i]>>4];name+=hex[digest[i]&15];}return name;
 }
 DWORD ValidateDescriptor(const LaunchDescriptor& d) {
+  if(d.policy_variant!=L"lpac-strict-v1"&&d.policy_variant!=L"lpac-registry-read-no-network-v2")return ERROR_INVALID_PARAMETER;
   if (d.version != 1 || !Identifier(d.demand) || !Identifier(d.generation)) return ERROR_INVALID_PARAMETER;
   if (d.role != L"planning" && d.role != L"implementation" && d.role != L"review" && d.role != L"boundary-review" && d.role != L"check") return ERROR_INVALID_PARAMETER;
   if (d.profile_name.empty() || d.profile_name.size()>64 || d.profile_name != AppContainerProfileName(d.demand,d.role,d.generation)) return ERROR_INVALID_PARAMETER;
   for (const auto* path : {&d.node_executable, &d.worker_entry, &d.workspace, &d.scratch}) if (!LocalAbsolute(*path)) return ERROR_BAD_PATHNAME;
+  if(d.shell_executable.empty()){if(!d.shell_root.empty()||!d.shell_files.empty())return ERROR_INVALID_PARAMETER;}else{
+    if(!LocalAbsolute(d.shell_executable)||!LocalAbsolute(d.shell_root)||d.shell_files.empty()||d.shell_files.size()>512)return ERROR_INVALID_PARAMETER;
+    bool executable_locked=false;for(const auto& file:d.shell_files){if(!LocalAbsolute(file.path))return ERROR_INVALID_PARAMETER;if(file.path==d.shell_executable&&file.sha256==d.shell_sha256)executable_locked=true;}if(!executable_locked)return ERROR_ACCESS_DENIED;
+  }
   if (d.workspace == d.scratch || d.policy_evidence.empty() || d.acl_evidence.empty() || d.private_channel_evidence.empty()) return ERROR_ACCESS_DENIED;
   if (!d.timeout_ms || d.timeout_ms > 3600000 || !d.process_limit || d.process_limit > 64 || d.memory_limit_bytes < 64ull*1024*1024 || d.output_limit_bytes == 0) return ERROR_INVALID_PARAMETER;
+  if(!d.disk_limit_bytes||d.disk_limit_bytes>64ull*1024*1024*1024||!d.file_limit||d.file_limit>1000000||d.minimum_free_bytes>1024ull*1024*1024*1024||d.disk_poll_ms<25||d.disk_poll_ms>2000)return ERROR_INVALID_PARAMETER;
   if (std::all_of(d.node_sha256.begin(), d.node_sha256.end(), [](unsigned char x) { return x == 0; }) ||
       std::all_of(d.worker_sha256.begin(), d.worker_sha256.end(), [](unsigned char x) { return x == 0; })) return ERROR_INVALID_DATA;
   return ERROR_SUCCESS;
@@ -137,6 +148,7 @@ DWORD ControlledJob::Launch(const LaunchDescriptor& d, const PrivateHandles& cha
   }
   stage_ = "verify-binary-digests";
   if ((error = Digest(node, d.node_sha256)) || (error = Digest(worker, d.worker_sha256))) return error;
+  for(const auto& file:d.shell_files){HANDLE dependency=nullptr;stage_="pin-shell-runtime";if((error=PinNoReparse(file.path,false,pinned_files_,&dependency))||(error=Digest(dependency,file.sha256)))return error;}
   HANDLE inherited[] = {channels.requests_read, channels.reports_write, channels.logs_write};
   if (inherited[0] == inherited[1] || inherited[0] == inherited[2] || inherited[1] == inherited[2]) return ERROR_INVALID_HANDLE;
   for (HANDLE h : inherited) {
@@ -147,9 +159,12 @@ DWORD ControlledJob::Launch(const LaunchDescriptor& d, const PrivateHandles& cha
   Sid sid;
   HRESULT hr = DeriveAppContainerSidFromAppContainerName(d.profile_name.c_str(), &sid.value);
   if (FAILED(hr)) return HRESULT_CODE(hr);
+  RegistryReadCapability registry;error=registry.Initialize();if(error)return error;
   SECURITY_CAPABILITIES security{};
   security.AppContainerSid = sid.value;
-  security.CapabilityCount = 0; security.Capabilities = nullptr;  // No broad network capabilities.
+  // Explicit LPAC policy v2: ordinary HKLM reads needed by Winsock initialization.
+  // NO internetClient, internetClientServer or privateNetworkClientServer capability.
+  security.CapabilityCount = d.policy_variant==L"lpac-registry-read-no-network-v2"?1:0; security.Capabilities = security.CapabilityCount?&registry.entry:nullptr;
   stage_ = "create-job";
   Handle job{CreateJobObjectW(nullptr, nullptr)}; if (!job.value) return GetLastError();
   JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
@@ -185,6 +200,7 @@ DWORD ControlledJob::Launch(const LaunchDescriptor& d, const PrivateHandles& cha
   if (!CreateProcessW(d.node_executable.c_str(), command.data(), nullptr, nullptr, TRUE,
     CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW,
     block.data(), d.workspace.c_str(), &startup.StartupInfo, &created)) return GetLastError();
+  ever_created_=true;
   Handle process{created.hProcess}, thread{created.hThread};
   const auto fail = [&](DWORD failure) { TerminateProcess(process.value, failure); WaitForSingleObject(process.value, 5000); return failure; };
   stage_ = "assign-job";
@@ -200,6 +216,9 @@ DWORD ControlledJob::Launch(const LaunchDescriptor& d, const PrivateHandles& cha
   std::vector<unsigned char> token_info(token_size);
   if (!token_size || !GetTokenInformation(token.value, TokenAppContainerSid, token_info.data(), token_size, &returned) ||
       !EqualSid(reinterpret_cast<TOKEN_APPCONTAINER_INFORMATION*>(token_info.data())->TokenAppContainer, sid.value)) return fail(ERROR_ACCESS_DENIED);
+  DWORD capability_bytes=0;GetTokenInformation(token.value,TokenCapabilities,nullptr,0,&capability_bytes);std::vector<unsigned char> capability_info(capability_bytes);
+  if(!capability_bytes||!GetTokenInformation(token.value,TokenCapabilities,capability_info.data(),capability_bytes,&capability_bytes))return fail(ERROR_ACCESS_DENIED);
+  const auto* actual_capabilities=reinterpret_cast<TOKEN_GROUPS*>(capability_info.data());if(actual_capabilities->GroupCount!=security.CapabilityCount||(security.CapabilityCount&&!EqualSid(actual_capabilities->Groups[0].Sid,registry.entry.Sid)))return fail(ERROR_ACCESS_DENIED);
   FILETIME exit{}, kernel{}, user{}, birth{};
   if (!GetProcessTimes(process.value, &birth, &exit, &kernel, &user)) return fail(GetLastError());
   // No untrusted instruction has run before containment and identity checks complete.
@@ -216,6 +235,13 @@ DWORD ControlledJob::Launch(const LaunchDescriptor& d, const PrivateHandles& cha
   return ERROR_SUCCESS;
 }
 DWORD ControlledJob::SpawnNodeCheck(const LaunchDescriptor& d, const std::vector<std::wstring>& args, HANDLE input, HANDLE output, PROCESS_INFORMATION* result) {
+  return SpawnPinnedCheck(d,d.node_executable,args,input,output,result,false);
+}
+DWORD ControlledJob::SpawnShellCheck(const LaunchDescriptor& d,const std::vector<std::wstring>& args,HANDLE input,HANDLE output,PROCESS_INFORMATION* result){
+  if(d.shell_executable.empty()||args.size()!=4||args[0]!=L"--noprofile"||args[1]!=L"--norc"||args[2]!=L"-c")return ERROR_ACCESS_DENIED;
+  return SpawnPinnedCheck(d,d.shell_executable,args,input,output,result,true);
+}
+DWORD ControlledJob::SpawnPinnedCheck(const LaunchDescriptor& d,const std::wstring& executable,const std::vector<std::wstring>& args,HANDLE input,HANDLE output,PROCESS_INFORMATION* result,bool shell) {
   std::lock_guard lock(spawn_stop_mutex_);
   if (stopping_) return ERROR_OPERATION_ABORTED;
   if (!job_ || !result || args.empty() || args.size() > 64 || d.generation != identity_.generation) return ERROR_INVALID_PARAMETER;
@@ -223,7 +249,8 @@ DWORD ControlledJob::SpawnNodeCheck(const LaunchDescriptor& d, const std::vector
   size_t total = 0; for (const auto& argument : args) { total += argument.size(); if (argument.size() > 8192 || argument.find(L'\0') != std::wstring::npos) return ERROR_INVALID_PARAMETER; }
   if (total > 32768) return ERROR_INVALID_PARAMETER;
   Sid sid; const HRESULT sid_result = DeriveAppContainerSidFromAppContainerName(d.profile_name.c_str(), &sid.value); if (FAILED(sid_result)) return HRESULT_CODE(sid_result);
-  SECURITY_CAPABILITIES security{}; security.AppContainerSid = sid.value; // Same identity, no capabilities.
+  RegistryReadCapability registry;error=registry.Initialize();if(error)return error;
+  SECURITY_CAPABILITIES security{}; security.AppContainerSid = sid.value;security.CapabilityCount=d.policy_variant==L"lpac-registry-read-no-network-v2"?1:0;security.Capabilities=security.CapabilityCount?&registry.entry:nullptr; // Same identity and explicit registry-only policy; no network capability.
   HANDLE handles[] = {input, output};
   for (HANDLE h : handles) { DWORD flags = 0; if (!GetHandleInformation(h, &flags) || !(flags & HANDLE_FLAG_INHERIT) || GetFileType(h) != FILE_TYPE_PIPE) return ERROR_INVALID_HANDLE; }
   SIZE_T size = 0; InitializeProcThreadAttributeList(nullptr, 3, 0, &size); if (!size) return GetLastError();
@@ -235,13 +262,14 @@ DWORD ControlledJob::SpawnNodeCheck(const LaunchDescriptor& d, const std::vector
       !UpdateProcThreadAttribute(list, 0, PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY, &policy, sizeof(policy), nullptr, nullptr)) return GetLastError();
   STARTUPINFOEXW startup{}; startup.StartupInfo.cb = sizeof(startup); startup.lpAttributeList = list; startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
   startup.StartupInfo.hStdInput = input; startup.StartupInfo.hStdOutput = output; startup.StartupInfo.hStdError = output;
-  std::wstring command = Quote(d.node_executable); for (const auto& argument : args) command += L" " + Quote(argument);
+  std::wstring command = Quote(executable); for (const auto& argument : args) command += L" " + Quote(argument);
   wchar_t windows[MAX_PATH]{}; if (!GetWindowsDirectoryW(windows, MAX_PATH)) return GetLastError();
   std::vector<std::wstring> environment = {L"APPDATA=" + d.scratch, L"LOCALAPPDATA=" + d.scratch, L"PI_OFFLINE=1", L"SystemDrive=" + std::wstring(windows, 2), L"SystemRoot=" + std::wstring(windows), L"TEMP=" + d.scratch, L"TMP=" + d.scratch, L"USERPROFILE=" + d.scratch};
+  if(shell){environment.push_back(L"LANG=C");environment.push_back(L"LC_ALL=C");environment.push_back(L"HOME="+d.scratch);environment.push_back(L"PATH="+d.shell_root+L"\\usr\\bin;"+d.shell_root+L"\\mingw64\\bin");environment.push_back(L"GIT_CONFIG_NOSYSTEM=1");environment.push_back(L"GIT_CONFIG_GLOBAL=NUL");environment.push_back(L"GIT_TERMINAL_PROMPT=0");environment.push_back(L"GCM_INTERACTIVE=never");environment.push_back(L"MSYS2_ARG_CONV_EXCL=*");}
   std::sort(environment.begin(), environment.end()); std::vector<wchar_t> block;
   for (const auto& item : environment) { block.insert(block.end(), item.begin(), item.end()); block.push_back(L'\0'); } block.push_back(L'\0');
   PROCESS_INFORMATION created{};
-  if (!CreateProcessW(d.node_executable.c_str(), command.data(), nullptr, nullptr, TRUE, CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW,
+  if (!CreateProcessW(executable.c_str(), command.data(), nullptr, nullptr, TRUE, CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW,
       block.data(), d.workspace.c_str(), &startup.StartupInfo, &created)) return GetLastError();
   Handle process{created.hProcess}, thread{created.hThread};
   const auto fail = [&](DWORD failure) { TerminateProcess(process.value, failure); WaitForSingleObject(process.value, 5000); return failure; };
@@ -250,6 +278,9 @@ DWORD ControlledJob::SpawnNodeCheck(const LaunchDescriptor& d, const std::vector
   Handle token; if (!OpenProcessToken(process.value, TOKEN_QUERY, &token.value)) return fail(GetLastError());
   DWORD bytes = 0; GetTokenInformation(token.value, TokenAppContainerSid, nullptr, 0, &bytes); std::vector<unsigned char> data(bytes);
   if (!bytes || !GetTokenInformation(token.value, TokenAppContainerSid, data.data(), bytes, &bytes) || !EqualSid(reinterpret_cast<TOKEN_APPCONTAINER_INFORMATION*>(data.data())->TokenAppContainer, sid.value)) return fail(ERROR_ACCESS_DENIED);
+  DWORD capability_bytes=0;GetTokenInformation(token.value,TokenCapabilities,nullptr,0,&capability_bytes);std::vector<unsigned char> capability_info(capability_bytes);
+  if(!capability_bytes||!GetTokenInformation(token.value,TokenCapabilities,capability_info.data(),capability_bytes,&capability_bytes))return fail(ERROR_ACCESS_DENIED);
+  const auto* actual_capabilities=reinterpret_cast<TOKEN_GROUPS*>(capability_info.data());if(actual_capabilities->GroupCount!=security.CapabilityCount||(security.CapabilityCount&&!EqualSid(actual_capabilities->Groups[0].Sid,registry.entry.Sid)))return fail(ERROR_ACCESS_DENIED);
   if (ResumeThread(thread.value) == static_cast<DWORD>(-1)) return fail(GetLastError());
   *result = created; result->hProcess = process.release(); result->hThread = thread.release(); return ERROR_SUCCESS;
 }

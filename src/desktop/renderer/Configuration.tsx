@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { Icon } from './icons.tsx';
-import { contextPolicyDisclosure, formatCostMicros, LOCAL_RESOURCE_SCOPE, modelAuthorizationChanged, modelAuthorizationUnavailable, modelPreparationUnavailable } from './configuration-model.ts';
+import { contextPolicyDisclosure, formatCostMicros, LOCAL_RESOURCE_SCOPE, modelAuthorizationChanged, modelAuthorizationUnavailable, modelPreparationUnavailable, runtimePolicyDisclosure } from './configuration-model.ts';
 import type { ConfigurationSummary, Demand, ProviderConfiguration, ViewState } from './types.ts';
 
 const stageNames = { planning: '规划方法', implementation: '实施方法', review: '独立 Review 方法' };
@@ -10,6 +10,8 @@ function Gaps({ items }: { items: string[] }) { return items.length ? <ul classN
 
 export function ConfigurationPanel({ state, demand, pending, preparing, offline, onImport, onReview }: { state: ViewState; demand?: Demand; pending: boolean; preparing: boolean; offline: boolean; onImport: () => void; onReview: (demand: Demand) => void }) {
   const summary = state.configuration;
+  const runtime = summary?.configuration.runtime;
+  const policy = runtimePolicyDisclosure(runtime?.policyVariant);
   const reason = modelPreparationUnavailable(state, demand);
   const authorization = summary?.authorization;
   const alreadyRecorded = !!demand && authorization?.demandId === demand.id && authorization.configurationDigest === summary?.configurationDigest;
@@ -30,7 +32,7 @@ export function ConfigurationPanel({ state, demand, pending, preparing, offline,
     <Gaps items={summary?.provider.blockers ?? []} />
     <div className="configuration-grant"><div><strong>{demand ? `授权对象：${demand.title}` : '先选择一条需求'}</strong><p>{alreadyRecorded ? `已记录模型授权 ${authorization.grantId}。Host 会继续核验实际剩余额度、有效期与资料范围。` : 'Host 会先计算实际源文件、冻结方法与产物的 ID 和摘要，再交给你审阅。准备清单不授予模型、资料传输或执行权限。'}</p></div><button className="button primary compact" disabled={pending || preparing || offline || !!reason || alreadyRecorded} onClick={() => { if (demand && summary) onReview(demand); }}><Icon name="shield" size={14} />{preparing ? '正在准备资料清单…' : alreadyRecorded ? '此配置授权已记录' : '审阅模型与资源授权'}</button>{reason && !alreadyRecorded && <p className="configuration-disabled-reason">{reason}</p>}</div>
     <div className="configuration-section-heading"><span className="configuration-step">03 · 原生运行核验</span><span className="tiny-pill">由 Host 判定</span></div>
-    {summary?.configuration.runtime && <Fact label="运行组合" value={summary.configuration.runtime.profileId} />}
+    {runtime && <><Fact label="运行组合" value={runtime.profileId} /><Fact label="已选择的隔离策略" value={policy.label} /><Fact label="策略版本" value={policy.id} /><p className="detail-muted">{policy.detail}</p></>}
     <p className="detail-muted">文件存在、方法已加载或额度已批准，都不代表隔离与真实模型通道已经通过。</p>
     <Gaps items={summary?.runtime.blockers ?? ['尚无已验证的原生运行组合。']} />
   </section>;

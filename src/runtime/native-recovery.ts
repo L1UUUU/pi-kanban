@@ -20,7 +20,7 @@ export class NativeRecoveryStore {
   readonly directory:string;
   constructor(directory:string){this.directory=resolve(directory);mkdirSync(this.directory,{recursive:true,mode:0o700});noLinks(this.directory);}
   private path(runId:string){return join(this.directory,`${identifier(runId)}.state.json`);}
-  private save(record:RecoveryRecord){noLinks(this.directory);const path=this.path(record.runId),temporary=`${path}.${randomBytes(8).toString('hex')}.tmp`;writeFileSync(temporary,JSON.stringify(record),{flag:'wx',mode:0o600});renameSync(temporary,path);}
+  private save(record:RecoveryRecord){noLinks(this.directory);const path=this.path(record.runId),temporary=`${path}.${randomBytes(8).toString('hex')}.tmp`;writeFileSync(temporary,JSON.stringify(record),{flag:'wx',mode:0o600,flush:true});renameSync(temporary,path);}
   private read(runId:string):RecoveryRecord|null { const path=this.path(runId);if(!existsSync(path))return null;noLinks(path);if(lstatSync(path).size>16384)throw new RuntimeError('RECOVERY_STATE_INVALID','Native recovery state exceeded bound');const record=JSON.parse(readFileSync(path,'utf8')) as RecoveryRecord;
     if(record.version!==1||record.runId!==runId||!/^[a-f0-9]{64}$/.test(record.recoveryKey)||!/^[a-f0-9]{64}$/.test(record.recoveryContextSha256)||record.recoveryReceiptPath!==join(this.directory,`${runId}.receipt.json`))throw new RuntimeError('RECOVERY_STATE_INVALID','Invalid Host recovery state');return record; }
   prepare(run:RunRecord,profile:LockedRuntimeProfile):NativeRecoveryDescriptor { if(existsSync(this.path(run.runId)))throw new RuntimeError('RECOVERY_REPLAY','A native generation cannot reuse prior recovery state');const record:RecoveryRecord={version:1,runId:run.runId,generation:run.generation,identity:null,recoveryReceiptPath:join(this.directory,`${identifier(run.runId)}.receipt.json`),recoveryKey:randomBytes(32).toString('hex'),recoveryContextSha256:nativeRecoveryContext(run,profile)};this.save(record);return {recoveryReceiptPath:record.recoveryReceiptPath,recoveryKey:record.recoveryKey,recoveryContextSha256:record.recoveryContextSha256}; }
@@ -34,8 +34,10 @@ export class NativeRecoveryStore {
     const expected=createHmac('sha256',Buffer.from(record.recoveryKey,'hex')).update(domain).update(envelope.payload).digest();
     if(!timingSafeEqual(expected,Buffer.from(envelope.mac,'hex')))throw new RuntimeError('RECOVERY_RECEIPT_INVALID','Native receipt authentication failed');
     const receipt=JSON.parse(envelope.payload) as Record<string,unknown>,identity=run.identity??record.identity;
-    if(receipt.version!==1||receipt.generation!==run.generation||receipt.contextSha256!==record.recoveryContextSha256||receipt.stopConfirmed!==true||receipt.resourcesRevoked!==true||receipt.activeProcesses!==0||!Number.isSafeInteger(receipt.pid)||Number(receipt.pid)<1||typeof receipt.birth!=='string'||!/^\d+$/.test(receipt.birth)||
-      (identity&&(identity.pid!==receipt.pid||identity.birth!==receipt.birth||identity.generation!==receipt.generation)))throw new RuntimeError('RECOVERY_RECEIPT_INVALID','Receipt lacks exact process identity, zero Job census, or revoked resources');
+    const neverCreated=receipt.neverCreated===true;
+    const validIdentity=neverCreated?receipt.pid===null&&receipt.birth===null&&!identity:Number.isSafeInteger(receipt.pid)&&Number(receipt.pid)>0&&typeof receipt.birth==='string'&&/^\d+$/.test(receipt.birth)&&(!identity||(identity.pid===receipt.pid&&identity.birth===receipt.birth&&identity.generation===receipt.generation));
+    if(receipt.version!==1||receipt.generation!==run.generation||receipt.contextSha256!==record.recoveryContextSha256||receipt.stopConfirmed!==true||receipt.resourcesRevoked!==true||receipt.activeProcesses!==0||!validIdentity)
+      throw new RuntimeError('RECOVERY_RECEIPT_INVALID','Receipt lacks exact native creation/identity, zero Job census, or revoked resources');
     return {state:'stopped',generation:run.generation,activePids:[],proof:JSON.stringify({kind:'authenticated-native-stop-receipt',receipt,receiptSha256:createHash('sha256').update(envelope.payload).digest('hex')})};
   }
 }

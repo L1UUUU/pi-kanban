@@ -1,16 +1,21 @@
 import { createHash } from 'node:crypto';
-import { lstatSync, realpathSync, openSync, fstatSync, closeSync, readSync } from 'node:fs';
+import { lstatSync, realpathSync, openSync, fstatSync, closeSync, readSync, constants } from 'node:fs';
 import { isAbsolute, relative, resolve, dirname } from 'node:path';
 import { release } from 'node:os';
 import { RuntimeError } from './types.ts';
+import { readLockedShellManifest } from './shell-profile.ts';
+import type { LockedShellRuntime } from './shell-profile.ts';
+export type { LockedShellRuntime } from './shell-profile.ts';
 import { MAX_WINDOWS_EVIDENCE_BYTES, requireWindowsProbeCoverage, validateWindowsEvidenceTrustAnchor, verifyWindowsEvidence } from './evidence-auth.ts';
-import type { WindowsEvidenceTrustAnchor } from './evidence-auth.ts';
+import type { WindowsEvidenceTrustAnchor, WindowsRuntimePolicyVariant } from './evidence-auth.ts';
 export { REQUIRED_WINDOWS_PROBES } from './evidence-auth.ts';
-export type { WindowsEvidenceTrustAnchor } from './evidence-auth.ts';
+export type { WindowsEvidenceTrustAnchor, WindowsRuntimePolicyVariant } from './evidence-auth.ts';
 interface BinaryLock { path: string; version: string; sha256: string }
 export interface LockedRuntimeProfile {
   profileId: string; osBuild: string; arch: 'x64'; node: BinaryLock; helper: BinaryLock; worker: BinaryLock;
   pi: BinaryLock & { package: '@earendil-works/pi-coding-agent' }; policySha256: string;
+  policyVariant?: WindowsRuntimePolicyVariant;
+  shell?: LockedShellRuntime | null;
   evidence: { id: string; path: string; sha256: string }[];
 }
 function freezeDeep<T>(value: T): T { if (value && typeof value === 'object') { for (const item of Object.values(value)) freezeDeep(item); Object.freeze(value); } return value; }
@@ -36,7 +41,7 @@ function object(value: unknown): Record<string, unknown> {
 function boundedRead(path: string, maxBytes: number): Buffer {
   const before = lstatSync(path);
   if (!before.isFile() || before.size > maxBytes) throw new RuntimeError('PROFILE_FILE_INVALID', 'Expected a bounded regular file');
-  const fd = openSync(path, 'r');
+  const fd = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
   try {
     const opened = fstatSync(fd);
     if (!opened.isFile() || opened.dev !== before.dev || opened.ino !== before.ino || opened.size > maxBytes)
@@ -72,6 +77,8 @@ function verifyProfile(input: unknown, trustedEvidenceRoot: string, trust: Windo
     throw new RuntimeError('PROFILE_MACHINE_MISMATCH', 'Profile OS build and architecture must match this machine exactly');
   if (Number(release().split('.')[2]) < 22000) throw new RuntimeError('WINDOWS_11_REQUIRED', 'Windows 11 build or later required');
   if (typeof config.policySha256 !== 'string' || !/^[a-f0-9]{64}$/.test(config.policySha256)) throw new RuntimeError('POLICY_UNVERIFIED', 'Policy digest missing');
+  if (config.policyVariant !== undefined && config.policyVariant !== 'lpac-strict-v1' && config.policyVariant !== 'lpac-registry-read-no-network-v2')
+    throw new RuntimeError('PROFILE_POLICY_MISMATCH', 'An explicit supported Windows policy variant is required');
   for (const key of ['node', 'helper', 'worker', 'pi'] as const) {
     const binary = object(config[key]);
     if (typeof binary.version !== 'string' || !binary.version || typeof binary.sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(binary.sha256) || typeof binary.path !== 'string')
@@ -80,6 +87,7 @@ function verifyProfile(input: unknown, trustedEvidenceRoot: string, trust: Windo
   }
   if (!/^v?24\./.test(config.node.version) || config.pi.package !== '@earendil-works/pi-coding-agent')
     throw new RuntimeError('PROFILE_RUNTIME_MISMATCH', 'Expected Node 24 and the exact official Pi package');
+  if (config.shell !== undefined && config.shell !== null) readLockedShellManifest(config.shell);
   if (!Array.isArray(config.evidence) || !config.evidence.length || config.evidence.length > 32)
     throw new RuntimeError('ISOLATION_UNVERIFIED', 'Bounded independently captured Windows evidence required');
   const root = lockedPath(trustedEvidenceRoot), covered = new Set<string>(), digests: string[] = [];
@@ -99,7 +107,7 @@ function verifyProfile(input: unknown, trustedEvidenceRoot: string, trust: Windo
     for (const probe of report.probes) covered.add(probe.id);
     digests.push(ref.sha256);
   }
-  requireWindowsProbeCoverage(covered);
+  requireWindowsProbeCoverage(covered, config.shell != null);
   return make(config, digests);
 }
 /** The two-argument form intentionally fails closed until the Host has a pinned recorder trust anchor. */

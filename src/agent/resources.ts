@@ -3,6 +3,7 @@ import { createExtensionRuntime } from '@earendil-works/pi-coding-agent';
 import type { ResourceLoader } from '@earendil-works/pi-coding-agent';
 import type { RuntimeRole } from '../runtime/types.ts';
 import { RuntimeError } from '../runtime/types.ts';
+import { reportAdapterInstructions } from './report-contract.ts';
 
 export interface AgentMaterial {
   id:string;kind:'method'|'plan'|'source'|'knowledge'|'check-evidence'|'implementation-session'|'implementation-summary';
@@ -23,7 +24,7 @@ export function explicitResourceLoader(role:RuntimeRole,materials:readonly Agent
     getExtensions:()=>({extensions:[],errors:[],runtime:extensionRuntime}),
     getSkills:()=>({skills:[],diagnostics:[]}),getPrompts:()=>({prompts:[],diagnostics:[]}),getThemes:()=>({themes:[],diagnostics:[]}),
     getAgentsFiles:()=>({agentsFiles:context.map(x=>({...x}))}),
-    getSystemPrompt:()=>`You are the ${role} Worker for a controlled local workbench. Report evidence through the Host bridge. You cannot grant authorization or accept results.\n\n${method}`,
+    getSystemPrompt:()=>`You are the ${role} Worker for a controlled local workbench. Report evidence through the Host bridge. You cannot grant authorization or accept results.\n\n${reportAdapterInstructions(role)}\n\nSelected frozen method:\n${method}`,
     getSystemPromptSource:()=>undefined,getAppendSystemPrompt:()=>[],getAppendSystemPromptSources:()=>[],
     extendResources:()=>{throw new RuntimeError('RESOURCE_DISCOVERY_DENIED','Runtime resource extension is disabled');},
     reload:async()=>{},

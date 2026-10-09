@@ -17,6 +17,7 @@
 using namespace pi_kanban;
 namespace fs = std::filesystem;
 namespace {
+bool registry_read_policy=false,all_network_validated=true;
 void Require(bool value, const char* detail) { if (!value) throw std::runtime_error(std::string(detail) + ": " + std::to_string(GetLastError())); }
 std::wstring Self() { std::vector<wchar_t> path(32768); DWORD n = GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size())); Require(n > 0, "self path"); return {path.data(), n}; }
 void Write(const fs::path& path, const std::string& text) { std::ofstream out(path, std::ios::binary); Require(!!out, "write fixture"); out << text; }
@@ -73,18 +74,21 @@ int ProbeChild() {
   HANDLE input = GetStdHandle(STD_INPUT_HANDLE); std::vector<wchar_t> buffer(8192); DWORD bytes = 0;
   Require(!!ReadFile(input, buffer.data(), static_cast<DWORD>((buffer.size()-1)*sizeof(wchar_t)), &bytes, nullptr), "read private input");
   const std::wstring config(buffer.data(), bytes/sizeof(wchar_t)); std::wistringstream lines(config);
-  std::wstring root_text, own_text, role, port_text; std::getline(lines, root_text); std::getline(lines, own_text); std::getline(lines, role); std::getline(lines, port_text);
+  std::wstring root_text, own_text, role, port_text, policy; std::getline(lines, root_text); std::getline(lines, own_text); std::getline(lines, role); std::getline(lines, port_text);std::getline(lines,policy);
   fs::path root(root_text), own(own_text); DWORD e_read = 0, e_write = 0, e_other = 0, e_db = 0, e_git = 0;
   const bool own_read = CanRead(own/L"source.txt", &e_read);
   const bool own_write = CanWrite(own/L"source.txt", &e_write);
   const bool other_read = CanRead(root/L"other"/L"private.txt", &e_other);
   const bool db_read = CanRead(root/L"host.sqlite", &e_db);
   const bool git_read = CanRead(root/L"shared-git"/L"object", &e_git);
+  const auto registry_path=L"Software\\pi-kanban-native-probe\\"+root.filename().wstring();
+  wchar_t registry_value[64]{};DWORD registry_bytes=sizeof(registry_value);const LSTATUS registry_status=RegGetValueW(HKEY_CURRENT_USER,registry_path.c_str(),L"private-marker",RRF_RT_REG_SZ,nullptr,registry_value,&registry_bytes);
+  const bool registry_leak=registry_status==ERROR_SUCCESS;
   wchar_t leaked[64]{}; const bool env_leak = GetEnvironmentVariableW(L"FORBIDDEN_HOST_CREDENTIAL", leaked, 64) != 0;
   WSADATA sockets{}; const int wsa_startup_error = WSAStartup(MAKEWORD(2,2), &sockets); const bool sockets_ok = wsa_startup_error == 0;
   SOCKET socket_value = sockets_ok ? socket(AF_INET, SOCK_STREAM, IPPROTO_TCP) : INVALID_SOCKET;
   sockaddr_in addr{}; addr.sin_family = AF_INET; addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK); addr.sin_port = htons(static_cast<u_short>(std::stoi(port_text)));
-  bool network = false; int network_error = 0;
+  bool network = false; int network_error = socket_value==INVALID_SOCKET?WSAGetLastError():0;
   if (socket_value != INVALID_SOCKET) { u_long nonblocking = 1; ioctlsocket(socket_value, FIONBIO, &nonblocking);
     const int result = connect(socket_value, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)); network_error = WSAGetLastError();
     if (result == 0) network = true;
@@ -100,10 +104,10 @@ int ProbeChild() {
   PROCESS_INFORMATION escape{};const bool escaped=!!CreateProcessW(Self().c_str(),command.data(),nullptr,nullptr,FALSE,CREATE_NO_WINDOW|CREATE_BREAKAWAY_FROM_JOB,nullptr,nullptr,&startup,&escape);
   const DWORD breakaway_error=escaped?0:GetLastError();
   if(escaped){TerminateProcess(escape.hProcess,1);CloseHandle(escape.hThread);CloseHandle(escape.hProcess);}
-  const bool expected=own_read&&(own_write==(role==L"implementation"))&&!other_read&&!db_read&&!git_read&&!env_leak&&!network&&!escaped;
+  const bool expected=own_read&&(own_write==(role==L"implementation"))&&!other_read&&!db_read&&!git_read&&!env_leak&&!registry_leak&&(policy!=L"registry-read"||(sockets_ok&&network_error==WSAEACCES))&&!network&&!escaped;
   std::ostringstream report;report<<"{\"phase\":\"native-child-probes\",\"role\":\""<<(role==L"implementation"?"implementation":"review")<<"\",\"ownRead\":"<<own_read<<",\"ownWrite\":"<<own_write
-    <<",\"otherRead\":"<<other_read<<",\"hostDbRead\":"<<db_read<<",\"sharedGitRead\":"<<git_read<<",\"environmentLeak\":"<<env_leak<<",\"loopbackConnected\":"<<network
-    <<",\"networkError\":"<<network_error<<",\"wsaStartupError\":"<<wsa_startup_error<<",\"childSpawned\":"<<spawned_child<<",\"childSpawnError\":"<<child_spawn_error<<",\"breakawaySucceeded\":"<<escaped<<",\"breakawayError\":"<<breakaway_error<<",\"readError\":"<<e_read<<",\"writeError\":"<<e_write<<",\"crossReadError\":"<<e_other<<",\"passed\":"<<expected<<"}\n";
+    <<",\"otherRead\":"<<other_read<<",\"hostDbRead\":"<<db_read<<",\"sharedGitRead\":"<<git_read<<",\"hostRegistryRead\":"<<registry_leak<<",\"hostRegistryStatus\":"<<registry_status<<",\"environmentLeak\":"<<env_leak<<",\"loopbackConnected\":"<<network
+    <<",\"networkError\":"<<network_error<<",\"policy\":\""<<(policy==L"registry-read"?"registry-read":"strict")<<"\",\"networkDenialProven\":"<<(sockets_ok&&!network&&network_error==WSAEACCES)<<",\"wsaStartupError\":"<<wsa_startup_error<<",\"childSpawned\":"<<spawned_child<<",\"childSpawnError\":"<<child_spawn_error<<",\"breakawaySucceeded\":"<<escaped<<",\"breakawayError\":"<<breakaway_error<<",\"readError\":"<<e_read<<",\"writeError\":"<<e_write<<",\"crossReadError\":"<<e_other<<",\"passed\":"<<expected<<"}\n";
   const auto text=report.str();DWORD written=0;Require(!!WriteFile(GetStdHandle(STD_OUTPUT_HANDLE),text.data(),static_cast<DWORD>(text.size()),&written,nullptr),"private report");
   Heartbeat(root/L"scratch"/L"parent-heartbeat.txt"); return 0;
 }
@@ -125,9 +129,9 @@ void RunRole(const fs::path& root,const std::wstring& role,SOCKET listener) {
   Require(!!CreatePipe(&in_read,&in_write,&sa,0)&&!!CreatePipe(&out_read,&out_write,&sa,0)&&!!CreatePipe(&log_read,&log_write,&sa,0),"private pipes");
   SetHandleInformation(in_write,HANDLE_FLAG_INHERIT,0);SetHandleInformation(out_read,HANDLE_FLAG_INHERIT,0);SetHandleInformation(log_read,HANDLE_FLAG_INHERIT,0);
   sockaddr_in bound{};int bound_size=sizeof(bound);Require(getsockname(listener,reinterpret_cast<sockaddr*>(&bound),&bound_size)==0,"listener address");
-  const auto command=root.wstring()+L"\n"+(root/L"own").wstring()+L"\n"+role+L"\n"+std::to_wstring(ntohs(bound.sin_port))+L"\n";
+  const auto command=root.wstring()+L"\n"+(root/L"own").wstring()+L"\n"+role+L"\n"+std::to_wstring(ntohs(bound.sin_port))+L"\n"+(registry_read_policy?L"registry-read":L"strict")+L"\n";
   DWORD sent=0;Require(!!WriteFile(in_write,command.data(),static_cast<DWORD>(command.size()*sizeof(wchar_t)),&sent,nullptr),"private command");
-  LaunchDescriptor d;d.demand=L"A";d.role=role;d.generation=generation;d.profile_name=profile.name;
+  LaunchDescriptor d;d.policy_variant=registry_read_policy?L"lpac-registry-read-no-network-v2":L"lpac-strict-v1";d.demand=L"A";d.role=role;d.generation=generation;d.profile_name=profile.name;
   d.node_executable=(root/L"bin"/L"probe.exe").wstring();d.worker_entry=(root/L"bin"/L"entry.fixture").wstring();d.workspace=(root/L"own").wstring();d.scratch=(root/L"scratch").wstring();
   d.node_sha256=Sha256(d.node_executable);d.worker_sha256=Sha256(d.worker_entry);
   d.policy_evidence=L"synthetic-ci-probe-not-G1";d.acl_evidence=L"this-test-provisioned-dacl";d.private_channel_evidence=L"candidate-under-test";
@@ -140,6 +144,7 @@ void RunRole(const fs::path& root,const std::wstring& role,SOCKET listener) {
   while(GetTickCount64()<deadline){if(PeekNamedPipe(out_read,nullptr,0,nullptr,&available,nullptr)&&available)break;Sleep(10);}
   Require(available>0&&available<16384,"bounded private report timeout");std::vector<char> report(available);DWORD received=0;
   Require(!!ReadFile(out_read,report.data(),available,&received,nullptr),"private report read");const std::string raw(report.data(),received);std::cout<<raw<<std::flush;
+  all_network_validated=all_network_validated&&raw.find("\"networkDenialProven\":1")!=std::string::npos;
   Require(raw.find("\"passed\":1")!=std::string::npos,"one or more access probes failed");
   // Direct child creation remains recorded (including its failure). The supported command
   // path is native-mediated into the SAME SID and Job, never unrestricted Host execution.
@@ -163,10 +168,14 @@ int wmain(int argc,wchar_t** argv) {
   try{
     if(argc==3&&std::wstring(argv[1])==L"--descendant"){Heartbeat(argv[2]);return 0;}
     if(argc==4&&std::wstring(argv[2])==L"--controlled-run")return ProbeChild();
+    if(argc==2&&std::wstring(argv[1])==L"--registry-read")registry_read_policy=true;
     Require(AppContainerProfileName(L"A",L"implementation",L"generation-1")==L"pi-kanban-a898bef33cf31470bdfb100d74db470c2cbf93aea19effb2","Host/native profile-name binding must match");
     const auto root=fs::temp_directory_path()/(L"pi-kanban-native-smoke-"+std::to_wstring(GetCurrentProcessId())+L"-"+std::to_wstring(GetTickCount64()));
     fs::create_directories(root);Acl(root,nullptr,0);fs::create_directories(root/L"other");fs::create_directories(root/L"shared-git");
     Write(root/L"other"/L"private.txt","SYNTHETIC-OTHER-DEMAND");Write(root/L"shared-git"/L"object","SYNTHETIC-PRIVATE-OBJECT");Write(root/L"host.sqlite","SYNTHETIC-HOST-CONTROL");
+    const auto registry_path=L"Software\\pi-kanban-native-probe\\"+root.filename().wstring();HKEY registry_key=nullptr;
+    Require(RegCreateKeyExW(HKEY_CURRENT_USER,registry_path.c_str(),0,nullptr,REG_OPTION_VOLATILE,KEY_SET_VALUE,nullptr,&registry_key,nullptr)==ERROR_SUCCESS,"create synthetic private registry fixture");
+    const wchar_t registry_marker[]=L"SYNTHETIC-HOST-SECRET";Require(RegSetValueExW(registry_key,L"private-marker",0,REG_SZ,reinterpret_cast<const BYTE*>(registry_marker),sizeof(registry_marker))==ERROR_SUCCESS,"write synthetic private registry marker");RegCloseKey(registry_key);
     SetEnvironmentVariableW(L"FORBIDDEN_HOST_CREDENTIAL",L"SYNTHETIC-NOT-A-REAL-SECRET");
     WSADATA sockets{};Require(WSAStartup(MAKEWORD(2,2),&sockets)==0,"listener sockets");SOCKET listener=socket(AF_INET,SOCK_STREAM,IPPROTO_TCP);
     sockaddr_in bind_to{};bind_to.sin_family=AF_INET;bind_to.sin_addr.s_addr=htonl(INADDR_LOOPBACK);
@@ -174,7 +183,8 @@ int wmain(int argc,wchar_t** argv) {
     RunRole(root,L"implementation",listener);RunRole(root,L"review",listener);
     closesocket(listener);WSACleanup();SetEnvironmentVariableW(L"FORBIDDEN_HOST_CREDENTIAL",nullptr);
     // Keep synthetic artifacts on failure; remove only this freshly generated root after success.
-    fs::remove_all(root);std::cout<<"{\"phase\":\"complete\",\"nativeSmokePassed\":true,\"nodeGitBashPiCompatibility\":\"not-tested\",\"fullG1\":false}"<<std::endl;return 0;
+    Require(RegDeleteTreeW(HKEY_CURRENT_USER,registry_path.c_str())==ERROR_SUCCESS,"delete only own synthetic registry fixture");
+    fs::remove_all(root);std::cout<<"{\"phase\":\"complete\",\"nativeSmokePassed\":true,\"policyVariant\":\""<<(registry_read_policy?"lpac-registry-read-no-network-v2":"lpac-strict-v1")<<"\",\"networkPolicyValidated\":"<<all_network_validated<<",\"nodeGitBashPiCompatibility\":\"not-tested\",\"fullG1\":false}"<<std::endl;return 0;
   }catch(const std::exception& error){std::cerr<<"native smoke failed: "<<error.what()<<std::endl;return 1;}
 }
 #endif

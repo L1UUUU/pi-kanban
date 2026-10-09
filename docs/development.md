@@ -24,9 +24,27 @@ Browser tests use Playwright and record screenshots as CI artifacts. They establ
 cmake -S native/windows -B build/native -A x64
 cmake --build build/native --config Release
 ctest --test-dir build/native -C Release --output-on-failure
+npm run build
+node native/windows/probe-worker.mjs --helper build/native/Release/pi_kanban_native_helper.exe --worker dist/worker/main.mjs --policy lpac-registry-read-no-network-v2 --git-bash "C:\Program Files\Git" --output artifacts/windows-worker
 ```
 
 The native smoke manages unique temporary synthetic identities/resources. Preserve `build/native/Testing/Temporary/LastTest.log` including failures. Do not install a new backend or disable failed negative cases to make the suite green. The product targets Windows 11 x64/NTFS; hosted Windows Server CI is useful partial Win32 evidence, not proof of that target combination.
+
+The explicit diagnostic policy above adds only the Windows `registryRead`
+capability to LPAC, because the zero-capability candidate failed real Node
+Winsock startup in CI. It adds no network capability and does not replace the
+strict default after a failed launch. Both policies are identified in observations;
+network denial requires successful Winsock initialization followed by an actual
+denied connection to a listening fixture. A failed Winsock startup is an unusable
+candidate, not proof of network isolation. Policy changes are part of the signed
+runtime identity and require new evidence. These no-model probes cannot authorize
+production execution or satisfy the real-model quality gates.
+
+`--git-bash` selects an existing official Git for Windows installation explicitly;
+adjust the example path to the actual installation. The recorder copies a bounded
+manifest of exact executable/DLL dependencies into its disposable fixture before
+applying ACLs. It does not change installed Git permissions or search for another
+shell. Missing files or an incompatible Bash runtime fail the probe.
 
 The locked Worker is emitted as `dist/worker/main.mjs`, including SDK dependencies rather than exposing the Host's node_modules directory. Runtime evidence binds its exact byte digest. On Windows, set `PI_KANBAN_GIT` to the verified absolute git.exe path before `npm start`. The launcher forwards only that path, necessary OS loader fields and the single explicitly configured `env:NAME` credential to the trusted Host. No credential enters the Worker. Restart after changing the referenced environment credential name.
 

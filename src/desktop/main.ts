@@ -73,11 +73,11 @@ async function startHost(): Promise<void> {
 }
 
 function registerControl(): void {
-  for (const method of ['snapshot', 'createDemand', 'command', 'sendMessage', 'prepareModelApproval', 'authorizeModel', 'knowledgeAction']) ipcMain.handle(`workbench:${method}`, async (event, params = {}) => {
+  for (const method of ['snapshot', 'createDemand', 'command', 'sendMessage', 'prepareModelApproval', 'authorizeModel', 'knowledgeAction', 'readArtifact']) ipcMain.handle(`workbench:${method}`, async (event, params = {}) => {
     if (!window || event.sender !== window.webContents || !isTrustedSender(event.senderFrame?.url ?? '', event.senderFrame === event.sender.mainFrame)) throw new Error('Untrusted control origin.');
     assertFrame(params);
     const state = await request(method, params);
-    window.webContents.send('workbench:state', state);
+    if (method !== 'readArtifact') window.webContents.send('workbench:state', state);
     return state;
   });
   ipcMain.handle('workbench:importConfiguration', async event => {

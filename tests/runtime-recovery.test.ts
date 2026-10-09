@@ -26,3 +26,10 @@ test('pre-registration crash recovery requires the explicit authenticated driver
   const payload=JSON.stringify({version:1,generation:captured.generation,pid:123,birth:'456',contextSha256:descriptor.recoveryContextSha256,stopConfirmed:true,resourcesRevoked:true,activeProcesses:0});const mac=createHmac('sha256',Buffer.from(descriptor.recoveryKey,'hex')).update('pi-kanban.native-stop-receipt.v1\0').update(payload).digest('hex');writeFileSync(descriptor.recoveryReceiptPath,JSON.stringify({payload,mac}));
   await recovered.recover();assert.equal(recovered.get(captured.runId).state,'stopped');database.close();
 });
+
+test('authenticated never-created cleanup is distinct from missing PID inference',()=>{
+  const directory=mkdtempSync(join(tmpdir(),'native-never-created-')),store=new NativeRecoveryStore(directory),base=fixture(),run={...base.run,runId:'never-created-run',identity:null};const descriptor=store.prepare(run,profile);
+  const payload=JSON.stringify({version:1,generation:run.generation,pid:null,birth:null,contextSha256:descriptor.recoveryContextSha256,stopConfirmed:true,resourcesRevoked:true,activeProcesses:0,neverCreated:true,terminationStatus:5});const mac=createHmac('sha256',Buffer.from(descriptor.recoveryKey,'hex')).update('pi-kanban.native-stop-receipt.v1\0').update(payload).digest('hex');
+  assert.equal(store.observe(run,profile),null);writeFileSync(descriptor.recoveryReceiptPath,JSON.stringify({payload,mac}));assert.equal(store.observe(run,profile)?.state,'stopped');
+  assert.throws(()=>store.observe({...run,identity:base.run.identity},profile),{code:'RECOVERY_RECEIPT_INVALID'});
+});

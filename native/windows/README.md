@@ -31,8 +31,10 @@ end-user behavior; capture exact OS build separately.
 absolute non-device paths, finite resource limits and pinned binary digests. It rejects
 reparse components while holding no-write/no-delete-share handles against path replacement.
 It derives the pre-provisioned AppContainer SID without silently provisioning permissions.
-The candidate uses LPAC (`ALL_APPLICATION_PACKAGES_OPT_OUT`) with no capabilities, especially
-no broad network capability. Pre-provisioned ACL evidence is required by the descriptor;
+The default strict candidate uses LPAC (`ALL_APPLICATION_PACKAGES_OPT_OUT`) with no
+capabilities. A separately selected diagnostic policy grants only the named `registryRead`
+capability for ordinary HKLM reads needed by Winsock initialization. Neither candidate
+grants internet, client/server or private-network capabilities; there is no startup fallback. Pre-provisioned ACL evidence is required by the descriptor;
 the production Host must verify its content, not merely accept a string reference.
 
 Only three explicitly listed inherited private pipe handles reach the Worker. The Job,
@@ -152,3 +154,84 @@ AppContainer profile names use a 192-bit SHA-256 prefix binding the complete dem
 and generation. They are always 58 ASCII characters, within the Win32 64-character limit.
 The native launcher recomputes the name; a truncated or caller-chosen name is rejected.
 The native smoke and TypeScript test share an exact digest vector and cover long IDs.
+
+Shared file/ancestor ACL changes are serialized across helper processes by a per-user
+Global named mutex with a protected user-and-SYSTEM-only DACL and a bounded acquisition
+time. Workers receive no mutex rights. Revoke independently reads back affected ACLs,
+including descendants of inherited grants, and refuses clean proof if its generated SID
+remains. The two-helper probe overlaps provisioning and A's revocation while B repeatedly
+uses its allowed files and remains denied adjacent private files.
+
+All post-launch exits, including broken Host stdout/stderr and failed lifecycle writes,
+use a once-only native finalizer. It terminates and censuses the Job, revokes resources,
+and persists the authenticated receipt before attempting bounded best-effort pipe output.
+It does not re-enter the native event mutex during cleanup. A final cleanup watchdog
+retains a failure/unknown outcome if cleanup itself cannot finish. The recorder closes
+both Host output readers during continuous contained Node output and checks reconstructed
+receipt authentication and quiescent writes; this is separate from orderly stdin EOF.
+
+## Sampled disk, file-count and free-space policy
+
+The helper requires finite `diskLimitBytes`, `fileLimit`, `minimumFreeBytes` and
+`diskPollMs` limits in its descriptor. Production defaults bound combined source+scratch
+bytes to 1 GiB, entries to 100,000, available space to at least 256 MiB on each volume,
+and polling to 250 ms. It samples before launching and while the Job runs; unreadable
+paths, reparse points, arithmetic errors or an exceeded bound cause the same authenticated
+stop/revoke finalizer. Source and scratch must not overlap. Files are retained, never
+silently deleted to regain space. Native diagnostics record thresholds, sampled counts,
+status, and whether available-space values were actually sampled.
+
+This is explicitly a polling monitor, **not a hard quota**. Writes can overshoot between
+samples, during traversal, or while termination completes; hard exhaustion prevention is
+not established. The Windows recorder writes a real 2 MiB scratch file under a 1 MiB
+fixture limit, checks observed stop/revocation/authentication, and retains the overflow
+file. Output/log streams remain independently byte-bounded; the probe records possible
+overshoot instead of relabeling monitoring as kernel-enforced storage containment.
+
+
+## Explicit policy candidates and locked Git Bash
+
+`lpac-strict-v1` remains the default for legacy configurations. Actual Windows CI observed
+Node 24 starting and then exiting with Winsock initialization error 10107 under that strict
+policy. This is a real compatibility failure, not successful network isolation. The native
+strict smoke retains its filesystem/Job observations and explicitly reports whether network
+initialization/denial was proven. The separate `native_registry_read_smoke` CTest requires
+successful Winsock initialization followed by actual access-denied connection behavior,
+plus denial of a disposable private HKCU registry marker. It does not change OS registry
+ACLs, firewall settings, or real user data. The marker is synthetic and deleted after success.
+
+The `lpac-registry-read-no-network-v2` diagnostic is explicitly selected by the profile and
+signed evidence. Its token capabilities are checked exactly. It is never selected in
+response to startup failure, and a strict-policy signature cannot authorize it. Microsoft's
+primary documentation distinguishes `registryRead` (HKLM read) from network capabilities:
+https://learn.microsoft.com/en-us/windows/win32/secauthz/implementing-an-appcontainer
+https://learn.microsoft.com/en-us/windows/win32/secauthz/createprocessinsandbox
+
+Run the expanded diagnostic, including an explicitly selected preinstalled official Git:
+
+```powershell
+node native/windows/probe-worker.mjs --helper build/native/Release/pi_kanban_native_helper.exe --worker dist/worker/main.mjs --output artifacts/windows-worker --policy lpac-registry-read-no-network-v2 --git-bash "C:\Program Files\Git"
+```
+
+The fixture copies only enumerated executable/DLL files from fixed official Git runtime
+subdirectories into its disposable tree. It hashes the complete exact-file manifest and
+never changes installed Git ACLs. Shell startup is the pinned executable with fixed
+`--noprofile --norc -c` arguments, scratch HOME, curated manifest-root PATH and no inherited
+credentials/config/proxy environment. Every dependency is pinned and hashed before launch;
+no root-directory read grant is substituted. Actual Bash `cat`/`rm`, own-source writes and
+deletes, reviewer denials, private/unlisted sibling denial and `/dev/tcp` access denial are
+checked through the independent native receipt and stop/revocation channel. A missing
+runtime file, denied child launch, failed Bash startup or inaccessible dependency fails
+closed, without a normal-user shell fallback. Execution of these expanded probes is a
+separate CI result; implementing them is not a passing release claim.
+
+Implementation source ACLs include scoped DELETE on inherited source objects but never
+parent FILE_DELETE_CHILD. Protected `.git` and `.local` deny DELETE. The real Node/Bash
+probes check that implementation can unlink its fixture while review cannot and protected
+Git metadata remains denied.
+
+Unconfirmed Host launch now queues stop and closes only its exact helper control pipe.
+A native receipt can attest either actual zero-Job process identity and cleanup, or the
+separate `neverCreated` state when CreateProcess never succeeded and scoped permissions
+were revoked. A missing PID does not imply either state. Late native launch before Host
+registration and pre-creation reparse rejection both have explicit recovery probes.

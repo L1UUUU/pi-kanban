@@ -1,5 +1,5 @@
 import type { KnowledgeAction, KnowledgeLifecycleView } from '../../host/knowledge-lifecycle.ts';
-import type { Finding, Methods, Stage } from '../../domain/types.ts';
+import type { ArtifactRef, Finding, Methods, Stage } from '../../domain/types.ts';
 import type { ConfigurationSummary } from '../../host/configuration.ts';
 export type { ConfigurationSummary, ProviderConfiguration } from '../../host/configuration.ts';
 /** Display-only Host snapshot. This is not an authorization boundary or a second workflow engine. */
@@ -22,10 +22,10 @@ export interface Message {
   timestamp?: string;
   stage?: string;
 }
-export interface Check { id: string; name: string; status: 'passed' | 'failed' | 'unavailable' | 'pending'; evidence?: string; contentId?: string }
+export interface Check { id: string; name: string; status: 'passed' | 'failed' | 'unavailable' | 'pending'; evidence?: string; contentId?: string; artifact?: ArtifactRef }
 export interface Knowledge { id: string; title: string; status: 'candidate' | 'verified' | 'ineligible'; detail?: string; source?: string }
-export interface Plan { id: string; scope: string; ready: boolean; confirmed: boolean; specPath?: string; requiredChecks?: string[]; unresolvedQuestions?: string[] }
-export interface Result { id: string; contentId: string; notes: string; createdAt: string; codeRef?: string; knowledgeRefs?: string[]; accepted?: boolean }
+export interface Plan { id: string; scope: string; ready: boolean; confirmed: boolean; specPath?: string; requiredChecks?: string[]; unresolvedQuestions?: string[]; spec?: ArtifactRef; tickets?: ArtifactRef; boundaryReviewEvidence?: ArtifactRef }
+export interface Result { id: string; contentId: string; notes: string; createdAt: string; codeRef?: string; knowledgeRefs?: string[]; accepted?: boolean; reviewEvidence?: ArtifactRef; codeArtifact?: ArtifactRef; knowledgeArtifacts?: ArtifactRef[] }
 export interface Demand {
   id: string;
   projectId: string;
@@ -98,6 +98,8 @@ export interface ModelAuthorizationCommand {
   configurationDigest: string;
   resourceScope: 'demand-worktree-private-runtime-v1';
 }
+export interface ArtifactRequest { demandId: string; artifactId: string; digest: string; offset?: number }
+export interface ArtifactPage { id: string; digest: string; kind: string; text: string; totalCharacters: number; offset: number; nextOffset: number | null }
 export interface WorkbenchBridge {
   snapshot(): Promise<ViewState>;
   subscribe(listener: (state: ViewState) => void): () => void;
@@ -108,6 +110,7 @@ export interface WorkbenchBridge {
   createDemand(input: { projectId: string; title: string; description: string; requestId: string }): Promise<ViewState>;
   command(input: Command): Promise<ViewState>;
   knowledgeAction(input: KnowledgeAction): Promise<ViewState>;
+  readArtifact(input: ArtifactRequest): Promise<ArtifactPage>;
   sendMessage(input: { demandId: string; text: string; requestId: string }): Promise<ViewState>;
 }
 declare global { interface Window { workbench?: WorkbenchBridge } }

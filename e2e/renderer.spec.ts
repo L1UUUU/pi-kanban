@@ -398,6 +398,7 @@ test.describe('Synthetic renderer interaction coverage (not backend acceptance)'
     await page.getByRole('button', { name: '切换冻结方法', exact: true }).click();
     const dialog = page.getByRole('dialog');
     await expect(dialog.getByRole('button', { name: '切换冻结方法', exact: true })).toBeDisabled();
+    await expect(dialog.getByLabel('切换阶段', { exact: true })).toHaveAccessibleName('切换阶段');
     await dialog.getByLabel('切换阶段', { exact: true }).selectOption('planning');
     await expect(dialog).toContainText('synthetic-old-planning');
     await expect(dialog).toContainText('a'.repeat(64));
@@ -470,7 +471,9 @@ test.describe('Synthetic renderer interaction coverage (not backend acceptance)'
     const dialog = page.getByRole('dialog');
     await expect(dialog).toContainText('synthetic-note-n1');
     await expect(dialog.getByRole('button', { name: '分类并保存候选', exact: true })).toBeDisabled();
+    await expect(dialog.getByLabel('来源分类', { exact: true })).toHaveAccessibleName('来源分类');
     await dialog.getByLabel('来源分类', { exact: true }).selectOption('implementation');
+    await expect(dialog.getByLabel('陈述类型', { exact: true })).toHaveAccessibleName('陈述类型');
     await dialog.getByLabel('陈述类型', { exact: true }).selectOption('fact');
     await dialog.getByRole('checkbox', { name: '规划', exact: true }).check();
     await dialog.getByLabel('模块路径（每行一个，可留空）', { exact: true }).fill('src/synthetic.ts');
@@ -491,6 +494,7 @@ test.describe('Synthetic renderer interaction coverage (not backend acceptance)'
     const dialog = page.getByRole('dialog');
     await expect(dialog).toContainText('合成精确正文：UTC 边界行为需要独立核对。');
     await expect(dialog.getByRole('button', { name: '审阅并申请复用', exact: true })).toBeDisabled();
+    await expect(dialog.getByLabel('真实合入观察', { exact: true })).toHaveAccessibleName('真实合入观察');
     await dialog.getByLabel('真实合入观察', { exact: true }).selectOption('synthetic-merge-observation');
     await dialog.getByLabel('核验理由与依据', { exact: true }).fill('合成：已审阅来源、范围与正文。');
     await dialog.getByRole('checkbox', { name: /合成原生检查展示/ }).check();
@@ -550,17 +554,83 @@ test.describe('Synthetic renderer interaction coverage (not backend acceptance)'
     expect((await readSyntheticCommands(page))[1]).toMatchObject({ action: 'apply-baseline', proposalId: 'synthetic-baseline-proposal', author: { name: 'Synthetic Owner', email: 'synthetic@example.invalid' } });
   });
 
-  test('post-integration verification binds operation, fresh result and exact independent checks', async ({ page }) => {
+  test('post-integration verification binds operation and real prior recipes for fresh native checks', async ({ page }) => {
     await openPreview(page, '?knowledge=integrated'); await observeSyntheticCommands(page);
     await page.getByRole('tab', { name: '经验', exact: true }).click();
     await page.getByRole('button', { name: '核验整合后能力', exact: true }).click();
     const dialog = page.getByRole('dialog');
     await expect(dialog).toContainText('d'.repeat(40));
-    await dialog.getByLabel('整合后成果', { exact: true }).selectOption('synthetic-result-r1');
+    await expect(dialog).toContainText('不调用模型');
+    await expect(dialog).toContainText('旧检查通过不代表新 HEAD 已通过');
+    await expect(dialog.getByLabel('先前检查的来源成果', { exact: true })).toHaveAccessibleName('先前检查的来源成果');
+    await dialog.getByLabel('先前检查的来源成果', { exact: true }).selectOption('synthetic-result-r1');
     await dialog.getByRole('checkbox', { name: /合成原生检查展示/ }).check();
     await dialog.getByRole('button', { name: '核验整合后能力', exact: true }).click();
     await expect(dialog.getByRole('alert')).toContainText('合成知识预览不会改变');
     expect((await readSyntheticCommands(page))[0]).toMatchObject({ action: 'verify-baseline', operationId: 'synthetic-baseline-proposal', resultId: 'synthetic-result-r1', checkIds: ['synthetic-native-check'] });
+  });
+
+  test('baseline conflict keeps exact proposal and original author for explicit reconciliation', async ({ page }) => {
+    await openPreview(page, '?knowledge=conflict'); await observeSyntheticCommands(page);
+    await page.getByRole('tab', { name: '经验', exact: true }).click();
+    await expect(page.getByRole('tabpanel')).toContainText('存在整合冲突，尚未放行');
+    await page.getByRole('button', { name: '核对并继续此整合', exact: true }).click();
+    const dialog = page.getByRole('dialog');
+    await expect(dialog).toContainText('同一基线整合');
+    await expect(dialog).toContainText('不会自动 reset 或 abort');
+    await expect(dialog.getByLabel('本地提交作者姓名', { exact: true })).toHaveValue('Synthetic Original');
+    await expect(dialog.getByLabel('本地提交作者姓名', { exact: true })).toHaveAttribute('readonly', '');
+    await expect(dialog.getByRole('checkbox')).not.toBeChecked();
+    await dialog.getByRole('checkbox').check();
+    await dialog.getByRole('button', { name: '授权整合此基线', exact: true }).click();
+    await expect(dialog.getByRole('alert')).toContainText('合成知识预览不会改变');
+    expect((await readSyntheticCommands(page))[0]).toMatchObject({ action: 'apply-baseline', proposalId: 'synthetic-baseline-proposal', author: { name: 'Synthetic Original', email: 'original@example.invalid' } });
+  });
+
+  test('plan and ticket artifacts expose full bounded immutable text without issuing approvals', async ({ page }, testInfo) => {
+    await openPreview(page, '?artifacts=1'); await observeSyntheticCommands(page);
+    await page.evaluate(() => {
+      const target = window as unknown as { syntheticArtifactReads: unknown[] }; target.syntheticArtifactReads = [];
+      window.addEventListener('pi-kanban:synthetic-artifact-read', event => target.syntheticArtifactReads.push((event as CustomEvent).detail));
+    });
+    await page.getByRole('tab', { name: '方案', exact: true }).click();
+    await page.getByRole('button', { name: '阅读完整 Spec', exact: true }).click();
+    const dialog = page.getByRole('dialog');
+    await expect(dialog.locator('.artifact-text')).toContainText('合成产物 synthetic-spec-artifact');
+    await expect(dialog.getByRole('status')).toContainText('尚有未载入内容');
+    await expect(dialog).toContainText('1'.repeat(64));
+    await dialog.getByRole('button', { name: '载入下一段正文', exact: true }).click();
+    await expect(dialog.getByRole('status')).toContainText('完整正文');
+    await expect(dialog.getByRole('button', { name: '载入下一段正文', exact: true })).toHaveCount(0);
+    await page.screenshot({ path: testInfo.outputPath('synthetic-full-spec-artifact.png'), fullPage: true });
+    await page.keyboard.press('Escape');
+    await page.getByRole('button', { name: '阅读完整任务清单', exact: true }).click();
+    await expect(dialog.locator('.artifact-text')).toContainText('合成产物 synthetic-tickets-artifact');
+    const reads = await page.evaluate(() => (window as unknown as { syntheticArtifactReads: unknown[] }).syntheticArtifactReads);
+    expect(reads).toEqual([
+      { demandId: 'synthetic-export', artifactId: 'synthetic-spec-artifact', digest: '1'.repeat(64), offset: 0 },
+      { demandId: 'synthetic-export', artifactId: 'synthetic-spec-artifact', digest: '1'.repeat(64), offset: 16_384 },
+      { demandId: 'synthetic-export', artifactId: 'synthetic-tickets-artifact', digest: '2'.repeat(64), offset: 0 },
+    ]);
+    expect(await readSyntheticCommands(page)).toEqual([]);
+  });
+
+  test('closing a slow artifact read preserves a newer dialog and unsubmitted draft', async ({ page }) => {
+    await openPreview(page, '?artifacts=1&latency=1000'); await observeSyntheticCommands(page);
+    await page.evaluate(() => {
+      const target = window as unknown as { syntheticArtifactReadCount: number }; target.syntheticArtifactReadCount = 0;
+      window.addEventListener('pi-kanban:synthetic-artifact-read', () => { target.syntheticArtifactReadCount += 1; });
+    });
+    await page.getByRole('tab', { name: '方案', exact: true }).click();
+    await page.getByRole('button', { name: '阅读完整 Spec', exact: true }).click();
+    await page.keyboard.press('Escape');
+    await page.getByRole('button', { name: '新建需求', exact: true }).click();
+    await page.getByRole('dialog').getByLabel('需求标题', { exact: true }).fill('读取关闭后保留的草稿');
+    await expect.poll(() => page.evaluate(() => (window as unknown as { syntheticArtifactReadCount: number }).syntheticArtifactReadCount)).toBe(1);
+    await expect(page.getByRole('dialog').getByRole('heading', { name: '记录一条新需求', exact: true })).toBeVisible();
+    await expect(page.getByRole('dialog').getByLabel('需求标题', { exact: true })).toHaveValue('读取关闭后保留的草稿');
+    await expect(page.locator('.artifact-viewer')).toHaveCount(0);
+    expect(await readSyntheticCommands(page)).toEqual([]);
   });
 
 });

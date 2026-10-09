@@ -22,7 +22,9 @@ export function knowledgeUnavailable(review: KnowledgeReview, state: ViewState):
   if (review.action === 'qualify') {
     const candidate = target.knowledgeLifecycle.candidates.find(item => item.revisionId === review.revisionId);
     if (!candidate || candidate.status === 'ineligible' || candidate.statementKind === 'hypothesis') return '请先分类候选材料；无效材料或假设不能成为共享事实。';
+    if (!candidate.body.trim()) return '精确候选正文不可用，不能完成语义审阅。';
     if (!target.knowledgeLifecycle.checks.some(check => check.resultId === candidate.resultId && check.usable)) return '缺少覆盖此成果的真实原生检查，不能授予复用资格。';
+    if (candidate.sourceKind === 'implementation' && !target.knowledgeLifecycle.resultMaterials.some(item => item.resultId === candidate.resultId && item.artifactId === candidate.artifactId && item.accepted)) return '请先接受此精确成果，再申请新增实现的复用资格。';
     if (candidate.sourceKind === 'implementation' && !target.knowledgeLifecycle.observations.some(item => item.state === 'merged' && item.provenance === 'github-live')) return '新增实现需要真实远端合入记录和独立最终内容核验。';
   }
   if (review.action === 'apply-baseline' || review.action === 'verify-baseline') {
@@ -57,7 +59,7 @@ export function makeKnowledgeAction(review: KnowledgeReview, input: KnowledgeInp
     case 'observe-remote': return { ...base, action: review.action };
     case 'qualify': {
       const candidate = view.candidates.find(item => item.revisionId === review.revisionId);
-      if (!candidate || candidate.status === 'ineligible' || candidate.statementKind === 'hypothesis' || !input.reviewed) throw new Error('请审阅有效候选的来源、复用价值、适用性和正文。');
+      if (!candidate || !candidate.body.trim() || candidate.status === 'ineligible' || candidate.statementKind === 'hypothesis' || !input.reviewed) throw new Error('请审阅有效候选的来源、复用价值、适用性和正文。');
       const checkIds = input.checkIds ?? [];
       if (!checkIds.length || checkIds.some(id => !view.checks.some(check => check.id === id && check.resultId === candidate.resultId && check.usable))) throw new Error('请选择覆盖此成果的真实原生检查。');
       if (candidate.sourceKind === 'implementation' && !view.observations.some(item => item.observationId === input.observationId && item.state === 'merged' && item.provenance === 'github-live')) throw new Error('请选择真实 GitHub 合入观察。');
@@ -68,13 +70,17 @@ export function makeKnowledgeAction(review: KnowledgeReview, input: KnowledgeInp
       if (!view.candidates.some(item => item.revisionId === review.revisionId)) throw new Error('候选版本不存在。');
       return { ...base, action: review.action, revisionId: review.revisionId, reason: required(input.reason, '撤销原因') };
     case 'propose-baseline': return { ...base, action: review.action, sourceCommit: commit(input.sourceCommit) };
-    case 'apply-baseline':
-      if (!input.reviewed || !view.proposals.some(item => item.proposalId === review.proposalId)) throw new Error('请审阅精确基线方案并明确授权整合。');
-      return { ...base, action: review.action, proposalId: review.proposalId, author: { name: required(input.authorName, '本地提交作者姓名'), email: required(input.authorEmail, '本地提交作者邮箱') } };
+    case 'apply-baseline': {
+      const proposal = view.proposals.find(item => item.proposalId === review.proposalId);
+      if (!input.reviewed || !proposal) throw new Error('请审阅精确基线方案并明确授权整合。');
+      const author = { name: required(input.authorName, '本地提交作者姓名'), email: required(input.authorEmail, '本地提交作者邮箱') };
+      if (proposal.author && (proposal.author.name !== author.name || proposal.author.email !== author.email)) throw new Error('继续整合必须使用原操作的精确作者身份。');
+      return { ...base, action: review.action, proposalId: review.proposalId, author };
+    }
     case 'verify-baseline': {
       const checkIds = input.checkIds ?? [], proposal = view.proposals.find(item => item.proposalId === review.proposalId);
       if (proposal?.result?.state !== 'integrated-awaiting-verification') throw new Error('该整合尚未进入待核验状态。');
-      if (!input.resultId || !checkIds.length || checkIds.some(id => !view.checks.some(check => check.id === id && check.resultId === input.resultId && check.usable))) throw new Error('请选择整合后成果及覆盖它的真实原生检查。');
+      if (!input.resultId || !checkIds.length || checkIds.some(id => !view.checks.some(check => check.id === id && check.resultId === input.resultId && check.usable))) throw new Error('请选择来源成果及其真实原生检查模板。');
       return { ...base, action: review.action, operationId: review.proposalId, resultId: input.resultId, checkIds: [...checkIds] };
     }
   }

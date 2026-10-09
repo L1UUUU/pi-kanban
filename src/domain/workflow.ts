@@ -310,6 +310,18 @@ export class WorkflowService {
       return demand;
     });
   }
+  /** Trusted observation clears one exact Host blocker, never a user permission. */
+  clearHostBlocker(demandId: string, code: string, reason: string): Demand {
+    text(code, 'blocker code'); text(reason, 'blocker reason');
+    return this.store.transaction(() => {
+      const demand = this.store.getDemand(demandId), blocker = `${code}: ${reason}`;
+      if (!demand.blockedReasons.includes(blocker)) return demand;
+      invariant(!this.store.listRuns(demandId).some(activeRun), 'RUN_ACTIVE', 'Verify stopped execution before clearing a Host observation.');
+      demand.blockedReasons = demand.blockedReasons.filter(item => item !== blocker);
+      this.audit(demandId, 'host-blocker-cleared', { code, reason });
+      this.reconcile(demand); demand.revision++; this.store.saveDemand(demand); return demand;
+    });
+  }
   /** Detect external modifications without replacing an immutable C or its acceptance. */
   invalidateCurrentContent(demandId: string, reason: string): Demand {
     text(reason,'reason');return this.store.transaction(()=>{const d=this.store.getDemand(demandId);d.blockedReasons.push(`Content changed: ${reason}`);if(d.activeContentId && !d.invalidatedContentIds.includes(d.activeContentId))d.invalidatedContentIds.push(d.activeContentId);this.stopRuns(d,'content-changed');this.audit(d.id,'content-invalidated',{contentId:d.activeContentId,resultId:d.activeResultId,reason});d.phase='blocked';d.revision++;this.store.saveDemand(d);this.notify(d,`content-changed:${d.activeContentId}`,reason);return d;});
