@@ -16,9 +16,9 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
-    # The 375-test Git-heavy suite took 20.4 minutes on Windows in run 24.
-    # The staged execution journeys add real Git/SDK cases; keep a finite margin
-    # for the expanded suite. This does not change any product execution budget.
+    # Full coverage remains gating. Windows execution journeys have dedicated
+    # shards below: one journey invokes thousands of real guarded Git commands,
+    # and the combined serial file exceeded this limit in run 26.
     timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
@@ -27,7 +27,19 @@ jobs:
           node-version: '24.19.0'
           cache: npm
       - run: npm ci --ignore-scripts
-      - run: npm run check
+      - run: npm run typecheck
+      - name: Run every portable and connected test on Linux
+        if: matrix.os == 'ubuntu-latest'
+        run: npm test
+      - name: Run Windows tests outside the dedicated execution shards
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          $testPaths = @(Get-ChildItem -LiteralPath tests -Filter '*.test.ts' -File | Where-Object { $_.Name -notlike 'production-execution*.test.ts' } | ForEach-Object FullName)
+          if ($testPaths.Count -eq 0) { throw 'No Windows portable tests were selected.' }
+          node --test @testPaths
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - run: npm run build
       - name: Record actual environment, without secrets
         if: always()
         shell: bash
@@ -37,6 +49,36 @@ jobs:
         with:
           name: runtime-observation-${{ matrix.os }}
           path: runtime-observation.json
+          retention-days: 14
+  execution-windows:
+    name: Windows implement-spec integration (${{ matrix.shard }}/4)
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    runs-on: windows-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.19.0'
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - name: Run one bounded shard with all Host guards intact
+        shell: pwsh
+        env:
+          PI_KANBAN_EXECUTION_TRACE: artifacts/production-execution-trace.jsonl
+        run: |
+          $testPaths = @(Get-ChildItem -LiteralPath tests -Filter 'production-execution*.test.ts' -File | Sort-Object Name | ForEach-Object FullName)
+          if ($testPaths.Count -ne 4) { throw 'Expected four execution integration files; update the complete shard partition explicitly.' }
+          node --test --test-shard=${{ matrix.shard }}/4 @testPaths
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-implement-spec-shard-${{ matrix.shard }}
+          path: artifacts/production-execution-trace.jsonl
           retention-days: 14
   native-windows:
     name: Windows Node-native tools / revised LPAC v2 (required partial evidence)

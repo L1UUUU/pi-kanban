@@ -64,6 +64,8 @@ export class SyntheticPlanningNativePort {
   async observe(run: RunRecord): Promise<Observation> {
     return { state: this.stopped.has(run.runId) ? 'stopped' : 'alive', generation: run.generation, activePids: this.stopped.has(run.runId) ? [] : [9001], proof: 'SYNTHETIC process/ACL observation; no real isolation.' };
   }
+  /** Preserve exact decoded Worker bytes; unlike emit, this adds no fixture identity fields. */
+  async dispatchWorkerFrame(launch: Launch, frame: Uint8Array) { return this.handler(launch.run, frame); }
   async emit(launch: Launch, body: Record<string, unknown>) {
     return this.handler(launch.run, Buffer.from(JSON.stringify({ version: 1, runId: launch.run.runId, ...(body.type === 'model.request' ? {} : { runtimeRunId: launch.run.runId }), generation: launch.run.generation, capability: launch.init.capability, ...body })));
   }

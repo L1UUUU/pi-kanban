@@ -66,7 +66,8 @@ test('a changed pinned execution file blocks both selected phases without partia
   const root = realpathSync.native(mkdtempSync(join(tmpdir(), 'pi-execution-config-'))); t.after(() => rmSync(root, { recursive: true, force: true }));
   const copy = join(root, 'vendor'); cpSync(vendorRoot, copy, { recursive: true });
   const config = emptyConfiguration(); config.methods.implementation = bundledImplementationMethod(copy); config.methods.review = bundledImplementationMethod(copy);
-  const changed = config.methods.implementation!.dependencies.find(dependency => dependency.path.endsWith('tdd/SKILL.md'))!;
+  const changed = config.methods.implementation!.dependencies.find(dependency => dependency.path === join(copy, 'skills', 'engineering', 'tdd', 'SKILL.md'));
+  assert.ok(changed, 'The pinned TDD dependency is present under the selected vendor root.');
   writeFileSync(changed.path, `${readFileSync(changed.path, 'utf8')}\nChanged fixture bytes.\n`);
   const loaded = loadMethods(config);
   for (const stage of ['implementation', 'review'] as const) {
