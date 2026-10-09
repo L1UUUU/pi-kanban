@@ -395,3 +395,37 @@ The exclusion correction's Windows execution is a separate required result; sour
 alone does not establish that the failure is closed.
 Failed Node checks now print bounded native-captured child diagnostics in CI logs, while
 the complete bounded receipt remains in the retained diagnostic artifact.
+
+
+## Observed Windows result, 2026-10-09
+
+[Run 37895356130](https://github.com/L1UUUU/pi-kanban/actions/runs/37895356130)
+compiled commit `94a8c943c32381c2fec7d09a1a5e47c944511234` on Windows Server 2025,
+build 26100, using Node 24.19.0. The exclusion correction passed actual read/delete
+negatives for Git directory, nested object, ordinary `.git` pointer and `.local`, plus
+inheritance restoration, unrelated ACE preservation, overlapping workspace rejection and
+failed-cleanup retry, under all three explicitly selected tokens. Strict and revised-v2
+native CTests passed their stated scopes. Ordinary-v3 still failed its inconclusive network
+check (pending 10035, no completed denial); that assertion remains mandatory and visible.
+
+The revised-v2 expanded recorder passed 16 independent probes: real bundled Pi/private
+model channel and native Node tools; implementation/review and clean role transition;
+Git, other-demand, Host and adjacent runtime-file denials; actual loopback EACCES;
+same-Job descendant stop; authenticated Host EOF and broken-output recovery; concurrent
+shared-runtime ACL cleanup; sampled disk overrun; early queued stop; and junction rejection.
+These are real partial results, not complete Windows 11 release evidence.
+
+The exact copied 77-file official Git Bash fixture failed before its script ran:
+`NtCreateDirectoryObject(\BaseNamedObjects\msys-2.0S5-00ba77ed17b904c1)` returned
+`0xC0000022` (access denied), and Bash exited `0xC0000142`. The native check retained that
+output and failed conservatively; final cleanup independently observed zero Job processes,
+successful ACL restoration and authenticated recovery. Git Bash compatibility remains
+**blocked** for this candidate. No global object-namespace grant, security change, silent
+fallback or alternative backend is introduced to bypass the failure. Shell profiles cannot
+be released without their actual compatibility evidence. The full diagnostic remains
+`releaseAuthorized: false`, including the successful Node subset.
+
+Reproduce with the explicit revised-v2 command above and retain both `report.json` and
+`transcript.json`. [The exact run artifact](https://github.com/L1UUUU/pi-kanban/actions/runs/37895356130/artifacts/11600570460)
+contains the successful subset, native receipts and the actual Bash error. Bounded failed
+Bash receipt output is also included in subsequent CI assertion diagnostics.

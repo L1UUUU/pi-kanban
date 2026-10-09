@@ -255,7 +255,8 @@ try {
       shell.send({ type: 'run-shell', requestId: `bash-${role}`, args, timeoutMs: 15000, maxOutputBytes: 65536 });
       await shell.wait(() => shell.event('native.check-result', event => event.requestId === `bash-${role}`), `Bash ${role} receipt`, 20000);
       const receipt = shell.event('native.check-result', event => event.requestId === `bash-${role}`);
-      assert.equal(receipt.status, 0); assert.equal(receipt.reason, 'exited'); assert.equal(receipt.exitCode, 0, Buffer.from(receipt.outputBase64, 'base64').toString('utf8')); assert.deepEqual(receipt.arguments, args); assert.equal(Buffer.from(receipt.outputBase64, 'base64').toString('utf8'), challenge);
+      const diagnostic = JSON.stringify({ status: receipt.status, reason: receipt.reason, exitCode: receipt.exitCode, output: Buffer.from(receipt.outputBase64, 'base64').toString('utf8').slice(0, 8192) });
+      assert.equal(receipt.status, 0, diagnostic); assert.equal(receipt.reason, 'exited', diagnostic); assert.equal(receipt.exitCode, 0, diagnostic); assert.deepEqual(receipt.arguments, args); assert.equal(Buffer.from(receipt.outputBase64, 'base64').toString('utf8'), challenge);
       assert.equal(readFileSync(join(shell.workspace, 'source.txt'), 'utf8'), role === 'implementation' ? 'shell-changed' : 'original'); assert.equal(existsSync(join(shell.workspace, 'delete-me.txt')), role === 'review');
       // Bash /dev/tcp performs a real connection attempt with the same no-network
       // token. No HTTP/provider destination or network capability is introduced.
