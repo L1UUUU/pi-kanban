@@ -8,6 +8,7 @@ const bridge: WorkbenchBridge = {
   authorizeModel: input => ipcRenderer.invoke('workbench:authorizeModel', input),
   prepareModelApproval: input => ipcRenderer.invoke('workbench:prepareModelApproval', input),
   createDemand: input => ipcRenderer.invoke('workbench:createDemand', input),
+  knowledgeAction: input => ipcRenderer.invoke('workbench:knowledgeAction', input),
   command: input => ipcRenderer.invoke('workbench:command', input),
   sendMessage: input => ipcRenderer.invoke('workbench:sendMessage', input),
   subscribe: listener => {

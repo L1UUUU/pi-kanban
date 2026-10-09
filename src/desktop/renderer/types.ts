@@ -1,3 +1,4 @@
+import type { KnowledgeAction, KnowledgeLifecycleView } from '../../host/knowledge-lifecycle.ts';
 import type { Finding, Methods, Stage } from '../../domain/types.ts';
 import type { ConfigurationSummary } from '../../host/configuration.ts';
 export type { ConfigurationSummary, ProviderConfiguration } from '../../host/configuration.ts';
@@ -45,6 +46,7 @@ export interface Demand {
   messages: Message[];
   checks?: Check[];
   knowledge?: Knowledge[];
+  knowledgeLifecycle?: KnowledgeLifecycleView;
   runState?: 'idle' | 'queued' | 'running' | 'stopping' | 'unknown' | 'stopped';
   workspacePath?: string;
   branch?: string;
@@ -83,6 +85,9 @@ export interface Command {
   methodDigest?: string;
   configurationDigest?: string;
   impactReviewed?: boolean;
+  localCommit?: boolean;
+  authorName?: string;
+  authorEmail?: string;
   text?: string;
   requestId: string;
 }
@@ -102,6 +107,7 @@ export interface WorkbenchBridge {
   authorizeModel(input: ModelAuthorizationCommand): Promise<ViewState>;
   createDemand(input: { projectId: string; title: string; description: string; requestId: string }): Promise<ViewState>;
   command(input: Command): Promise<ViewState>;
+  knowledgeAction(input: KnowledgeAction): Promise<ViewState>;
   sendMessage(input: { demandId: string; text: string; requestId: string }): Promise<ViewState>;
 }
 declare global { interface Window { workbench?: WorkbenchBridge } }

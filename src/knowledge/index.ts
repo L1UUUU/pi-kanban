@@ -89,7 +89,7 @@ export class KnowledgeService {
       insist(o.provenance==='github-live','MOCK_EVIDENCE','Mock remote evidence cannot grant implementation knowledge production eligibility.');
       const verification=this.db.prepare('SELECT data FROM workspace_content_verifications WHERE verification_id=?').get(e.finalContentVerificationId) as any;
       insist(verification,'CONTENT_UNVERIFIED','Final content verification is missing.');const v=JSON.parse(verification.data);
-      insist(v.observationId===e.mergeObservationId && v.formalCommit===e.formalCommit && v.contentCorresponds && v.capabilitiesVerified && v.revisionIds.includes(input.revisionId),'CONTENT_UNVERIFIED','Final verification does not cover this exact knowledge revision.');
+      insist(v.observationId===e.mergeObservationId && v.formalCommit===e.formalCommit && v.reviewerId===e.reviewerId && v.contentCorresponds && v.capabilitiesVerified && v.acceptanceCoverage==='covered' && v.revisionIds.includes(input.revisionId),'CONTENT_UNVERIFIED','Final verification does not cover this exact knowledge revision and acceptance.');
     } else if(revision.sourceKind==='existing-fact') {
       insist(e.formalCommit && e.independentOfDemand,'SOURCE_UNVERIFIED','Existing facts require an independently verified formal version.');
     } else {

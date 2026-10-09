@@ -1,5 +1,5 @@
 import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
-import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
+import { isAbsolute, join, relative, resolve } from 'node:path';
 import { mkdirSync } from 'node:fs';
 import { openaiProvider } from '@earendil-works/pi-ai/providers/openai';
 import { streamSimple } from '@earendil-works/pi-ai/api/openai-responses';
@@ -11,7 +11,7 @@ import type { Demand, Methods, RunAttempt, Stage, WorkerReport } from '../domain
 import { KnowledgeService } from '../knowledge/index.ts';
 import type { KnowledgeRole } from '../knowledge/index.ts';
 import { WorkspaceService, canonicalJson } from '../workspace/index.ts';
-import { noLinks, canonicalDirectory } from '../workspace/paths.ts';
+import { noLinks } from '../workspace/paths.ts';
 import { ModelBudgetLedger } from '../runtime/budget.ts';
 import type { ModelGrant } from '../runtime/budget.ts';
 import { ModelBroker } from '../runtime/model-broker.ts';
@@ -20,10 +20,11 @@ import { HostPiBrokerEndpoint, parsePiModelFrame } from '../runtime/pi-channel.t
 import { verifyWindowsRuntimeProfile } from '../runtime/profile.ts';
 import type { VerifiedRuntimeProfile, LockedRuntimeProfile, WindowsEvidenceTrustAnchor } from '../runtime/profile.ts';
 import { VerifiedWindowsDriver } from '../runtime/verified-windows-driver.ts';
-import type { WindowsRunBootstrap, NativeCheckResult } from '../runtime/verified-windows-driver.ts';
+import { appContainerProfileName } from '../runtime/appcontainer-name.ts';
+import type { WindowsRunBootstrap } from '../runtime/verified-windows-driver.ts';
 import { RuntimeError } from '../runtime/types.ts';
-import type { LaunchRequest, RuntimeDriver, RunRecord, Observation, ProcessIdentity } from '../runtime/types.ts';
-import { loadMethods, runtimeProfileInput, configurationDigest } from './configuration.ts';
+import type { RuntimeDriver, RunRecord, Observation } from '../runtime/types.ts';
+import { loadMethods, runtimeProfileInput } from './configuration.ts';
 import type { WorkbenchConfiguration, ProviderConfiguration } from './configuration.ts';
 import type { ExecutionPrerequisites } from './coordinator.ts';
 import { ExecutionCoordinator } from './coordinator.ts';
@@ -108,6 +109,8 @@ export interface ProductionOptions {
   stateDirectory: string; trustedEvidenceRoot?: string;
   /** Separately provisioned installation trust, never a renderer/configuration value. */
   evidenceTrustAnchor?: WindowsEvidenceTrustAnchor;
+  /** Explicit Host-owned local-commit identity for this demand's user grant. */
+  localCommitAuthor?: (demandId: string) => { name: string; email: string } | null;
   resolveCredential?: (reference: string) => string;
 }
 export interface ProductionDiagnostics { executionEnabled: boolean; blockers: string[]; profileVerified: boolean; budgetAvailable: boolean; workspaceVerified: boolean }
@@ -164,7 +167,7 @@ function composeProductionServices(options: ProductionOptions, synthetic?: Synth
   function refreshNative(): NativeDriverPort {
     const configuration = config(), digest = hash(canonicalJson(configuration.runtime));
     if (native && digest === profileDigest) return native;
-    insist(!native || (![...channels.values()].some(channel => !channel.settled) && (coordinator?.supervisor.list() ?? []).every(run => run.state === 'stopped' && !!options.store.db.prepare('SELECT 1 FROM host_native_revocations WHERE run_id=?').get(run.runId))), 'RUNTIME_CONFIGURATION_BUSY', 'Stop and verify every durable primary and boundary run before replacing their exact runtime binding.');
+    insist(!native || ((coordinator?.supervisor.list() ?? []).every(run => run.state === 'stopped' && !!options.store.db.prepare('SELECT 1 FROM host_native_revocations WHERE run_id=?').get(run.runId)) && options.store.listRuns().every(run => run.status === 'stopped')), 'RUNTIME_CONFIGURATION_BUSY', 'Stop and verify every durable primary and boundary run before replacing their exact runtime binding.');
     profile = synthetic ? { config: synthetic.profile, evidenceDigests: ['SYNTHETIC-NOT-ISOLATION-EVIDENCE'] } as unknown as VerifiedRuntimeProfile : verifyWindowsRuntimeProfile(runtimeProfileInput(configuration), trustedEvidenceRoot, options.evidenceTrustAnchor);
     // Auxiliary drivers lock the same exact profile as the primary driver. They
     // may be replaced only after durable Job stop and ACL revocation above.
@@ -180,6 +183,7 @@ function composeProductionServices(options: ProductionOptions, synthetic?: Synth
     async launch(run) { return refreshNative().launch(run); },
     async stop(run) { channels.get(run.runId)?.abort.abort(new RuntimeError('RUN_STOPPED', 'Run stopped.')); const target = recoveryDriver(run); const result = target ? await target.stop(run) : unknown(run); retainRevocation(run.runId, target); return result; },
     async observe(run) { const target = recoveryDriver(run), result = target ? await target.observe(run) : unknown(run); retainRevocation(run.runId, target); return result; },
+    async recoverUnregistered(run) { const target = recoveryDriver(run), result = target?.recoverUnregistered ? await target.recoverUnregistered(run) : unknown(run); retainRevocation(run.runId, target); return result; },
   };
   function recoveryDriver(run: RunRecord): NativeDriverPort | undefined { try { return (run.role === 'boundary-review' ? boundaryNative : native) ?? refreshNative(); } catch { return undefined; } }
   function retainRevocation(id: string, driver: NativeDriverPort | undefined): void { const resource = driver?.getResourceEvidence(id); if (resource?.provisioned && resource.revoked && resource.status === 0) { options.store.db.prepare('INSERT OR IGNORE INTO host_native_revocations VALUES(?,?)').run(id, canonicalJson(resource)); options.store.db.prepare('DELETE FROM host_native_check_lease WHERE runtime_run_id=?').run(id); } }
@@ -279,6 +283,7 @@ function composeProductionServices(options: ProductionOptions, synthetic?: Synth
     if (!demandId) return { executionEnabled: false, blockers: [...blockers, 'Select a demand to verify its frozen methods, dedicated worktree, and finite data/model approval.'], profileVerified, budgetAvailable, workspaceVerified };
     try {
       const demand = options.store.getDemand(demandId), stage = stageFor(demand);
+      if (stage === 'implementation' && demand.grant?.localCommit) commitAuthor(demand.id);
       evidence.method(demand.methodSnapshot[stage]!);
       const source = evidence.sourceMaterial(demandId); workspaceVerified = !!source.sha256;
       const provider = config().provider; insist(provider, 'MODEL_CONFIGURATION_MISSING', 'Explicit provider configuration is missing.');
@@ -336,7 +341,7 @@ function composeProductionServices(options: ProductionOptions, synthetic?: Synth
     // directories. Native ACLs grant only these files and ancestor traversal.
     const roots = [...new Set([profile.config.node.path, profile.config.worker.path])];
     for (const file of roots) { noLinks(file); for (const protectedPath of [stateDirectory, ...options.store.listProjects().map(project => project.rootPath)]) { const rel = relative(protectedPath, file); insist(rel.startsWith('..') || isAbsolute(rel), 'RUNTIME_ROOT_UNSAFE', 'Pinned runtime files must remain outside mutable project source and Host state.'); } }
-    return { profileName: `pi-kanban-${runtime.demandId}-${runtime.role}-${runtime.generation}`, scratch,
+    return { profileName: appContainerProfileName(runtime.demandId, runtime.role, runtime.generation), scratch,
       aclEvidence: profile.evidenceDigests.join(','), privateChannelEvidence: profile.evidenceDigests.join(','), processLimit: 8, memoryLimitBytes: 1024 * 1024 * 1024, workerInit: init as unknown as Record<string, unknown>,
       resourceAuthorizationId: grant.decisionId, readonlyRuntimeRoots: roots } as WindowsRunBootstrap;
   }
@@ -363,14 +368,45 @@ function composeProductionServices(options: ProductionOptions, synthetic?: Synth
   }
   function nativeEnvironment(runtime: RunRecord): string { return canonicalJson({ profileId: runtime.profileId, profileDigest, evidenceDigests: profile?.evidenceDigests, synthetic: !!synthetic }); }
   function currentKnowledgeEnvironment(): string { refreshNative(); return nativeEnvironment({ profileId: profile!.config.profileId } as RunRecord); }
+  function commitAuthor(demandId: string): { name: string; email: string } {
+    const author = options.localCommitAuthor?.(demandId);
+    insist(author && typeof author.name === 'string' && author.name.trim().length > 0 && author.name.length <= 200 && typeof author.email === 'string' && author.email.length <= 320 && /^[^\s<>@]+@[^\s<>@]+$/.test(author.email) && !/[\r\n<>\0]/.test(author.name + author.email), 'LOCAL_COMMIT_AUTHOR_REQUIRED', 'The local-commit grant requires an explicitly approved Host author name and email; no identity is inferred.');
+    return { name: author.name, email: author.email };
+  }
+  function commitStoppedContent(channel: ActiveChannel, demand: Demand): void {
+    if (!demand.grant?.localCommit) return;
+    insist(channel.run.stage === 'implementation' && channel.runtime.writes && channel.modelObserved && demand.control === 'active' && demand.grant.planId === channel.run.planId && demand.activePlanId === channel.run.planId && demand.cycle === channel.run.cycle, 'LOCAL_COMMIT_AUTHORITY_CHANGED', 'A local commit requires the still-current explicit implementation grant and verified stopped writer.');
+    const author = commitAuthor(demand.id), workspace = options.workspace(), binding = workspace.getBinding(demand.id)!;
+    insist(workspace.git.staged(binding.worktreePath).length === 0, 'USER_STAGED', 'Existing staged work is preserved; reconcile it explicitly before a controlled local commit.');
+    const source = evidence.source(demand.id), files = new Map(source.files.map(file => [file.path, file.sha256]));
+    const changes = workspace.git.status(binding.worktreePath);
+    // A clean index excludes staged rename/copy multi-record porcelain entries.
+    // Refuse any other format instead of treating an arbitrary record as a path.
+    insist(changes.every(change => /^(?: [MDT]|\?\?) /.test(change)), 'LOCAL_COMMIT_SCOPE_UNSUPPORTED', 'Changed paths require a supported clean-index source status.');
+    const paths = changes.map(change => change.slice(3)).sort();
+    insist(paths.length <= 1024 && paths.join('').length <= 24_000, 'LOCAL_COMMIT_SCOPE_TOO_LARGE', 'The exact local-commit path list exceeds its finite command bound.');
+    if (!paths.length) return; // No invented empty commit or new baseline.
+    const expectedFiles = Object.fromEntries(paths.map(path => [path, files.get(path) ?? null]));
+    const operationId = `content-${hash(`${channel.run.id}:${channel.run.generation}`).slice(0, 40)}`;
+    workspace.commit({ operationId, demandId: demand.id, expectedHead: binding.head, paths, expectedFiles, message: `Save verified demand implementation (${demand.id})`, author, commitAuthorized: true, writerStopped: true });
+    insist(workspace.git.status(binding.worktreePath).length === 0, 'LOCAL_COMMIT_CONTENT_CHANGED', 'Source changed during local commit; no immutable delivery handoff was recorded.');
+  }
   async function settle(channel: ActiveChannel, aborted = false): Promise<void> {
     insist(coordinator, 'HOST_CHANNEL_UNBOUND', 'Coordinator is unavailable.');
     channel.settled = true; channel.abort.abort();
     const stopped = await (channel.boundary ? boundarySupervisor! : coordinator.supervisor).stop(channel.runtime.runId, 'worker-terminal-handoff');
     if (stopped.state !== 'stopped' || (channel.boundary ? boundaryNative : native)?.getResourceEvidence(channel.runtime.runId)?.revoked !== true) { options.workflow.markInterrupted(channel.run.id, 'Worker handoff has no verified complete native Job stop.'); return; }
     retainRevocation(channel.runtime.runId, channel.boundary ? boundaryNative : native);
+    insist(options.store.db.prepare('SELECT 1 FROM host_native_revocations WHERE run_id=?').get(channel.runtime.runId), 'NATIVE_REVOCATION_UNVERIFIED', 'Terminal artifacts require durable successful native resource revocation.');
     if (aborted) { channel.pending.length = 0; channel.handoffs.length = 0; options.workflow.blockDemand(channel.run.demandId, 'WORKER_ABORTED', 'An aborted session cannot establish a completed stage handoff.'); return; }
     for (const queued of channel.pending) {
+      if (queued.type === 'content-ready' && options.store.getDemand(channel.run.demandId).grant?.localCommit) {
+        try {
+          insist(queued.content.planId === channel.run.planId, 'LOCAL_COMMIT_AUTHORITY_CHANGED', 'The content report must target the exact locally authorized plan before any commit.');
+          insist(queued.content.code.location === 'current-worktree', 'LOCAL_COMMIT_SNAPSHOT_REQUIRED', 'An authorized local commit requires a fresh stopped-worktree snapshot, never a substituted older artifact.');
+          commitStoppedContent(channel, options.store.getDemand(channel.run.demandId));
+        } catch (error) { options.workflow.blockDemand(channel.run.demandId, 'LOCAL_COMMIT_FAILED', error instanceof Error ? error.message : 'The exact local commit could not be verified.'); throw error; }
+      }
       if (queued.type === 'content-ready' && queued.content.code.location === 'current-worktree') {
         const demand = options.store.getDemand(channel.run.demandId);
         queued.content.code = evidence.saveSource(demand.projectId, demand.id, channel.run.id, queued.content.code.id);

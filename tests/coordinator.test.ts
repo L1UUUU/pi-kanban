@@ -107,6 +107,41 @@ async function prepareImplementation(f: ReturnType<typeof fixture>, driver: Synt
   const implementation = f.latest(); assert.equal(implementation.stage, 'implementation'); return implementation;
 }
 
+test('SYNTHETIC coordinator: explicit returns after verified deliveries do not consume one shared retry allowance', async () => {
+  const driver = new SyntheticObservedDriver(), f = fixture({ driver });
+  try {
+    await prepareImplementation(f, driver);
+    for (let cycle = 1; cycle <= 3; cycle++) {
+      const implementation = f.latest();
+      assert.equal(implementation.stage, 'implementation');
+      assert.equal(implementation.status, 'running');
+      const contentId = `returned-content-${cycle}`;
+      f.report(implementation, { type: 'content-ready', content: {
+        id: contentId, planId: 'P1', code: ref(`returned-code-${cycle}`), knowledge: [],
+        maintenance: 'not-needed', deliveryNotes: `Distinct verified delivery ${cycle}.`,
+      } });
+      f.classify(implementation); driver.naturalExit(implementation.id); await f.coordinator.tick();
+      const reviewer = f.latest();
+      assert.equal(reviewer.stage, 'review');
+      for (const requirementId of ['base-test', 'feature-test']) f.report(reviewer, { type: 'check', check: {
+        id: `returned-check-${cycle}-${requirementId}`, contentId, requirementId, status: 'passed',
+        evidence: ref(`returned-evidence-${cycle}-${requirementId}`), environment: 'synthetic-only',
+      } });
+      f.report(reviewer, { type: 'review', reviewId: `returned-review-${cycle}`, contentId,
+        evidence: ref(`returned-review-evidence-${cycle}`), knowledgeReviewed: true, findings: [] });
+      f.classify(reviewer); driver.naturalExit(reviewer.id); await f.coordinator.tick();
+      const demand = f.store.getDemand('demand');
+      assert.equal(demand.phase, 'awaiting-acceptance');
+      f.command({ type: 'return-result', resultId: demand.activeResultId!, reason: `Explicit new user revision ${cycle}.` });
+      await f.coordinator.tick();
+    }
+    assert.deepEqual(f.store.getDemand('demand').blockedReasons, []);
+    assert.equal(f.latest().stage, 'implementation');
+    assert.equal(f.latest().status, 'running', 'A fourth explicitly requested revision has its own bounded cycle.');
+    assert.equal(driver.launches.filter(run => run.role === 'implementation').length, 4);
+  } finally { await f.coordinator.supervisor.stopAll('synthetic-test-cleanup'); f.store.close(); }
+});
+
 // Full handoff path: trusted reports are necessary, but process exit must also be observed.
 test('SYNTHETIC coordinator: verified handoffs plus observed exits advance planning, implementation, review and stable acceptance', async () => {
   const driver = new SyntheticObservedDriver(), f = fixture({ driver });

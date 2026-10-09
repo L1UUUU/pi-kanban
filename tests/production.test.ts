@@ -14,6 +14,7 @@ import { emptyConfiguration, loadMethods } from '../src/host/configuration.ts';
 import type { ProviderConfiguration, WorkbenchConfiguration } from '../src/host/configuration.ts';
 import { ProductionEvidence, hash } from '../src/host/evidence.ts';
 import { PiOpenAITransport, createProductionServices } from '../src/host/production.ts';
+import type { ProductionOptions } from '../src/host/production.ts';
 import { ExecutionCoordinator } from '../src/host/coordinator.ts';
 
 // Every provider reply, credential, approval and process identity in this file is
@@ -140,7 +141,7 @@ class SyntheticNativePort {
   async observe(run: RunRecord): Promise<Observation> { return { state: this.stopped.has(run.runId) ? 'stopped' : 'alive', generation: run.generation, activePids: this.stopped.has(run.runId) ? [] : [7001], proof: 'SYNTHETIC process and ACL observation; no real isolation.' }; }
   async emit(launch: { run: RunRecord; init: WorkerInit }, body: Record<string, unknown>) { return this.handler(launch.run, Buffer.from(JSON.stringify({ version: 1, runId: launch.run.runId, ...(body.type === 'model.request' ? {} : { runtimeRunId: launch.run.runId }), generation: launch.run.generation, capability: launch.init.capability, ...body }))); }
 }
-function syntheticComposition(t: test.TestContext) {
+function syntheticComposition(t: test.TestContext, localCommitAuthor?: ProductionOptions['localCommitAuthor']) {
   const f = fixture(t); const configuration = f.configuration; configuration.provider = provider();
   const runtimeRoot = join(f.root, 'runtime-files'); mkdirSync(runtimeRoot);
   const nodeRoot = join(runtimeRoot, 'node'), workerRoot = join(runtimeRoot, 'worker'); mkdirSync(nodeRoot); mkdirSync(workerRoot);
@@ -150,7 +151,7 @@ function syntheticComposition(t: test.TestContext) {
   f.configuration = configuration;
   const drivers: SyntheticNativePort[] = []; const calls: string[] = [];
   const transport: BoundedProviderTransport = { mode: 'synthetic-no-network', provider: 'openai', modelId: 'gpt-4.1-mini', destination: 'https://api.openai.com/v1/responses', async send(request) { calls.push(request.requestId); return { text: 'Synthetic planner/reviewer observation.', usage: { tokens: 20, costMicros: 10, source: 'SYNTHETIC-NO-NETWORK' } }; } };
-  const production = createSyntheticProductionServices({ store: f.store, workflow: f.workflow, workspace: () => f.workspace, knowledge: f.knowledge, budget: f.budget, configuration: () => f.configuration, stateDirectory: join(f.root, 'test-state') }, { profile, transport, createDriver: bootstrap => { const driver = new SyntheticNativePort(bootstrap); drivers.push(driver); return driver; } });
+  const production = createSyntheticProductionServices({ store: f.store, workflow: f.workflow, workspace: () => f.workspace, knowledge: f.knowledge, budget: f.budget, configuration: () => f.configuration, stateDirectory: join(f.root, 'test-state'), localCommitAuthor }, { profile, transport, createDriver: bootstrap => { const driver = new SyntheticNativePort(bootstrap); drivers.push(driver); return driver; } });
   const coordinator = new ExecutionCoordinator(f.store, f.workflow, production.driver, production.prerequisites); production.bindCoordinator(coordinator);
   f.store.db.exec('CREATE TABLE host_model_decisions(grant_id TEXT,demand_id TEXT,decision_id TEXT,runtime_scope TEXT)');
   const authorize = (id: string) => {
@@ -250,16 +251,17 @@ test('restart records stop intent for durable boundary rows without pretending a
   assert.equal(restarted.auxiliaryStatus().safe, false); assert.equal(f.store.getDemand('demand').plans[0]!.ready, false);
 });
 
-async function enterReview(f: ReturnType<typeof syntheticComposition>) {
+async function enterReview(f: ReturnType<typeof syntheticComposition>, options: { localCommit?: boolean; beforeHandoff?: (primary: SyntheticNativePort, implementation: { run: RunRecord; init: WorkerInit }) => void } = {}) {
   await f.production.tick(); const primary = f.drivers[0]!, planning = primary.launches[0]!; await f.ready(primary, planning);
   await f.report(primary, planning, { type: 'plan-draft', plan: { id: 'p', scope: 'Only this requested feature', spec: pendingRef('s'), tickets: pendingRef('t'), requiredChecks: [{ id: 'test', name: 'Check requested feature', source: 'demand' }], unresolvedQuestions: [] }, artifactBodies: [{ id: 's', kind: 'plan', text: 'Exact requested behavior.' }, { id: 't', kind: 'plan', text: 'Bounded tickets.' }] });
   await f.settled(primary, planning); const boundaryDriver = f.drivers[1]!, boundary = boundaryDriver.launches[0]!; await f.ready(boundaryDriver, boundary);
   const context = String(f.store.db.prepare('SELECT context_id FROM host_boundary_runs WHERE domain_run_id=?').get(planning.init.domainRunId)!.context_id);
   await f.report(boundaryDriver, boundary, { type: 'plan-ready', planId: 'p', boundaryReview: { contextId: context, planningContextId: f.store.getRun(planning.init.domainRunId).contextId, evidence: pendingRef('b'), unresolvedBlockingFindings: [] }, artifactBodies: [{ id: 'b', kind: 'check-evidence', text: 'Independent boundary observations.' }] });
   await f.settled(boundaryDriver, boundary); await f.production.tick();
-  f.workflow.execute({ type: 'authorize-implementation', requestId: randomUUID(), demandId: 'demand', planId: 'p', confirmDesign: true }, f.user); f.authorize('grant2');
+  f.workflow.execute({ type: 'authorize-implementation', requestId: randomUUID(), demandId: 'demand', planId: 'p', confirmDesign: true, localCommit: options.localCommit }, f.user); f.authorize('grant2');
   await f.production.tick(); const implementation = primary.launches[1]!; assert.ok(implementation, JSON.stringify(f.production.diagnostics('demand'))); await f.ready(primary, implementation);
   writeFileSync(join(f.binding.worktreePath, 'code.txt'), 'Synthetic feature implementation.');
+  options.beforeHandoff?.(primary, implementation);
   await f.report(primary, implementation, { type: 'content-ready', content: { id: 'c', planId: 'p', code: { id: 'code', digest: 'pending', location: 'current-worktree' }, knowledge: [], maintenance: 'not-needed', deliveryNotes: 'Feature implemented.' } });
   await f.settled(primary, implementation); await f.production.tick();
   const review = primary.launches[2]!; assert.ok(review, JSON.stringify(f.production.diagnostics('demand'))); await f.ready(primary, review); return { primary, review };
@@ -307,4 +309,72 @@ test('model data preparation preserves only role-authorized explicitly selected 
   const approved = f.production.requiredModelData('demand');
   assert.ok(approved.some(item => item.id === 'knowledge:selected' && item.sha256 === selected.object.sha256)); assert.ok(!approved.some(item => item.id === 'knowledge:foreign'));
   const readIds = f.store.db.prepare('SELECT revision_id FROM knowledge_reads').all().map(row => row.revision_id); assert.ok(readIds.includes('selected')); assert.ok(!readIds.includes('foreign'));
+});
+
+async function completeReview(f: ReturnType<typeof syntheticComposition>, primary: SyntheticNativePort, review: { run: RunRecord; init: WorkerInit }) {
+  const check = await nativeCheck(f, primary, review);
+  await f.report(primary, review, { type: 'check', check: { id: 'pass', contentId: 'c', requirementId: 'test', status: 'passed', evidence: check, environment: 'ignored' } });
+  await f.report(primary, review, { type: 'review', reviewId: 'r', contentId: 'c', evidence: pendingRef('r-evidence'), knowledgeReviewed: true, findings: [], artifactBodies: [{ id: 'r-evidence', kind: 'check-evidence', text: 'Independent verified result.' }] });
+  await f.settled(primary, review); await f.production.tick();
+  assert.equal(f.store.getDemand('demand').phase, 'awaiting-acceptance');
+}
+
+test('return reasons are explicitly approved and carried with the exact returned result into fresh rework', async t => {
+  const f = syntheticComposition(t), { primary, review } = await enterReview(f); await completeReview(f, primary, review);
+  const result = f.store.getDemand('demand').activeResultId!;
+  f.workflow.execute({ type: 'return-result', requestId: randomUUID(), demandId: 'demand', resultId: result, reason: 'Keep the approved scope; correct the specified edge case.' }, f.user);
+  const proposed = f.production.requiredModelData('demand'); assert.ok(proposed.some(item => item.id === 'user-decisions:demand')); assert.ok(proposed.some(item => item.id === 'code'));
+  await f.production.tick(); assert.equal(primary.launches.length, 3, 'New user reasons are not automatically covered by old generated-context permission.');
+  f.authorize('grant3'); await f.production.tick(); const rework = primary.launches[3]!; assert.ok(rework, JSON.stringify(f.production.diagnostics('demand')));
+  const body = JSON.parse(rework.init.materials.find(item => item.id.startsWith('rework-scope:'))!.content);
+  assert.equal(body.returns[0].resultId, result); assert.match(body.returns[0].reason, /specified edge case/);
+  assert.ok(rework.init.materials.some(item => item.id === 'r-evidence')); assert.ok(rework.init.materials.some(item => item.id === 'code'));
+});
+
+test('stopped profile changes replace both native drivers and retain bounded revision instructions', async t => {
+  const f = syntheticComposition(t), { primary, review } = await enterReview(f); await completeReview(f, primary, review);
+  const result = f.store.getDemand('demand').activeResultId!;
+  f.workflow.execute({ type: 'return-result', requestId: randomUUID(), demandId: 'demand', resultId: result, reason: 'Return before revising the plan.' }, f.user);
+  f.workflow.execute({ type: 'revise-plan', requestId: randomUUID(), demandId: 'demand', previousPlanId: 'p', reason: 'Only adjust the requested edge case.' }, f.user);
+  f.configuration.runtime!.policySha256 = 'b'.repeat(64); f.authorize('grant3'); await f.production.tick();
+  const replacement = f.drivers[2]!, planning = replacement?.launches[0]!; assert.ok(planning, JSON.stringify(f.production.diagnostics('demand'))); assert.equal(planning.init.role, 'planning');
+  assert.match(planning.init.materials.find(item => item.id === 'user-decisions:demand')!.content, /Only adjust the requested edge case/);
+  assert.ok(planning.init.materials.some(item => item.id === 'plan-scope:p'), 'Revision sees the previous exact scope without silently retaining its authority.');
+  await f.ready(replacement, planning);
+  await f.report(replacement, planning, { type: 'plan-draft', plan: { id: 'p2', scope: 'Only adjusted requested edge case', spec: pendingRef('s2'), tickets: pendingRef('t2'), requiredChecks: [], unresolvedQuestions: [] }, artifactBodies: [{ id: 's2', kind: 'plan', text: 'Revised exact spec.' }, { id: 't2', kind: 'plan', text: 'Revised exact tickets.' }] });
+  await f.settled(replacement, planning);
+  assert.equal(f.drivers.length, 4); assert.equal(f.drivers[1]!.launches.length, 1, 'Old boundary driver is never reused with a new profile binding.'); assert.equal(f.drivers[3]!.launches[0]!.init.role, 'boundary-review');
+});
+
+test('explicit local commit uses approved author only after native writer stop and before immutable source capture', async t => {
+  const author = { name: 'Explicit Synthetic Author', email: 'explicit@example.invalid' }, f = syntheticComposition(t, demandId => { assert.equal(demandId, 'demand'); return author; });
+  await enterReview(f, { localCommit: true, beforeHandoff(primary, implementation) {
+    assert.equal(primary.stopped.has(implementation.run.runId), false); assert.equal(git(f.binding.worktreePath, 'rev-parse', 'HEAD'), f.binding.head, 'A live writer cannot create a commit.');
+  } });
+  const demand = f.store.getDemand('demand'), content = demand.contents[0]!, snapshot = JSON.parse(f.production.evidence.read(demand.id, content.code).content), head = git(f.binding.worktreePath, 'rev-parse', 'HEAD');
+  assert.notEqual(head, f.binding.head); assert.equal(snapshot.head, head); assert.equal(f.workspace.getBinding('demand')!.head, head);
+  assert.equal(git(f.binding.worktreePath, 'log', '-1', '--format=%an <%ae>'), 'Explicit Synthetic Author <explicit@example.invalid>');
+  assert.equal(git(f.binding.worktreePath, 'status', '--porcelain'), ''); assert.equal(git(f.repo, 'rev-parse', 'HEAD'), f.binding.head);
+  assert.equal(f.store.db.prepare("SELECT count(*) AS n FROM workspace_intents WHERE kind='commit' AND status='complete'").get()!.n, 1);
+});
+
+test('local commit author absence fails before implementation without guessing repository identity', async t => {
+  const f = syntheticComposition(t);
+  await assert.rejects(enterReview(f, { localCommit: true }), /LOCAL_COMMIT_AUTHOR_REQUIRED/);
+  assert.equal(f.drivers[0]!.launches.length, 1); assert.equal(git(f.binding.worktreePath, 'rev-parse', 'HEAD'), f.binding.head);
+  assert.equal(f.store.db.prepare("SELECT count(*) AS n FROM workspace_intents WHERE kind='commit'").get()!.n, 0);
+});
+
+test('requested local commit preserves user-staged data and does not freeze partial delivery', async t => {
+  const f = syntheticComposition(t, () => ({ name: 'Explicit Synthetic Author', email: 'explicit@example.invalid' }));
+  await assert.rejects(enterReview(f, { localCommit: true, beforeHandoff() {
+    writeFileSync(join(f.binding.worktreePath, 'user.txt'), 'Preexisting user staging must survive.'); git(f.binding.worktreePath, 'add', 'user.txt');
+  } }), /staged work is preserved/);
+  assert.equal(git(f.binding.worktreePath, 'diff', '--cached', '--name-only'), 'user.txt'); assert.equal(git(f.binding.worktreePath, 'rev-parse', 'HEAD'), f.binding.head);
+  assert.equal(f.store.getDemand('demand').contents.length, 0); assert.equal(f.store.db.prepare("SELECT count(*) AS n FROM workspace_intents WHERE kind='commit'").get()!.n, 0);
+});
+
+test('unrequested local commit never reads an author and remains honestly uncommitted', async t => {
+  let authorReads = 0; const f = syntheticComposition(t, () => { authorReads++; return { name: 'Unused', email: 'unused@example.invalid' }; });
+  await enterReview(f); assert.equal(authorReads, 0); assert.equal(git(f.binding.worktreePath, 'rev-parse', 'HEAD'), f.binding.head); assert.ok(git(f.binding.worktreePath, 'status', '--porcelain').includes('code.txt'));
 });

@@ -16,10 +16,20 @@ Callers must restrict context-creation, evidence and eligibility APIs to the Hos
 
 ## GitHub read-only adapter
 
-`GitHubReadOnlyAdapter({db,binding:{projectId,demandId,owner,repository,pullRequest,target},transport?,timeoutMs?})` exposes only `observe`, `observations` and `recordContentVerification`.
+`GitHubReadOnlyAdapter({db,binding:{projectId,demandId,owner,repository,pullRequest,target},transport?,timeoutMs?})` exposes only observations, exact tree comparison, and local verification records.
 
 The built-in transport makes bounded, redirect-rejecting GET requests to fixed GitHub API paths. There is no arbitrary URL, token forwarding, comments-to-control, push, PR creation or merge operation. A supplied test transport forces `controlled-response` provenance. The built-in public read path has `github-live` provenance only for requests it actually makes; tests make no real network requests.
 
 PR identity and target are checked. Merge commit existence and its containment in the observed target are verified independently of PR status. Unknown, open, closed-unmerged, wrong-target and merged observations remain distinct; failures do not erase historical facts. Merge observations do not grant acceptance or knowledge eligibility.
 
 `recordContentVerification` stores Q's separate scoped code/capability evidence across accepted, submitted and final content. Different SHAs from squash/rebase are not automatically a mismatch. Acceptance coverage (`covered`, `gap`, `unknown`) is distinct from correspondence and knowledge suitability. Full live GitHub/Agent reuse remains blocked until an authorized test repository and execution combination exist.
+
+## Application lifecycle
+
+`HostKnowledgeLifecycle` in `src/host/knowledge-lifecycle.ts` joins actual application results to these services. After a production tick, `captureResults` retains each exact result N as an immutable local hypothesis only when the Host registry proves that a separately stopped Review received the exact C/N bodies. A model's `knowledgeReviewed` field alone cannot do this. The desktop can inspect candidates, explicitly classify an immutable child revision, pin a GitHub PR, observe its state, select independently observed capability checks, qualify an exact baseline/environment, or invalidate a revision.
+
+Qualification obtains native check data from the Host command registry and verifies artifact ownership, successful actual exit, source-before/source-after identities, stopped independent run, generation and environment. Synthetic receipts are rejected. The user's review decision records reusable meaning, applicability and absence of mixed private conclusions; it supplies no merge or process evidence. Implementation material additionally needs the exact accepted result and a live remote observation. GET-only commit-tree comparisons require submitted and final remote trees to equal the independently reviewed local tree. This deliberately rejects changed final code until separately reviewed; equal squash/rebase trees are supported without assuming equal commits. Existing facts must predate the discovering demand's initial formal baseline. Environment-only material cannot declare code-dependent module paths. Every reuse eligibility pins an exact baseline and observed environment.
+
+Baseline proposals record source commit, formal target, demand HEAD and current baseline. Applying one requires a current-version desktop decision, explicit commit identity, active unprotected demand and stopped execution. The Host first blocks queued execution, then calls the recoverable local workspace operation. There is no fetch, push, PR creation, remote merge or silent formal-target update. Missing local formal objects must be supplied through the user's separately controlled Git workflow. Integrated code remains unverified and the prior reuse baseline remains effective until an independently checked result at the exact integrated commit is supplied. Existing results are never rewritten or accepted by integration.
+
+`tests/knowledge-lifecycle.test.ts` exercises the application orchestration with isolated repositories and controlled trusted-registry fixtures. It does not establish a real Windows native run, live GitHub merge, paid-model invocation, or actual later-agent reuse. Those external acceptance gates remain unverified.

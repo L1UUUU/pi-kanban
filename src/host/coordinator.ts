@@ -28,6 +28,7 @@ export class ExecutionCoordinator {
   constructor(store: WorkbenchStore, workflow: WorkflowService, driver: RuntimeDriver, prerequisites: ExecutionPrerequisites) {
     this.#store = store; this.#workflow = workflow; this.#prerequisites = prerequisites;
     store.db.exec('CREATE TABLE IF NOT EXISTS host_run_bindings(domain_run_id TEXT PRIMARY KEY, runtime_run_id TEXT UNIQUE, status TEXT NOT NULL)');
+    store.db.exec('CREATE TABLE IF NOT EXISTS host_run_operation_keys(run_id TEXT PRIMARY KEY, operation_key TEXT NOT NULL)');
     store.db.exec('CREATE TABLE IF NOT EXISTS host_exit_classifications(run_id TEXT PRIMARY KEY, outcome TEXT NOT NULL, evidence TEXT NOT NULL)');
     this.#limits = new ModelBudgetLedger(store.db, () => { throw new Error('The coordinator cannot grant model spend.'); });
     this.supervisor = new RuntimeSupervisor(store.db, driver, request => {
@@ -94,7 +95,19 @@ export class ExecutionCoordinator {
       }
     }
   }
-  private operationKey(run: RunAttempt): string { return `execution:${run.demandId}:${run.stage}:${run.planId ?? 'initial'}:${run.contentId ?? 'work'}`; }
+  private operationKey(run: RunAttempt): string {
+    const saved = this.#store.db.prepare('SELECT operation_key FROM host_run_operation_keys WHERE run_id=?').get(run.id);
+    if (saved) return String(saved.operation_key);
+    // Explicitly returning a submitted result or revising an exact plan starts
+    // a new user-requested operation. Clearing a blocker/resuming never resets
+    // the retry budget for an unchanged operation. Freeze this key per run.
+    const demand = this.#store.getDemand(run.demandId);
+    const returns = demand.acceptances.filter(item => item.decision === 'returned').length;
+    const revisions = this.#store.history(run.demandId).filter(item => item.kind === 'user-command' && (item.data as { command?: { type?: string } }).command?.type === 'revise-plan').length;
+    const key = `execution:${run.demandId}:${run.stage}:returns-${returns}:revisions-${revisions}:${run.planId ?? 'initial'}:${run.contentId ?? 'work'}`;
+    this.#store.db.prepare('INSERT INTO host_run_operation_keys VALUES(?,?)').run(run.id, key);
+    return key;
+  }
   private classifyStoppedRun(run: RunAttempt): void {
     if (this.#store.db.prepare('SELECT 1 FROM host_exit_classifications WHERE run_id=?').get(run.id)) return;
     const demand = this.#store.getDemand(run.demandId);

@@ -1,0 +1,4 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { appContainerProfileName } from '../src/runtime/appcontainer-name.ts';
+test('AppContainer name binds full demand role and generation within Win32 64-character bound',()=>{assert.equal(appContainerProfileName('A','implementation','generation-1'),'pi-kanban-a898bef33cf31470bdfb100d74db470c2cbf93aea19effb2');const demand='d'.repeat(80),generation='g'.repeat(80),name=appContainerProfileName(demand,'boundary-review',generation);assert.equal(name.length,58);assert.match(name,/^pi-kanban-[a-f0-9]{48}$/);for(const variant of [appContainerProfileName(demand+'', 'review',generation),appContainerProfileName('e'+demand.slice(1),'boundary-review',generation),appContainerProfileName(demand,'boundary-review',generation.slice(1)+'h')])assert.notEqual(name,variant);assert.throws(()=>appContainerProfileName('A|review','implementation','g'),{code:'NATIVE_IDENTITY_INVALID'});});

@@ -66,6 +66,20 @@ export class GitHubReadOnlyAdapter {
   observations():RemoteObservation[] {
     return (this.db.prepare('SELECT data FROM workspace_remote_observations WHERE project_id=? AND demand_id=? ORDER BY rowid').all(this.binding.projectId,this.binding.demandId) as any[]).map(r=>JSON.parse(r.data));
   }
+  /** Real immutable Git tree identities establish byte/mode/path correspondence,
+   * including squash/rebase commits. Matching ancestry alone is insufficient. */
+  async compareTrees(observationId:string,acceptedTree:string):Promise<{contentCorresponds:boolean;formalTree:string;submittedTree:string;evidenceRef:string}> {
+    insist(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(acceptedTree),'INVALID_TREE','Use the exact independently reviewed Git tree.');
+    const observation=this.observations().find(o=>o.observationId===observationId);
+    insist(observation?.state==='merged' && observation.formalCommit && observation.submittedCommit,'MERGE_UNVERIFIED','A matching merged observation is required.');
+    const [formal,submitted]=await Promise.all([this.get(`/git/commits/${observation.formalCommit}`),this.get(`/git/commits/${observation.submittedCommit}`)]);
+    insist(formal.sha===observation.formalCommit && submitted.sha===observation.submittedCommit,'REMOTE_IDENTITY','Remote content identities differ from the pinned observed commits.');
+    for(const response of [formal,submitted])insist(/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(response.tree?.sha??''),'REMOTE_INCOMPLETE','Remote commit tree identity is missing.');
+    const result={contentCorresponds:formal.tree.sha===acceptedTree && submitted.tree.sha===acceptedTree,formalTree:formal.tree.sha,submittedTree:submitted.tree.sha,evidenceRef:`github-tree:${observationId}:${formal.tree.sha}:${submitted.tree.sha}:${acceptedTree}`};
+    this.db.exec('CREATE TABLE IF NOT EXISTS workspace_tree_correspondence(evidence_ref TEXT PRIMARY KEY,observation_id TEXT NOT NULL,data TEXT NOT NULL)');
+    this.db.prepare('INSERT OR IGNORE INTO workspace_tree_correspondence VALUES(?,?,?)').run(result.evidenceRef,observationId,canonicalJson({...result,acceptedTree,provenance:this.provenance,observedAt:new Date().toISOString()}));
+    return result;
+  }
   /** Independent Q evidence; neither merged=true nor matching SHAs supplies semantic correspondence. */
   recordContentVerification(input:ContentVerification):void {
     id(input.verificationId);id(input.reviewerId);

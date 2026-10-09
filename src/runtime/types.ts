@@ -44,6 +44,9 @@ export interface RuntimeDriver {
   launch(run: RunRecord): Promise<ProcessIdentity>;
   stop(run: RunRecord): Promise<Observation>;
   observe(run: RunRecord): Promise<Observation>;
+  /** Optional authenticated durable proof for crash before process registration.
+   * Never infer this from a missing PID or a generic process lookup. */
+  recoverUnregistered?(run: RunRecord): Promise<Observation>;
 }
 export class RuntimeError extends Error {
   code: string;

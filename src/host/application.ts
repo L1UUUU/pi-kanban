@@ -12,6 +12,9 @@ import { KnowledgeService } from '../knowledge/index.ts';
 import { ExecutionCoordinator } from './coordinator.ts';
 import { ConfigurationStore, configurationDigest, createModelGrant, loadMethods } from './configuration.ts';
 import { createProductionServices } from './production.ts';
+import { HostKnowledgeLifecycle } from './knowledge-lifecycle.ts';
+import { loadInstalledWindowsEvidenceTrust } from '../runtime/profile.ts';
+import type { WindowsEvidenceTrustAnchor } from '../runtime/evidence-auth.ts';
 
 export const EXECUTION_BLOCKERS = [
   'Windows AppContainer / Job Objects 运行组合尚未验证；不会在无隔离环境启动 Agent。',
@@ -29,6 +32,8 @@ export class HostApplication {
   readonly budget: ModelBudgetLedger;
   readonly configuration: ConfigurationStore;
   readonly production: ReturnType<typeof createProductionServices>;
+  readonly knowledgeLifecycle: HostKnowledgeLifecycle;
+  #runtimeTrustProblem: string | undefined;
   #temporaryConfiguration: string | undefined;
   #workspace?: WorkspaceService;
   #closing = false;
@@ -41,6 +46,7 @@ export class HostApplication {
     this.configuration = new ConfigurationStore(configDirectory);
     this.store.db.exec('CREATE TABLE IF NOT EXISTS host_snapshot_sequence(singleton INTEGER PRIMARY KEY CHECK(singleton=1), value INTEGER NOT NULL); INSERT OR IGNORE INTO host_snapshot_sequence VALUES(1,0)');
     this.store.db.exec('CREATE TABLE IF NOT EXISTS host_model_decisions(request_id TEXT PRIMARY KEY, input_hash TEXT NOT NULL, demand_id TEXT NOT NULL, configuration_digest TEXT NOT NULL, grant_id TEXT NOT NULL, decision_id TEXT NOT NULL, created_at TEXT NOT NULL)');
+    this.store.db.exec('CREATE TABLE IF NOT EXISTS host_local_commit_authorities(demand_id TEXT NOT NULL,plan_id TEXT NOT NULL,request_id TEXT NOT NULL,author_json TEXT NOT NULL,PRIMARY KEY(demand_id,plan_id))');
     this.store.db.exec('CREATE TABLE IF NOT EXISTS host_project_baselines(project_id TEXT PRIMARY KEY, baseline TEXT, formal_target TEXT NOT NULL)');
     if (!this.store.db.prepare('PRAGMA table_info(host_model_decisions)').all().some(column => column.name === 'runtime_scope')) this.store.db.exec("ALTER TABLE host_model_decisions ADD COLUMN runtime_scope TEXT NOT NULL DEFAULT 'none'");
     this.knowledge = new KnowledgeService({ db: this.store.db, resolveStore: projectId => {
@@ -51,9 +57,19 @@ export class HostApplication {
       const decision = this.store.db.prepare('SELECT * FROM host_model_decisions WHERE decision_id=? AND demand_id=? AND grant_id=?').get(grant.decisionId, grant.demandId, grant.id);
       if (!decision) throw new ProtocolError('MODEL_AUTHORIZATION_MISSING', 'No independently recorded trusted model/data/spend approval exists.');
     });
-    this.production = createProductionServices({ store: this.store, workflow: this.workflow, configuration: () => this.configuration.load(), workspace: () => this.workspace, knowledge: this.knowledge, budget: this.budget, stateDirectory: join(configDirectory, 'runtime') });
+    let evidenceTrustAnchor: WindowsEvidenceTrustAnchor | undefined;
+    const trustDirectory = process.env.PI_KANBAN_RUNTIME_TRUST_DIR, trustDigest = process.env.PI_KANBAN_RUNTIME_TRUST_SHA256;
+    if (trustDirectory || trustDigest) {
+      try {
+        if (!trustDirectory || !trustDigest) throw new Error('Both trusted installation directory and its independently pinned digest are required.');
+        evidenceTrustAnchor = loadInstalledWindowsEvidenceTrust(trustDirectory, trustDigest);
+      } catch (error) { this.#runtimeTrustProblem = error instanceof Error ? error.message : 'Installed runtime recorder trust could not be verified.'; }
+    }
+    this.production = createProductionServices({ store: this.store, workflow: this.workflow, configuration: () => this.configuration.load(), workspace: () => this.workspace, knowledge: this.knowledge, budget: this.budget, stateDirectory: join(configDirectory, 'runtime'), evidenceTrustAnchor, localCommitAuthor: demandId => { const demand = this.store.getDemand(demandId); if (!demand.grant?.localCommit) return null; const row = this.store.db.prepare('SELECT author_json FROM host_local_commit_authorities WHERE demand_id=? AND plan_id=?').get(demandId, demand.grant.planId); return row ? JSON.parse(String(row.author_json)) : null; } });
     this.coordinator = new ExecutionCoordinator(this.store, this.workflow, this.production.driver, this.production.prerequisites);
     this.production.bindCoordinator(this.coordinator);
+    this.knowledgeLifecycle = new HostKnowledgeLifecycle({ store: this.store, workflow: this.workflow, knowledge: this.knowledge, workspace: () => this.workspace, evidence: this.production.evidence,
+      stopped: demandId => !this.store.listRuns(demandId).some(run => run.status !== 'stopped') && !this.coordinator.supervisor.list().some(run => run.demandId === demandId && run.state !== 'stopped') && this.production.auxiliaryStatus().safe });
   }
   /** Host-only lazy service: absent Windows Git configuration does not prevent
    * users recording ideas. It blocks only repository preparation/execution. */
@@ -76,7 +92,7 @@ export class HostApplication {
       sequence: Number(this.store.db.prepare('SELECT value FROM host_snapshot_sequence WHERE singleton=1').get()!.value),
       projects: this.store.listProjects().map(p => ({ id: p.id, name: p.name, rootPath: p.rootPath })),
       demands: this.store.listDemands().map(d => this.#view(d)),
-      runtime: { platform: process.platform, node: process.version, executionEnabled: runtime.executionEnabled, blockers: [...new Set([...runtime.blockers, ...configuration.methods.flatMap(method => method.blockers), ...configuration.provider.blockers])], connection: 'connected', model: configuration.configuration.provider?.modelId },
+      runtime: { platform: process.platform, node: process.version, executionEnabled: runtime.executionEnabled, blockers: [...new Set([...runtime.blockers, ...(this.#runtimeTrustProblem ? [this.#runtimeTrustProblem] : []), ...configuration.methods.flatMap(method => method.blockers), ...configuration.provider.blockers])], connection: 'connected', model: configuration.configuration.provider?.modelId },
       configuration: { ...configuration, authorization: approval ? { demandId: String(approval.demand_id), grantId: String(approval.grant_id), configurationDigest: String(approval.configuration_digest) } : undefined },
     };
   }
@@ -94,6 +110,7 @@ export class HostApplication {
       activities: this.store.history(d.id).slice(-200).map((h, index) => ({ id: `${d.id}-${index}`, kind: 'workflow', title: h.kind, timestamp: h.createdAt, status: 'complete' })),
       messages: d.messages.map(m => ({ id: m.id, role: 'user', text: m.text, state: m.state })),
       checks: d.checks.map(c => ({ id: c.id, name: plan?.requiredChecks.find(r => r.id === c.requirementId)?.name ?? c.requirementId, status: c.status, evidence: c.evidence.location, contentId: c.contentId })),
+      knowledgeLifecycle: this.knowledgeLifecycle.snapshot(d.id),
       knowledge: result?.N.map(n => ({ id: n.id, title: n.id, status: 'candidate', detail: '本轮版本已保存；接受成果与取得跨需求复用资格是不同事实。' })) ?? [],
       runState: run ? run.status === 'starting' ? 'queued' : run.status : this.store.outbox('pending').some(o => o.demandId === d.id && o.kind === 'start-run') ? 'queued' : 'idle',
     };
@@ -182,7 +199,16 @@ export class HostApplication {
         if (!COMMANDS.has(kind)) throw new ProtocolError('UNKNOWN_COMMAND', 'Unsupported desktop control.');
         const common = { requestId: id(params.requestId), demandId: id(params.demandId), expectedRevision: revision(params.expectedVersion) };
         let command: UserCommand;
-        if (kind === 'confirm-plan' || kind === 'authorize-implementation') command = { ...common, type: kind, planId: id(params.planId, 'plan version') };
+        let localAuthor: { name: string; email: string } | undefined;
+        if (kind === 'authorize-implementation') {
+          if (params.localCommit !== undefined && typeof params.localCommit !== 'boolean') throw new ProtocolError('INVALID_INPUT', 'Local commit permission must be explicit.');
+          if (params.localCommit === true) {
+            localAuthor = { name: text(params.authorName, 'local commit author', 200), email: text(params.authorEmail, 'local commit email', 320) };
+            if (/[\r\n<>]/.test(localAuthor.name) || !/^[^\s<>@]+@[^\s<>@]+$/.test(localAuthor.email)) throw new ProtocolError('INVALID_AUTHOR', 'Use an explicit valid local Git author identity.');
+          }
+          command = { ...common, type: kind, planId: id(params.planId, 'plan version'), localCommit: params.localCommit === true, originalText: localAuthor ? JSON.stringify({ localCommit: true, author: localAuthor }) : undefined };
+        }
+        else if (kind === 'confirm-plan') command = { ...common, type: kind, planId: id(params.planId, 'plan version') };
         else if (kind === 'accept-result') command = { ...common, type: kind, resultId: id(params.resultId, 'result version') };
         else if (kind === 'return-result') command = { ...common, type: kind, resultId: id(params.resultId, 'result version'), reason: text(params.text, 'return reason') };
         else if (kind === 'revise-plan') command = { ...common, type: kind, previousPlanId: id(params.previousPlanId, 'previous plan version'), reason: text(params.text, 'revision reason') };
@@ -215,6 +241,7 @@ export class HostApplication {
           }
         }
         this.workflow.execute(command, this.#user);
+        if (localAuthor && kind === 'authorize-implementation') this.store.db.prepare('INSERT INTO host_local_commit_authorities VALUES(?,?,?,?) ON CONFLICT(demand_id,plan_id) DO UPDATE SET request_id=excluded.request_id,author_json=excluded.author_json').run(common.demandId,String(params.planId),common.requestId,JSON.stringify(localAuthor));
         if (kind === 'start-planning' || kind === 'resume') {
           const demand = this.store.getDemand(common.demandId), base = this.store.db.prepare('SELECT baseline FROM host_project_baselines WHERE project_id=?').get(demand.projectId);
           if (base) this.production.prepareDemand(demand.id, base.baseline === null ? null : String(base.baseline));
@@ -249,6 +276,11 @@ export class HostApplication {
     await this.coordinator.observeCompletedRuns();
     return this.shutdown();
   }
-  async tick(): Promise<void> { await this.production.tick(); }
+  async knowledgeAction(input: unknown): Promise<ViewState> {
+    if (this.#closing) throw new ProtocolError('APP_STOPPING', 'Application exit is in progress.');
+    await this.knowledgeLifecycle.handle(input);
+    return this.snapshot();
+  }
+  async tick(): Promise<void> { await this.production.tick(); this.knowledgeLifecycle.captureResults(); }
   close(): void { this.store.close(); if (this.#temporaryConfiguration) rmSync(this.#temporaryConfiguration, { recursive: true, force: true }); }
 }

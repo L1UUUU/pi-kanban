@@ -45,7 +45,7 @@ test('AC-026: tracked or forcibly staged private materials block commits, even w
 });
 for(const point of ['prepare.intent','prepare.created'])test(`FI-04/AC-053: recover ${point} without duplicate worktrees`,t=>{
  const f=fixture(t);const crash=new WorkspaceService({db:f.db,gitExecutable,fault:p=>{if(p===point)throw new Error('injected crash');}});
- assert.throws(()=>crash.prepare(f.req),/injected crash/);const w=f.service.reconcile(f.req.operationId) as any;assert.equal(w.worktreePath,realpathSync(f.req.worktreePath));assert.equal(f.service.git.worktrees(f.repo).length,2);
+ assert.throws(()=>crash.prepare(f.req),/injected crash/);const w=f.service.reconcile(f.req.operationId) as any;assert.equal(w.worktreePath,realpathSync.native(f.req.worktreePath));assert.equal(f.service.git.worktrees(f.repo).length,2);
 });
 for(const point of ['commit.intent','commit.staged','commit.object','commit.recorded','commit.ref','commit.index'])test(`FI-04/AC-032: recover ${point} with one ordinary commit`,t=>{
  const f=fixture(t);const w=f.service.prepare(f.req);writeFileSync(join(w.worktreePath,'code.txt'),'new');const input=saveRequest(w.worktreePath,f.base);

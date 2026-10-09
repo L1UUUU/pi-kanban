@@ -286,3 +286,56 @@ test('renderer: method switch binds only an imported exact snapshot, requires re
   assert.equal(decisionUnavailable(review, state({ demands: [target], configuration: config })), null);
   assert.match(decisionUnavailable(review, state({ demands: [target], configuration: { ...config, configurationDigest: 'e'.repeat(64) } }))!, /配置版本已变化/);
 });
+
+import { knowledgeUnavailable, makeKnowledgeAction } from '../src/desktop/renderer/knowledge-model.ts';
+import { implementationUnavailable, makeImplementationAuthorization } from '../src/desktop/renderer/implementation-model.ts';
+import type { KnowledgeLifecycleView } from '../src/host/knowledge-lifecycle.ts';
+const lifecycle = (): KnowledgeLifecycleView => ({ candidates: [{ revisionId: 'synthetic-kr1', resultId: 'synthetic-r1', artifactId: 'synthetic-n1', title: 'Synthetic fact', sourceKind: 'implementation', statementKind: 'fact', status: 'candidate', body: 'Synthetic exact candidate body', roles: ['planner'], modulePaths: ['src/synthetic.ts'] }], resultMaterials: [{ resultId: 'synthetic-r1', artifactId: 'synthetic-n1', title: 'Synthetic candidate', accepted: true }], checks: [{ id: 'synthetic-check1', resultId: 'synthetic-r1', name: 'Synthetic renderer fixture', environment: 'synthetic-environment', usable: true }], observations: [{ observationId: 'synthetic-observation', projectId: 'synthetic-project', demandId: 'synthetic-demand', observedAt: '2026-10-08T00:00:00Z', provenance: 'github-live', owner: 'synthetic', repository: 'fixture', pullRequest: 1, target: 'main', state: 'merged', formalCommit: 'a'.repeat(40), targetCommit: 'a'.repeat(40), submittedCommit: 'b'.repeat(40), url: 'https://github.com/synthetic/fixture/pull/1' }], baseline: { initial: 'a'.repeat(40), current: 'a'.repeat(40), head: 'b'.repeat(40), formalTarget: 'main' }, proposals: [{ proposalId: 'synthetic-proposal', demandId: 'synthetic-demand', formalTarget: 'main', sourceCommit: 'c'.repeat(40), expectedHead: 'b'.repeat(40), expectedBaseline: 'a'.repeat(40), createdAt: '' }], blockers: [] });
+test('renderer: knowledge candidate saves exact artifact with explicit classification and role scope only', () => {
+  const target = demand({ knowledgeLifecycle: lifecycle() }); const review = { action: 'save-candidate' as const, demand: target, resultId: 'synthetic-r1', artifactId: 'synthetic-n1' };
+  assert.throws(() => makeKnowledgeAction(review, { title: 'Synthetic' }, 'request'), /明确选择/);
+  const action = makeKnowledgeAction(review, { title: '  Synthetic fact  ', sourceKind: 'implementation', statementKind: 'fact', roles: ['planner'], modulePaths: 'src/a.ts\nsrc/a.ts\nsrc/b.ts', tags: 'dates' }, 'request');
+  assert.deepEqual(action, { action: 'save-candidate', demandId: target.id, expectedVersion: 7, requestId: 'request', resultId: 'synthetic-r1', artifactId: 'synthetic-n1', title: 'Synthetic fact', sourceKind: 'implementation', statementKind: 'fact', roles: ['planner'], modulePaths: ['src/a.ts','src/b.ts'], tags: ['dates'] });
+  assert.equal('body' in action, false); assert.equal('verified' in action, false);
+});
+test('renderer: qualification cannot treat hypothesis, fake merge, unavailable or other-result checks as proof', () => {
+  const target = demand({ knowledgeLifecycle: lifecycle() }); const review = { action: 'qualify' as const, demand: target, revisionId: 'synthetic-kr1' };
+  const input = { baseline: 'a'.repeat(40), checkIds: ['synthetic-check1'], observationId: 'synthetic-observation', reviewed: true, reason: 'Synthetic semantic review' };
+  assert.throws(() => makeKnowledgeAction(review, { ...input, reviewed: false }, 'request'), /审阅/);
+  const action = makeKnowledgeAction(review, input, 'request'); assert.equal(action.action, 'qualify'); assert.equal('sourceVerified' in action, false);
+  for (const mutate of [(view: KnowledgeLifecycleView) => { view.candidates[0]!.statementKind = 'hypothesis'; }, (view: KnowledgeLifecycleView) => { view.observations[0]!.provenance = 'controlled-response'; }, (view: KnowledgeLifecycleView) => { view.checks[0]!.usable = false; }, (view: KnowledgeLifecycleView) => { view.checks[0]!.resultId = 'other-result'; }]) {
+    const view = lifecycle(); mutate(view); assert.throws(() => makeKnowledgeAction({ ...review, demand: { ...target, knowledgeLifecycle: view } }, input, 'request'));
+  }
+  const independent = lifecycle(); independent.candidates[0]!.sourceKind = 'existing-fact';
+  assert.throws(() => makeKnowledgeAction({ ...review, demand: { ...target, knowledgeLifecycle: independent } }, input, 'request'), /独立/);
+});
+test('renderer: baseline proposal has no integration authority; integration requires exact proposal and explicit author', () => {
+  const target = demand({ runState: 'stopped', knowledgeLifecycle: lifecycle() });
+  const proposal = makeKnowledgeAction({ action: 'propose-baseline', demand: target }, { sourceCommit: 'c'.repeat(40) }, 'request');
+  assert.equal(proposal.action, 'propose-baseline'); assert.equal('author' in proposal, false); assert.equal('updateAuthorized' in proposal, false);
+  assert.throws(() => makeKnowledgeAction({ action: 'propose-baseline', demand: target }, { sourceCommit: 'main' }, 'request'), /完整/);
+  const review = { action: 'apply-baseline' as const, demand: target, proposalId: 'synthetic-proposal' };
+  assert.throws(() => makeKnowledgeAction(review, { authorName: 'Synthetic', authorEmail: 'synthetic@example.invalid' }, 'request'), /授权/);
+  assert.deepEqual(makeKnowledgeAction(review, { reviewed: true, authorName: 'Synthetic', authorEmail: 'synthetic@example.invalid' }, 'request'), { action: 'apply-baseline', demandId: target.id, expectedVersion: 7, requestId: 'request', proposalId: 'synthetic-proposal', author: { name: 'Synthetic', email: 'synthetic@example.invalid' } });
+  assert.equal(knowledgeUnavailable(review, state({ demands: [target] })), null);
+  assert.match(knowledgeUnavailable(review, state({ demands: [{ ...target, runState: 'running' }] }))!, /停止/);
+  const drift = structuredClone(target); drift.knowledgeLifecycle!.baseline!.head = 'f'.repeat(40);
+  assert.match(knowledgeUnavailable(review, state({ demands: [drift] }))!, /记录已变化/);
+});
+test('renderer: knowledge stale version and changed exact lifecycle record close eligibility decisions', () => {
+  const target = demand({ knowledgeLifecycle: lifecycle() }), review = { action: 'invalidate' as const, demand: target, revisionId: 'synthetic-kr1' };
+  assert.match(knowledgeUnavailable(review, state({ demands: [{ ...target, version: 8 }] }))!, /重新审阅/);
+  assert.throws(() => makeKnowledgeAction(review, { reason: ' ' }, 'request'), /撤销原因/);
+  assert.equal(makeKnowledgeAction(review, { reason: 'Synthetic invalid source' }, 'request').action, 'invalidate');
+});
+test('renderer: implementation author consent is default-off and never confirms design or grants remote rights', () => {
+  const target = demand({ phase: 'awaiting-authorization', plan: { id: 'synthetic-plan', scope: 'Synthetic scope', ready: true, confirmed: true } });
+  const noCommit = makeImplementationAuthorization(target, { localCommit: false, authorName: 'Ignored', authorEmail: 'ignored@example.invalid' }, 'request');
+  assert.deepEqual(noCommit, { kind: 'authorize-implementation', demandId: target.id, expectedVersion: 7, requestId: 'request', planId: 'synthetic-plan', localCommit: false });
+  assert.throws(() => makeImplementationAuthorization(target, { localCommit: true, authorName: '', authorEmail: '' }, 'request'), /作者/);
+  const withCommit = makeImplementationAuthorization(target, { localCommit: true, authorName: 'Synthetic User', authorEmail: 'synthetic@example.invalid' }, 'request');
+  assert.equal(withCommit.localCommit, true); assert.equal(withCommit.authorName, 'Synthetic User');
+  assert.equal('confirmDesign' in withCommit, false); assert.equal('push' in withCommit, false);
+  assert.match(implementationUnavailable(target, state({ demands: [{ ...target, version: 8 }] }))!, /版本已变化/);
+  assert.throws(() => makeImplementationAuthorization({ ...target, plan: { ...target.plan!, confirmed: false } }, { localCommit: false, authorName: '', authorEmail: '' }, 'request'), /单独确认/);
+});

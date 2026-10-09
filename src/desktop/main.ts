@@ -35,6 +35,8 @@ async function startHost(): Promise<void> {
   if (process.env.PI_KANBAN_GIT && isAbsolute(process.env.PI_KANBAN_GIT)) environment.PI_KANBAN_GIT = process.env.PI_KANBAN_GIT;
   // Explicit OS loader/profile/temp paths required by the trusted native helper only. No API tokens, shell config, proxy, or HOME.
   for (const key of ['SystemRoot', 'SystemDrive', 'WINDIR', 'USERPROFILE', 'LOCALAPPDATA', 'APPDATA', 'TEMP', 'TMP', 'TMPDIR', 'LANG']) if (process.env[key]) environment[key] = process.env[key];
+  if (process.env.PI_KANBAN_RUNTIME_TRUST_DIR && isAbsolute(process.env.PI_KANBAN_RUNTIME_TRUST_DIR)) environment.PI_KANBAN_RUNTIME_TRUST_DIR = process.env.PI_KANBAN_RUNTIME_TRUST_DIR;
+  if (/^[a-f0-9]{64}$/.test(process.env.PI_KANBAN_RUNTIME_TRUST_SHA256 ?? '')) environment.PI_KANBAN_RUNTIME_TRUST_SHA256 = process.env.PI_KANBAN_RUNTIME_TRUST_SHA256;
   // A configured reference selects at most one credential for the trusted Host.
   // The native Worker environment never inherits it. Importing settings alone
   // does not grant a request; the Host ledger requires separate finite consent.
@@ -71,7 +73,7 @@ async function startHost(): Promise<void> {
 }
 
 function registerControl(): void {
-  for (const method of ['snapshot', 'createDemand', 'command', 'sendMessage', 'prepareModelApproval', 'authorizeModel']) ipcMain.handle(`workbench:${method}`, async (event, params = {}) => {
+  for (const method of ['snapshot', 'createDemand', 'command', 'sendMessage', 'prepareModelApproval', 'authorizeModel', 'knowledgeAction']) ipcMain.handle(`workbench:${method}`, async (event, params = {}) => {
     if (!window || event.sender !== window.webContents || !isTrustedSender(event.senderFrame?.url ?? '', event.senderFrame === event.sender.mainFrame)) throw new Error('Untrusted control origin.');
     assertFrame(params);
     const state = await request(method, params);

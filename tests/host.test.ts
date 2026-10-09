@@ -165,3 +165,25 @@ test('desktop method replacement resolves a frozen configured source and rejects
     assert.throws(() => app.handle('command', { ...input, requestId: 'changed', expectedVersion: result.demands[0].version }), /snapshot changed/);
   } finally { app.close(); rmSync(root, { recursive: true, force: true }); }
 });
+
+test('implementation permission separately binds optional local Git commit authority and exact author', () => {
+  const app = new HostApplication();
+  try {
+    const project = app.workflow.createProject({ name: 'synthetic commit consent', rootPath: tmpdir() });
+    const demand = app.workflow.createDemand({ projectId: project.id, title: 'synthetic', description: '' });
+    demand.planningStarted = true; demand.activePlanId = 'P1'; demand.confirmedPlanId = 'P1';
+    demand.plans = [{ id: 'P1', scope: 'synthetic plan', spec: { id: 'spec', digest: 'a'.repeat(64), location: 'synthetic-only' }, tickets: { id: 'tickets', digest: 'b'.repeat(64), location: 'synthetic-only' }, ready: true, requiredChecks: [], unresolvedQuestions: [], createdByRun: 'synthetic-planning' }];
+    app.store.saveDemand(demand);
+    const base = { kind: 'authorize-implementation', demandId: demand.id, planId: 'P1', expectedVersion: demand.revision };
+    assert.throws(() => app.handle('command', { ...base, requestId: 'missing-author', localCommit: true }), /author/);
+    app.handle('command', { ...base, requestId: 'implement-only' });
+    assert.equal(app.store.getDemand(demand.id).grant!.localCommit, false);
+    assert.equal(app.store.db.prepare('SELECT count(*) n FROM host_local_commit_authorities').get()!.n, 0);
+    const selected = { ...base, expectedVersion: app.store.getDemand(demand.id).revision, requestId: 'allow-local-commit', localCommit: true, authorName: 'Synthetic Fixture', authorEmail: 'fixture@example.invalid' };
+    app.handle('command', selected); app.handle('command', selected);
+    assert.equal(app.store.getDemand(demand.id).grant!.localCommit, true);
+    assert.deepEqual(JSON.parse(String(app.store.db.prepare('SELECT author_json FROM host_local_commit_authorities').get()!.author_json)), { name: selected.authorName, email: selected.authorEmail });
+    assert.throws(() => app.handle('command', { ...selected, authorEmail: 'changed@example.invalid' }), /different content/);
+    assert.equal(app.store.listRuns().length, 0); assert.equal(app.snapshot().runtime.executionEnabled, false);
+  } finally { app.close(); }
+});

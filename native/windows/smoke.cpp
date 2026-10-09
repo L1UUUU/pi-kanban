@@ -108,7 +108,7 @@ int ProbeChild() {
   Heartbeat(root/L"scratch"/L"parent-heartbeat.txt"); return 0;
 }
 void RunRole(const fs::path& root,const std::wstring& role,SOCKET listener) {
-  const auto generation=L"g"+std::to_wstring(GetTickCount64());Profile profile(L"pi-kanban-A-"+role+L"-"+generation);
+  const auto generation=L"g"+std::to_wstring(GetTickCount64());Profile profile(AppContainerProfileName(L"A",role,generation));
   // Test root has no broad AppContainer grants; explicitly grant this identity only required resources.
   Acl(root,profile.sid,FILE_TRAVERSE|FILE_READ_ATTRIBUTES);
   for(const auto& folder:{root/L"bin",root/L"own",root/L"scratch"})fs::create_directories(folder);
@@ -163,6 +163,7 @@ int wmain(int argc,wchar_t** argv) {
   try{
     if(argc==3&&std::wstring(argv[1])==L"--descendant"){Heartbeat(argv[2]);return 0;}
     if(argc==4&&std::wstring(argv[2])==L"--controlled-run")return ProbeChild();
+    Require(AppContainerProfileName(L"A",L"implementation",L"generation-1")==L"pi-kanban-a898bef33cf31470bdfb100d74db470c2cbf93aea19effb2","Host/native profile-name binding must match");
     const auto root=fs::temp_directory_path()/(L"pi-kanban-native-smoke-"+std::to_wstring(GetCurrentProcessId())+L"-"+std::to_wstring(GetTickCount64()));
     fs::create_directories(root);Acl(root,nullptr,0);fs::create_directories(root/L"other");fs::create_directories(root/L"shared-git");
     Write(root/L"other"/L"private.txt","SYNTHETIC-OTHER-DEMAND");Write(root/L"shared-git"/L"object","SYNTHETIC-PRIVATE-OBJECT");Write(root/L"host.sqlite","SYNTHETIC-HOST-CONTROL");

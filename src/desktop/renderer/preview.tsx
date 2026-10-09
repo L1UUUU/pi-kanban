@@ -80,6 +80,21 @@ if (params.has('decisions')) {
   else if (params.get('decisions') === 'method') state.configuration = syntheticConfiguration();
   target.blockers = [...target.workflowBlockers];
 }
+if (params.has('knowledge')) {
+  const target = state.demands[0]!;
+  target.knowledgeLifecycle = {
+    candidates: [{ revisionId: 'synthetic-knowledge-revision', resultId: 'synthetic-result-r1', artifactId: 'synthetic-note-n1', title: '合成：时间范围经验', sourceKind: 'implementation', statementKind: 'fact', status: 'candidate', body: '合成精确正文：UTC 边界行为需要独立核对。', roles: ['planner'], modulePaths: ['src/synthetic.ts'] }],
+    resultMaterials: [{ resultId: 'synthetic-result-r1', artifactId: 'synthetic-note-n1', title: '合成：时间范围经验', accepted: true }],
+    checks: [{ id: 'synthetic-native-check', resultId: 'synthetic-result-r1', name: '合成原生检查展示', environment: 'synthetic-environment', usable: params.get('knowledge') !== 'blocked' }],
+    remote: { owner: 'synthetic-owner', repository: 'synthetic-repo', pullRequest: 42, projectId: target.projectId, demandId: target.id, target: 'main' },
+    observations: [{ observationId: 'synthetic-merge-observation', projectId: target.projectId, demandId: target.id, observedAt: '2026-10-08T00:00:00Z', provenance: params.get('knowledge') === 'blocked' ? 'controlled-response' : 'github-live', owner: 'synthetic-owner', repository: 'synthetic-repo', pullRequest: 42, target: 'main', state: 'merged', formalCommit: 'a'.repeat(40), targetCommit: 'a'.repeat(40), submittedCommit: 'b'.repeat(40), url: 'https://github.com/synthetic-owner/synthetic-repo/pull/42' }],
+    baseline: { initial: 'a'.repeat(40), current: 'a'.repeat(40), head: 'b'.repeat(40), formalTarget: 'main' },
+    proposals: [{ proposalId: 'synthetic-baseline-proposal', demandId: target.id, formalTarget: 'main', sourceCommit: 'c'.repeat(40), expectedHead: 'b'.repeat(40), expectedBaseline: 'a'.repeat(40), createdAt: '2026-10-08T00:00:00Z' }], blockers: [],
+  };
+  if (params.get('knowledge') === 'unbound') { target.knowledgeLifecycle.remote = undefined; target.knowledgeLifecycle.observations = []; }
+  if (params.get('knowledge') === 'baseline' || params.get('knowledge') === 'integrated') { target.result = undefined; target.phase = 'blocked'; target.runState = 'stopped'; }
+  if (params.get('knowledge') === 'integrated') target.knowledgeLifecycle.proposals[0]!.result = { operationId: 'synthetic-baseline-proposal', sourceCommit: 'c'.repeat(40), head: 'd'.repeat(40), state: 'integrated-awaiting-verification', conflicts: [], capabilityVerified: false };
+}
 const latency = Math.min(1000, Math.max(0, Number(params.get('latency')) || 0));
 const waitForSyntheticResponse = () => new Promise<void>(resolve => setTimeout(resolve, latency));
 const listeners = new Set<(next: ViewState) => void>();
@@ -103,6 +118,7 @@ const previewBridge: WorkbenchBridge = {
     return publish();
   },
   authorizeModel: async input => { window.dispatchEvent(new CustomEvent('pi-kanban:synthetic-command', { detail: { kind: 'authorize-model', ...structuredClone(input) } })); await waitForSyntheticResponse(); throw new Error('合成配置仅用于审阅 UI，不会创建真实模型授权、发送资料或产生费用。'); },
+  knowledgeAction: async input => { window.dispatchEvent(new CustomEvent('pi-kanban:synthetic-command', { detail: { kind: 'knowledge-action', ...structuredClone(input) } })); await waitForSyntheticResponse(); throw new Error('合成知识预览不会改变真实复用资格、访问远端或整合基线。'); },
   createProject: async () => { throw new Error('合成预览不能选择真实项目。请从桌面应用接入本地目录。'); },
   createDemand: async input => { await waitForSyntheticResponse(); state.demands.push({ ...input, id: `synthetic-${crypto.randomUUID()}`, version: 1, phase: 'idea', control: 'active', runState: 'idle', blockers: [], activities: [], messages: [] }); return publish(); },
   command: async input => { window.dispatchEvent(new CustomEvent('pi-kanban:synthetic-command', { detail: structuredClone(input) })); await waitForSyntheticResponse(); throw new Error('合成 UI 预览不执行授权、验收或运行控制。请在真实桌面 Host 中操作。'); },

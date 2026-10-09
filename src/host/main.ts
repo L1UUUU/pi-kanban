@@ -21,7 +21,7 @@ process.on('message', async (raw: unknown) => {
   let requestId: string | null = null;
   try {
     const request = parseRequest(raw); requestId = request.id;
-    const result = request.method === 'shutdown' ? await application.requestShutdown() : request.method === 'inspectProject' ? application.inspectProject(request.params) : application.handle(request.method, request.params);
+    const result = request.method === 'shutdown' ? await application.requestShutdown() : request.method === 'knowledgeAction' ? await application.knowledgeAction(request.params) : request.method === 'inspectProject' ? application.inspectProject(request.params) : application.handle(request.method, request.params);
     process.send?.({ id: request.id, ok: true, result });
     if (request.method !== 'snapshot') void application.tick().catch(() => { /* Durable unknown states remain visible. */ });
   } catch (error) {

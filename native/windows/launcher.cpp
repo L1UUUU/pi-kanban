@@ -94,10 +94,22 @@ std::wstring Quote(const std::wstring& input) {
   output.append(slashes * 2, L'\\'); output.push_back(L'"'); return output;
 }
 }  // namespace
+std::wstring AppContainerProfileName(const std::wstring& demand,const std::wstring& role,const std::wstring& generation) {
+  if(!Identifier(demand)||!Identifier(role)||!Identifier(generation))return {};
+  const std::wstring identity=demand+L"|"+role+L"|"+generation;
+  std::vector<unsigned char> bytes;for(wchar_t c:identity)bytes.push_back(static_cast<unsigned char>(c));
+  BCRYPT_ALG_HANDLE algorithm=nullptr;BCRYPT_HASH_HANDLE hash=nullptr;
+  NTSTATUS status=BCryptOpenAlgorithmProvider(&algorithm,BCRYPT_SHA256_ALGORITHM,nullptr,0);if(status<0)return {};
+  status=BCryptCreateHash(algorithm,&hash,nullptr,0,nullptr,0,0);
+  if(status>=0)status=BCryptHashData(hash,bytes.data(),static_cast<ULONG>(bytes.size()),0);
+  std::array<unsigned char,32> digest{};if(status>=0)status=BCryptFinishHash(hash,digest.data(),static_cast<ULONG>(digest.size()),0);
+  if(hash)BCryptDestroyHash(hash);BCryptCloseAlgorithmProvider(algorithm,0);if(status<0)return {};
+  const wchar_t hex[]=L"0123456789abcdef";std::wstring name=L"pi-kanban-";for(size_t i=0;i<24;i++){name+=hex[digest[i]>>4];name+=hex[digest[i]&15];}return name;
+}
 DWORD ValidateDescriptor(const LaunchDescriptor& d) {
   if (d.version != 1 || !Identifier(d.demand) || !Identifier(d.generation)) return ERROR_INVALID_PARAMETER;
   if (d.role != L"planning" && d.role != L"implementation" && d.role != L"review" && d.role != L"boundary-review" && d.role != L"check") return ERROR_INVALID_PARAMETER;
-  if (d.profile_name != L"pi-kanban-" + d.demand + L"-" + d.role + L"-" + d.generation) return ERROR_INVALID_PARAMETER;
+  if (d.profile_name.empty() || d.profile_name.size()>64 || d.profile_name != AppContainerProfileName(d.demand,d.role,d.generation)) return ERROR_INVALID_PARAMETER;
   for (const auto* path : {&d.node_executable, &d.worker_entry, &d.workspace, &d.scratch}) if (!LocalAbsolute(*path)) return ERROR_BAD_PATHNAME;
   if (d.workspace == d.scratch || d.policy_evidence.empty() || d.acl_evidence.empty() || d.private_channel_evidence.empty()) return ERROR_ACCESS_DENIED;
   if (!d.timeout_ms || d.timeout_ms > 3600000 || !d.process_limit || d.process_limit > 64 || d.memory_limit_bytes < 64ull*1024*1024 || d.output_limit_bytes == 0) return ERROR_INVALID_PARAMETER;

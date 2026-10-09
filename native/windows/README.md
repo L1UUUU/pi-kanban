@@ -1,8 +1,8 @@
 # Windows AppContainer + Job candidate
 
-Status: substantive candidate source; **not compiled or executed in the Linux authoring
-container**. The production TypeScript driver remains disabled even if a JSON profile says
-`verified: true`. The general helper, bounded IPC/Host driver, scoped resource provisioning and independent
+Status: substantive native source; **not compiled or executed in the Linux authoring
+container**, with native compilation and CTest smoke subsequently passed in Windows CI. The production TypeScript driver remains disabled until exact signed runtime evidence and
+separately provisioned Host recorder trust pass; a JSON `verified: true` flag does nothing. The general helper, bounded IPC/Host driver, scoped resource provisioning and independent
 evidence verifier are now implemented; all units have now compiled in Windows CI; runtime validation remains incomplete.
 
 ## Native Windows 11 / Windows CI build
@@ -83,8 +83,9 @@ binary and requires independent profile evidence before exposing this transport.
 
 `provision.cpp` accepts only a bounded explicit resource-authorization reference and a new
 per-demand/role/generation profile. It rejects reparse trees, grants read/execute to exact
-readonly runtime roots, role-specific source rights and private scratch rights, and denies
-`.git`/`.local`. Runtime roots cannot enclose source or scratch. Ancestors receive traverse
+readonly runtime files, role-specific source rights and private scratch rights, and denies
+`.git`/`.local`. Only the exact Node executable and bundled Worker file are accepted; directory-wide
+runtime grants and overlaps with source or scratch are rejected. Ancestors receive traverse
 only. It appends/removes only the generated SID, preserving unrelated principals. Verified
 stop includes explicit revocation status; unexpected reparse changes retain a cleanup
 blocker rather than following links or deleting user files. Crashes still require cleanup
@@ -97,3 +98,57 @@ run; raw failure is retained by the parent CI evidence. The next Windows CI comp
 read/write and cross-demand/Git/Host/environment/network denial probes. Legal descendant creation
 failed, so the smoke still failed and no G1 release is claimed. Additional immediate Win32 error
 telemetry preserves that unresolved behavior for diagnosis.
+
+## Real Node 24 / bundled Pi private-channel probe
+
+The native CTest smoke has passed on the Windows CI baseline. The broader recorder below
+must be run separately; a C++ fixture passing is not Node/Pi compatibility evidence.
+
+```powershell
+npm ci --ignore-scripts
+npm run build
+node native/windows/probe-worker.mjs --helper build/native/Release/pi_kanban_native_helper.exe --worker dist/worker/main.mjs --output artifacts/windows-worker
+```
+
+`probe-worker.mjs` runs as the independent trusted Host, not in the sandbox. It copies the
+exact Node and bundled Worker files into disposable fixtures, then executes the production
+helper. Actual Pi SDK turns use a deterministic in-memory model responder over the inherited
+private channel. It exercises real controlled-tool dispatch, native-mediated Node commands,
+separate native receipts, role-specific source access, cross-demand/Host/Git denial, adjacent
+runtime-file denial, and a live loopback listener. No real provider or credential is used.
+Only the exact pinned executable and bundled Worker file receive read/execute grants;
+parent runtime directories and their siblings do not. The legacy `readonlyRuntimeRoots`
+field name now contains those two exact files, never directory trees.
+
+Additional probes create a real same-Job Node heartbeat and verify zero-process stop plus
+quiescent writes, reject a real junction before launch, and close the Host control pipe to
+exercise authenticated cleanup across a reconstructed Host. Reports and raw framed
+transcripts are retained, including bounded Worker diagnostics. Fixtures contain only
+synthetic data and remain available for ACL inspection. A nonzero process status, timeout,
+missing observation, failed revoke or access-policy failure fails the probe.
+
+The recorder explicitly emits `releaseAuthorized: false`: it is partial real-runtime
+validation, not a full release attestation. In particular it does not prove all reparse
+races, arbitrary network/service escape routes, catastrophic helper-crash cleanup, or full
+role-transition attack coverage. It cannot be used as a signed all-pass profile.
+
+## Authenticated recovery after Host loss
+
+The production Host stores a unique per-run recovery secret and exact generation/artifact/
+policy/workspace binding in its private state before launch. The helper receives that data
+only over the trusted control pipe. It never forwards the secret or receipt path to the
+Worker. After explicit stop, natural completion or Host stdin EOF, the helper must observe
+an actual zero Job census and successfully revoke its generated identity's ACLs before
+atomically writing an HMAC-SHA256 receipt. Process birth identity is included.
+
+A restarted Host authenticates that receipt before releasing a lease, including the narrow
+crash window before PID registration. Generic drivers have no such recovery authority;
+missing PIDs, unsigned files and absent connections remain unknown. If the helper itself
+is killed before it can complete cleanup and write the receipt, the Job still has
+kill-on-close, but missing independent cleanup proof remains an explicit recovery blocker.
+The application never kills an arbitrary reused PID to work around that blocker.
+
+AppContainer profile names use a 192-bit SHA-256 prefix binding the complete demand, role
+and generation. They are always 58 ASCII characters, within the Win32 64-character limit.
+The native launcher recomputes the name; a truncated or caller-chosen name is rejected.
+The native smoke and TypeScript test share an exact digest vector and cover long IDs.

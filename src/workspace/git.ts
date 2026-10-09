@@ -182,6 +182,15 @@ export class ControlledGit {
   readFile(cwd: string, commit: string, path: string): Buffer {
     this.validateOid(commit); sourcePath(path); return this.run(cwd,['show',`${commit}:${path}`]);
   }
+  /** Exact committed paths only; never enumerate a different worktree or follow links. */
+  filesAt(cwd: string, commit: string): { path: string; mode: string; object: string }[] {
+    this.validateOid(commit); this.verifyTree(cwd,commit);
+    return this.run(cwd,['ls-tree','-r','-z',commit]).toString().split('\0').filter(Boolean).map(record=>{
+      const split=record.indexOf('\t'), [mode,kind,object]=record.slice(0,split).split(' '), path=record.slice(split+1);
+      sourcePath(path);insist(kind==='blob' && ['100644','100755'].includes(mode),'UNSUPPORTED_TREE','Only ordinary committed files support exact correspondence.');
+      return {path,mode,object};
+    });
+  }
   mergeState(cwd:string):{mergeHead:string|null;unmergedPaths:string[]} {
     const path=resolve(cwd,this.run(cwd,['rev-parse','--git-path','MERGE_HEAD']).toString().trim());
     const mergeHead=existsSync(path)?readRegular(path,1024).toString().trim():null;

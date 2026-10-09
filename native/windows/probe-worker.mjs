@@ -11,6 +11,7 @@ import { tmpdir, release } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { PrivateFrameDecoder, encodePrivateFrame } from '../../src/runtime/pipe-frames.ts';
+import { appContainerProfileName } from '../../src/runtime/appcontainer-name.ts';
 import { NativeRecoveryStore } from '../../src/runtime/native-recovery.ts';
 
 if (process.platform !== 'win32' || process.arch !== 'x64' || !/^v24\./.test(process.version)) throw new Error('The native Worker probe requires actual Windows x64 with Node 24; no platform fallback.');
@@ -46,7 +47,7 @@ function launch(role, suffix, workspaceOverride, enableRecovery = false) {
   const generation = `probe-${randomUUID()}`, workspace = workspaceOverride ?? join(root, `source-${suffix}`), scratch = join(root, `scratch-${suffix}`);
   if (!workspaceOverride) { mkdirSync(workspace); mkdirSync(join(workspace, '.git')); writeFileSync(join(workspace, 'source.txt'), 'original'); writeFileSync(join(workspace, '.git', 'object'), 'PRIVATE-GIT'); }
   mkdirSync(scratch); const sessionDir = join(scratch, 'sessions'); mkdirSync(sessionDir);
-  const descriptor = { type: 'launch', version: 1, demand: 'probe', role, generation, profileName: `pi-kanban-probe-${role}-${generation}`, nodeExecutable: nodePath, workerEntry: bundledWorker, workspace, scratch,
+  const descriptor = { type: 'launch', version: 1, demand: 'probe', role, generation, profileName: appContainerProfileName('probe', role, generation), nodeExecutable: nodePath, workerEntry: bundledWorker, workspace, scratch,
     nodeSha256: evidence.bindings.nodeSha256, workerSha256: evidence.bindings.workerSha256, policyEvidence: 'actual-native-worker-probe-partial-not-release', aclEvidence: `fixture-${suffix}`, privateChannelEvidence: 'parent-owned-anonymous-pipes', timeoutMs: 45000, processLimit: 8, memoryLimitBytes: 1024 * 1024 * 1024, outputLimitBytes: 4 * 1024 * 1024,
     resourceAuthorizationId: 'disposable-synthetic-fixtures-only', readonlyRuntimeRoots: [nodePath, bundledWorker], recoveryReceiptPath: '', recoveryKey: '', recoveryContextSha256: '' };
   const recoveryStore = enableRecovery ? new NativeRecoveryStore(join(root, 'host', 'native-recovery')) : null;
@@ -58,7 +59,7 @@ function launch(role, suffix, workspaceOverride, enableRecovery = false) {
   const send = value => helper.stdin.write(encodePrivateFrame(Buffer.from(JSON.stringify(value))));
   for (const [stream, decoder, values, kind] of [[helper.stderr, nativeDecoder, native, 'native'], [helper.stdout, workerDecoder, worker, 'worker']]) stream.on('data', data => { try { for (const frame of decoder.push(data)) { const value = JSON.parse(Buffer.from(frame).toString('utf8')); values.push(value); record(kind, { suffix, ...value }); } } catch (error) { failure = error; } });
   helper.on('error', error => { failure = error; }); helper.stdin.on('error', error => { if (!exited) failure = error; }); helper.on('close', (code, signal) => { exited = true; liveHelpers.delete(helper); record('helper-exit', { suffix, code, signal }); });
-  const wait = async (test, label, milliseconds = 15000) => { const until = Date.now() + milliseconds; while (!test()) { if (failure) throw failure; if (Date.now() >= until) throw new Error(`${label}: timed out; native=${JSON.stringify(native.slice(-3))}`); if (exited) throw new Error(`${label}: helper exited before required observation`); await delay(10); } return test(); };
+  const wait = async (test, label, milliseconds = 15000) => { const until = Date.now() + milliseconds; while (!test()) { if (failure) throw failure; if (Date.now() >= until) throw new Error(`${label}: timed out; native=${JSON.stringify(native.slice(-3))}`); if (exited) throw new Error(`${label}: helper exited before required observation; native=${JSON.stringify(native.slice(-10))}`); await delay(10); } return test(); };
   const event = (type, predicate = () => true) => native.find(value => value.type === type && predicate(value));
   send(descriptor);
   const stop = async () => { send({ type: 'stop' }); await wait(() => event('native.observation', value => value.status === 0 && value.activePids.length === 0), 'actual zero-process Job observation'); assert.ok(event('native.resources', value => value.phase === 'revoke' && value.status === 0), 'Actual ACL revocation required'); await wait(() => exited, 'helper exit after stop'); };
@@ -71,8 +72,8 @@ function accessProgram(run, role) {
   return `const fs=require('node:fs'),net=require('node:net');const p=${JSON.stringify({ source: join(run.workspace, 'source.txt'), other: join(root, 'other', 'private.txt'), host: join(root, 'host', 'control.txt'), git: join(run.workspace, '.git', 'object'), nodeSibling: join(nodeRoot, 'private-sibling.txt'), workerSibling: join(workerRoot, 'private-sibling.txt') })};const result={challenge:${JSON.stringify(challenge)},version:process.version,role:${JSON.stringify(role)},ownRead:fs.readFileSync(p.source,'utf8')==='original',ownWrite:false,denied:{},environmentClean:!process.env.FORBIDDEN_HOST_CREDENTIAL&&!process.env.NODE_OPTIONS&&!process.env.OPENAI_API_KEY};try{fs.writeFileSync(p.source,'changed');result.ownWrite=true}catch(e){result.writeError=e.code}for(const key of ['other','host','git','nodeSibling','workerSibling']){try{fs.readFileSync(p[key]);result.denied[key]=false}catch(e){result.denied[key]=['EACCES','EPERM'].includes(e.code)}}const socket=net.connect({host:'127.0.0.1',port:${port}});let finished=false;const done=(denied,code)=>{if(finished)return;finished=true;socket.destroy();result.networkDenied=denied;result.networkError=code;process.stdout.write(JSON.stringify(result));process.exit(result.ownRead&&result.ownWrite===${role === 'implementation'}&&Object.values(result.denied).every(Boolean)&&result.environmentClean&&denied?0:1)};socket.once('connect',()=>done(false,'connected'));socket.once('error',e=>done(['EACCES','EPERM'].includes(e.code),e.code));setTimeout(()=>done(false,'inconclusive-timeout'),3000);`;
 }
 
-async function runPiRole(role) {
-  const run = launch(role, role); await run.wait(() => run.event('native.started'), 'native Node Worker launch');
+async function runPiRole(role, workspaceOverride) {
+  const run = launch(role, role, workspaceOverride); await run.wait(() => run.event('native.started'), 'native Node Worker launch');
   assert.ok(run.event('native.resources', event => event.phase === 'provision' && event.status === 0));
   const capability = randomBytes(32).toString('hex'), sessionId = `session-${randomUUID()}`, runId = `runtime-${randomUUID()}`;
   const args = ['-e', accessProgram(run, role)];
@@ -119,7 +120,11 @@ async function runPiRole(role) {
 
 try {
   record('start', evidence);
-  await runPiRole('implementation'); await runPiRole('review');
+  const implemented = await runPiRole('implementation');
+  writeFileSync(join(implemented.workspace, 'source.txt'), 'original');
+  const reviewed = await runPiRole('review', implemented.workspace);
+  assert.notEqual(implemented.generation, reviewed.generation);
+  passed('role-transition-clean', 'Same source tree transitioned from implementation to independent review after observed zero Job census and successful old-SID ACL revoke; the new generation read it but could not modify it. This does not claim exhaustive role-transition attack coverage.');
   assert.equal(connected, 0, 'Trusted listener must observe zero sandbox connections');
   for (const id of ['cross-demand-denied', 'shared-git-denied', 'host-control-denied', 'private-model-channel', 'node-pi-compatibility']) passed(id, 'Both real role runs passed exact Host-selected native command, private broker tool loop and native process receipt assertions.');
   passed('network-denied', 'Both role checks returned actual EACCES/EPERM against a live trusted loopback listener; Host observed zero connections. This does not claim every network/service escape is tested.');

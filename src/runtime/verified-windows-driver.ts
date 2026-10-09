@@ -8,15 +8,18 @@ import { RuntimeError } from './types.ts';
 import type { LaunchRequest,RunRecord,RuntimeDriver,ProcessIdentity,Observation } from './types.ts';
 import { VerifiedRuntimeProfile,assertVerifiedProfile } from './profile.ts';
 import { PrivateFrameDecoder,encodePrivateFrame } from './pipe-frames.ts';
+import { appContainerProfileName } from './appcontainer-name.ts';
 import { NativeRecoveryStore } from './native-recovery.ts';
+import { validateNativeCheckReceipt } from './native-check.ts';
+import type { NativeCheckResult } from './native-check.ts';
+export type { NativeCheckResult } from './native-check.ts';
 
 export interface WindowsRunBootstrap {
   profileName:string;scratch:string;aclEvidence:string;privateChannelEvidence:string;
   processLimit:number;memoryLimitBytes:number;workerInit:Record<string,unknown>;
   resourceAuthorizationId:string;readonlyRuntimeRoots:string[];
 }
-export interface NativeCheckResult {requestId:string;exitCode:number|null;output:string;reason:'exited'|'timeout'|'output-limit'|'descendants-survived'|'launch-failed';nativeEvidence:Record<string,unknown>}
-type PendingCheck={id:string;args:string[];resolve:(value:NativeCheckResult)=>void;reject:(error:Error)=>void;timer:ReturnType<typeof setTimeout>};
+type PendingCheck={id:string;args:string[];maxOutputBytes:number;resolve:(value:NativeCheckResult)=>void;reject:(error:Error)=>void;timer:ReturnType<typeof setTimeout>};
 type Control={helper:ChildProcessWithoutNullStreams;run:RunRecord;identity:ProcessIdentity|null;observation:Observation|null;exit:boolean;native:PrivateFrameDecoder;worker:PrivateFrameDecoder;waiters:Set<()=>void>;resources:{provisioned:boolean;revoked:boolean;status:number|null};check:PendingCheck|null;stopping:boolean};
 /** Native production path. Construction requires independently verified exact Windows artifacts.
  * createBootstrap must supply per-run pre-provisioned ACLs and an approved model/data context.
@@ -49,7 +52,7 @@ export class VerifiedWindowsDriver implements RuntimeDriver {
   private async wait(control:Control,predicate:()=>boolean,timeout:number){
     const deadline=Date.now()+timeout;while(!predicate()&&!control.exit&&Date.now()<deadline){await new Promise<void>(resolve=>{const timer=setTimeout(()=>{control.waiters.delete(wake);resolve();},Math.min(100,deadline-Date.now()));const wake=()=>{clearTimeout(timer);resolve();};control.waiters.add(wake);});}
   }
-  getResourceEvidence(runId:string){const control=this.controls.get(runId);return control?{...control.resources}:this.recovered.has(runId)?{provisioned:true,revoked:true,status:0}:null;}
+  getResourceEvidence(runId:string){const control=this.controls.get(runId);return this.recovered.has(runId)?{provisioned:true,revoked:true,status:0}:control?{...control.resources}:null;}
   private nativeEvent(control:Control,frame:Uint8Array){
     const event=JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(frame)) as Record<string,unknown>;
     if(event.type==='native.started'){
@@ -62,12 +65,10 @@ export class VerifiedWindowsDriver implements RuntimeDriver {
       control.observation={state:event.activePids.length?'alive':'stopped',generation:control.run.generation,activePids:event.activePids as number[],proof:JSON.stringify({nativeJobCensus:event,evidence:this.profile.evidenceDigests})};
     }else if(event.type==='native.check-result'){
       const check=control.check;
-      if(!check||event.requestId!==check.id||event.generation!==control.run.generation||JSON.stringify(event.arguments)!==JSON.stringify(check.args)||
-        !['exited','timeout','output-limit','descendants-survived','launch-failed'].includes(String(event.reason))||typeof event.outputBase64!=='string'||event.outputBase64.length>750000||
-        (event.exitCode!==null&&(!Number.isSafeInteger(event.exitCode)||Number(event.exitCode)<0)))throw new RuntimeError('NATIVE_CHECK_INVALID','Mismatched or invalid native command receipt');
+      if(!check)throw new RuntimeError('NATIVE_CHECK_INVALID','No pending native check matches this receipt');
+      const receipt=validateNativeCheckReceipt(event,{requestId:check.id,generation:control.run.generation,args:check.args,maxOutputBytes:check.maxOutputBytes});
       clearTimeout(check.timer);control.check=null;
-      const output=Buffer.from(event.outputBase64,'base64');if(output.byteLength>524288)throw new RuntimeError('NATIVE_CHECK_INVALID','Command output exceeded native receipt bound');
-      check.resolve({requestId:check.id,exitCode:event.exitCode as number|null,output:output.toString('utf8'),reason:event.reason as NativeCheckResult['reason'],nativeEvidence:{...event,nodeSha256:this.profile.config.node.sha256,helperSha256:this.profile.config.helper.sha256,policySha256:this.profile.config.policySha256}});
+      check.resolve({...receipt,nativeEvidence:{...receipt.nativeEvidence,profileId:this.profile.config.profileId,osBuild:this.profile.config.osBuild,nodeSha256:this.profile.config.node.sha256,helperSha256:this.profile.config.helper.sha256,workerSha256:this.profile.config.worker.sha256,piSha256:this.profile.config.pi.sha256,policySha256:this.profile.config.policySha256}});
     }else if(event.type==='native.resources'){
       if(event.generation!==control.run.generation||!Number.isSafeInteger(event.status)||!['provision','revoke'].includes(String(event.phase)))throw new RuntimeError('NATIVE_RESOURCE_INVALID','Invalid scoped resource evidence');
       control.resources.status=Number(event.status);if(event.phase==='provision')control.resources.provisioned=event.status===0;else control.resources.revoked=event.status===0;
@@ -83,7 +84,7 @@ export class VerifiedWindowsDriver implements RuntimeDriver {
   }
   async launch(run:RunRecord):Promise<ProcessIdentity>{
     this.preflight(run);const config=this.profile.config,boot=this.bootstrap(run);
-    if(boot.profileName!==`pi-kanban-${run.demandId}-${run.role}-${run.generation}`||!boot.aclEvidence||!boot.privateChannelEvidence||!boot.resourceAuthorizationId||!boot.readonlyRuntimeRoots?.length)throw new RuntimeError('RUN_ACL_UNVERIFIED','Per-generation identity and actual ACL/channel evidence required');
+    if(boot.profileName!==appContainerProfileName(run.demandId,run.role,run.generation)||!boot.aclEvidence||!boot.privateChannelEvidence||!boot.resourceAuthorizationId||!boot.readonlyRuntimeRoots?.length)throw new RuntimeError('RUN_ACL_UNVERIFIED','Per-generation identity and actual ACL/channel evidence required');
     const recovery=this.recovery?.prepare(run,config)??{recoveryReceiptPath:'',recoveryKey:'',recoveryContextSha256:''};
     const helper=spawn(config.helper.path,[],{windowsHide:true,stdio:['pipe','pipe','pipe'],env:{SystemRoot:process.env.SystemRoot??'C:\\Windows',SystemDrive:process.env.SystemDrive,USERPROFILE:process.env.USERPROFILE,LOCALAPPDATA:process.env.LOCALAPPDATA,APPDATA:process.env.APPDATA}});
     const control:Control={helper,run,identity:null,observation:null,exit:false,native:new PrivateFrameDecoder(),worker:new PrivateFrameDecoder(),waiters:new Set(),resources:{provisioned:false,revoked:false,status:null},check:null,stopping:false};this.controls.set(run.runId,control);
@@ -111,10 +112,14 @@ export class VerifiedWindowsDriver implements RuntimeDriver {
     const maxOutputBytes=Math.min(limits.maxOutputBytes,524288); // Base64 plus metadata must fit the 1 MiB proof frame.
     return new Promise((resolve,reject)=>{
       const timer=setTimeout(()=>{control.check=null;void this.stopHandler?.(runId,'native-check-receipt-timeout').catch(()=>{});reject(new RuntimeError('NATIVE_CHECK_UNKNOWN','No native exit receipt before deadline'));},limits.timeoutMs+15000);timer.unref();
-      control.check={id:requestId,args:[...args],resolve,reject,timer};
+      control.check={id:requestId,args:[...args],maxOutputBytes,resolve,reject,timer};
       try{this.command(control,{type:'run-node',requestId,args,timeoutMs:limits.timeoutMs,maxOutputBytes});}
       catch(error){clearTimeout(timer);control.check=null;reject(error);}
     });
+  }
+  async recoverUnregistered(run:RunRecord):Promise<Observation>{
+    try{const receipt=this.recovery?.observe(run,this.profile.config);if(receipt){this.recovered.add(run.runId);return receipt;}}catch(error){return {state:'unknown',generation:run.generation,activePids:[],proof:`Unregistered native recovery remains unverified: ${String(error)}`};}
+    return {state:'unknown',generation:run.generation,activePids:[],proof:'No authenticated native stop/revocation receipt for unregistered generation'};
   }
   async observe(run:RunRecord):Promise<Observation>{
     const control=this.controls.get(run.runId);const unknown={state:'unknown' as const,generation:run.generation,activePids:[],proof:'No matching live native control; PID absence cannot prove Job termination'};

@@ -14,7 +14,7 @@ export interface ProjectBinding { projectId:string; anchorPath:string; formalTar
 export interface WorkspaceBinding { projectId:string; demandId:string; worktreePath:string; branch:string; initialBaseline:string|null; currentBaseline:string|null; head:string|null; preparationOperation:string }
 export interface PrepareRequest { operationId:string; projectId:string; demandId:string; worktreePath:string; branch:string; baseline:string|null; prepareAuthorized:boolean }
 export interface CommitRequest { operationId:string; demandId:string; expectedHead:string|null; paths:string[]; expectedFiles:Record<string,string|null>; message:string; author:{name:string;email:string}; commitAuthorized:boolean; writerStopped:boolean }
-export interface BaselineUpdateRequest { operationId:string; demandId:string; sourceCommit:string; formalTarget:string; updateAuthorized:boolean; writerStopped:boolean; controlState:'active'|'paused'|'cancelled'|'awaiting-acceptance'; author:{name:string;email:string} }
+export interface BaselineUpdateRequest { operationId:string; demandId:string; sourceCommit:string; formalTarget:string; expectedHead?:string; expectedBaseline?:string|null; updateAuthorized:boolean; writerStopped:boolean; controlState:'active'|'paused'|'cancelled'|'awaiting-acceptance'; author:{name:string;email:string} }
 export interface BaselineUpdateResult { operationId:string; sourceCommit:string; head:string|null; state:'conflict'|'integrated-awaiting-verification'|'verified'; conflicts:string[]; capabilityVerified:boolean }
 interface Intent { kind:string; status:string; data:any }
 export interface WorkspaceOptions extends GitOptions { db:DatabaseSync; fault?:(point:string)=>void }
@@ -198,6 +198,8 @@ export class WorkspaceService {
     this.git.verifyTree(p.anchorPath,input.sourceCommit);this.git.guardPrivate(binding.worktreePath);
     insist(this.git.status(binding.worktreePath).length===0 && !this.git.mergeState(binding.worktreePath).mergeHead,'USER_DIRTY','Preserve existing work and resolve staging or merge state before integration.');
     const previousHead=this.git.head(binding.worktreePath);insist(previousHead,'EMPTY_UPDATE','Unborn branch integration requires an explicit initial-delivery workflow.');
+    if(input.expectedHead!==undefined)insist(previousHead===input.expectedHead,'STALE_BASELINE','The approved demand HEAD changed before integration.');
+    if(input.expectedBaseline!==undefined)insist(binding.currentBaseline===input.expectedBaseline,'STALE_BASELINE','The approved baseline changed before integration.');
     const data={request:input,requestHash,previousHead,timestamp:new Date().toISOString(),message:`Integrate verified formal source (${input.operationId})`,result:null};
     this.saveIntent(input.operationId,'baseline',input.demandId,data);this.fault('baseline.intent');return this.reconcileBaseline(input.operationId,this.intent(input.operationId)!);
   }

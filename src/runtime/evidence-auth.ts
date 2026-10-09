@@ -77,8 +77,7 @@ function text(value: unknown, max = 1024): value is string {
 }
 function signingBytes(payload: string): Buffer { return Buffer.concat([signatureDomain, Buffer.from(payload, 'utf8')]); }
 
-/** Pure authentication/content checks. This alone does not create an executable profile. */
-export function verifyWindowsEvidence(bytes: Uint8Array, expected: ExpectedWindowsEvidence, trust?: WindowsEvidenceTrustAnchor): WindowsEvidenceReport {
+function validatedTrust(trust?: WindowsEvidenceTrustAnchor) {
   // Trust comes from the caller, never from an adjacent key, payload, profile or envelope.
   const anchor = record(trust, 'EVIDENCE_TRUST_REQUIRED');
   if (typeof anchor.keyId !== 'string' || !keyIdPattern.test(anchor.keyId) || typeof anchor.publicKeyPem !== 'string' ||
@@ -88,12 +87,28 @@ export function verifyWindowsEvidence(bytes: Uint8Array, expected: ExpectedWindo
   let key;
   try { key = createPublicKey(anchor.publicKeyPem); } catch { throw new RuntimeError('EVIDENCE_TRUST_REQUIRED', 'Invalid Host recorder public key'); }
   if (key.asymmetricKeyType !== 'ed25519') throw new RuntimeError('EVIDENCE_TRUST_REQUIRED', 'Host recorder trust requires an Ed25519 public key');
+  if (anchor.publicKeyPem.replace(/\r\n/g, '\n').trim() !== key.export({ format: 'pem', type: 'spki' }).toString().trim())
+    throw new RuntimeError('EVIDENCE_TRUST_REQUIRED', 'Trust must contain one canonical public key without appended material');
+  return { anchor, key };
+}
+
+/** Validate provisioned public material without loading or generating any signing key. */
+export function validateWindowsEvidenceTrustAnchor(trust: WindowsEvidenceTrustAnchor): Readonly<WindowsEvidenceTrustAnchor> {
+  const { anchor } = validatedTrust(trust);
+  return Object.freeze({ keyId: anchor.keyId as string, publicKeyPem: anchor.publicKeyPem as string, recorderSha256: anchor.recorderSha256 as string });
+}
+
+/** Pure authentication/content checks. This alone does not create an executable profile. */
+export function verifyWindowsEvidence(bytes: Uint8Array, expected: ExpectedWindowsEvidence, trust?: WindowsEvidenceTrustAnchor): WindowsEvidenceReport {
+  const { anchor, key } = validatedTrust(trust);
   if (bytes.byteLength > MAX_WINDOWS_EVIDENCE_BYTES) throw new RuntimeError('EVIDENCE_TOO_LARGE', 'Bounded evidence required');
   const envelope = record(parse(Buffer.from(bytes).toString('utf8')));
   const keys = Object.keys(envelope).sort().join(',');
   if (keys !== 'algorithm,keyId,payload,schemaVersion,signature' || envelope.schemaVersion !== 1 || envelope.algorithm !== 'Ed25519' ||
       envelope.keyId !== anchor.keyId || typeof envelope.payload !== 'string' || typeof envelope.signature !== 'string')
     throw new RuntimeError('EVIDENCE_AUTHENTICATION_FAILED', 'A signed envelope from the pinned Host recorder is required');
+  if (Buffer.from(envelope.payload, 'utf8').toString('utf8') !== envelope.payload)
+    throw new RuntimeError('EVIDENCE_AUTHENTICATION_FAILED', 'Evidence payload must be lossless UTF-8');
   const signature = Buffer.from(envelope.signature, 'base64');
   if (signature.length !== 64 || signature.toString('base64') !== envelope.signature || !verify(null, signingBytes(envelope.payload), key, signature))
     throw new RuntimeError('EVIDENCE_AUTHENTICATION_FAILED', 'Host recorder evidence signature is invalid');
@@ -127,4 +142,10 @@ export function verifyWindowsEvidence(bytes: Uint8Array, expected: ExpectedWindo
     seen.add(probe.id);
   }
   return report as unknown as WindowsEvidenceReport;
+}
+
+/** Run after authenticating every report. Partial reports cannot remove any mandatory probe. */
+export function requireWindowsProbeCoverage(probeIds: Iterable<string>): void {
+  const covered = new Set(probeIds), missing = REQUIRED_WINDOWS_PROBES.filter(id => !covered.has(id));
+  if (missing.length) throw new RuntimeError('EVIDENCE_INCOMPLETE', `Unverified probes: ${missing.join(', ')}`);
 }

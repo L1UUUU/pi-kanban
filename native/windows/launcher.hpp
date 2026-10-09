@@ -1,6 +1,6 @@
 #pragma once
-// Windows 11 x64 candidate. Not a security certification, and not wired to the Host.
-// All paths and pre-provisioned ACLs come from a trusted Host descriptor verifier.
+// Windows x64 native containment candidate, wired through the gated Host driver.
+// Not a security certification. Only trusted helper descriptors and scoped ACLs enter here.
 #ifdef _WIN32
 #include <windows.h>
 #include <array>
@@ -58,6 +58,7 @@ class ControlledJob {
   std::mutex spawn_stop_mutex_;
   bool stopping_ = false;
 };
+std::wstring AppContainerProfileName(const std::wstring& demand,const std::wstring& role,const std::wstring& generation);
 DWORD ValidateDescriptor(const LaunchDescriptor&);
 }  // namespace pi_kanban
 #endif

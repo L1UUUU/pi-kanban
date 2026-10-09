@@ -335,4 +335,232 @@ test.describe('Synthetic renderer interaction coverage (not backend acceptance)'
     await expect(page.getByRole('heading', { name: '待处理', exact: true })).toBeVisible();
     expect(await readSyntheticCommands(page)).toEqual([]);
   });
+  test('unresolved planner answers use explicit exact-plan revision, never resume or implicit authority', async ({ page }) => {
+    await openPreview(page, '?decisions=plan&latency=200'); await observeSyntheticCommands(page);
+    await page.getByRole('button', { name: '方案与决定', exact: true }).click();
+    await expect(page.getByRole('tabpanel')).toContainText('合成问题：日期边界使用哪个时区？');
+    await page.getByRole('button', { name: '修订当前方案', exact: true }).click();
+    const dialog = page.getByRole('dialog');
+    await expect(dialog).toContainText('synthetic-unresolved-plan');
+    await expect(dialog).toContainText('撤销该方案的确认和实施授权');
+    await expect(dialog.getByRole('button', { name: '修订当前方案', exact: true })).toBeDisabled();
+    await dialog.getByLabel('问题答案与修订要求', { exact: true }).fill('合成答案：使用 UTC，重新规划。');
+    await dialog.locator('form').evaluate(form => { (form as HTMLFormElement).requestSubmit(); (form as HTMLFormElement).requestSubmit(); });
+    await expect(dialog.getByRole('alert')).toContainText('合成 UI 预览不执行');
+    const commands = await readSyntheticCommands(page); expect(commands).toHaveLength(1);
+    expect(commands[0]).toMatchObject({ kind: 'revise-plan', previousPlanId: 'synthetic-unresolved-plan', expectedVersion: 12, text: '合成答案：使用 UTC，重新规划。' });
+    expect(commands[0]).not.toHaveProperty('confirmDesign'); expect(commands[0]).not.toHaveProperty('localCommit');
+    await page.keyboard.press('Escape');
+    await page.getByRole('button', { name: '修订当前方案', exact: true }).click();
+    await expect(page.getByRole('dialog').getByLabel('问题答案与修订要求', { exact: true })).toHaveValue('');
+  });
+
+  test('decision finding action targets current immutable finding only and generic resolution cannot bypass it', async ({ page }, testInfo) => {
+    await openPreview(page, '?decisions=finding'); await observeSyntheticCommands(page);
+    await page.getByRole('tab', { name: '决定', exact: true }).click();
+    await expect(page.getByRole('button', { name: '记录此项决定', exact: true })).toHaveCount(1);
+    await expect(page.getByRole('region', { name: '发现 synthetic-blocking-f2', exact: true }).getByRole('button')).toHaveCount(0);
+    await expect(page.getByRole('region', { name: '发现 synthetic-historical-f3', exact: true })).toContainText('历史内容');
+    await expect(page.getByRole('button', { name: '核对并解除阻塞', exact: true })).toBeDisabled();
+    await page.screenshot({ path: testInfo.outputPath('synthetic-current-review-decisions.png'), fullPage: true });
+    await page.getByRole('button', { name: '记录此项决定', exact: true }).click();
+    const dialog = page.getByRole('dialog');
+    await expect(dialog).toContainText('synthetic-decision-f1'); await expect(dialog).toContainText('synthetic-current-content');
+    await dialog.getByLabel('决定与理由', { exact: true }).fill('合成决定：维持明确的 UTC 时间语义。');
+    await dialog.getByRole('button', { name: '记录此项决定', exact: true }).click();
+    await expect(dialog.getByRole('alert')).toContainText('合成 UI 预览不执行');
+    expect((await readSyntheticCommands(page))[0]).toMatchObject({ kind: 'decide-finding', findingId: 'synthetic-decision-f1', contentId: 'synthetic-current-content', expectedVersion: 12 });
+  });
+
+  test('blocker resolution requires evidence and a stale open form cannot target newer state', async ({ page }) => {
+    await openPreview(page, '?decisions=blocker'); await observeSyntheticCommands(page);
+    await page.getByRole('tab', { name: '决定', exact: true }).click();
+    await page.getByRole('button', { name: '核对并解除阻塞', exact: true }).click();
+    const dialog = page.getByRole('dialog');
+    await expect(dialog).toContainText('不会关闭 Review 发现');
+    await dialog.getByLabel('阻塞处理情况与证据', { exact: true }).fill('合成证据：环境现已可用。');
+    await page.evaluate(() => window.dispatchEvent(new Event('pi-kanban:synthetic-change-version')));
+    await expect(dialog.getByRole('alert')).toContainText('对象版本已变化');
+    await expect(dialog.getByRole('button', { name: '核对并解除阻塞', exact: true })).toBeDisabled();
+    expect(await readSyntheticCommands(page)).toEqual([]);
+    await page.keyboard.press('Escape');
+    await page.getByRole('button', { name: '核对并解除阻塞', exact: true }).click();
+    await expect(dialog.getByLabel('阻塞处理情况与证据', { exact: true })).toHaveValue('');
+    await dialog.getByLabel('阻塞处理情况与证据', { exact: true }).fill('已重新核对全部阻塞。');
+    await dialog.getByRole('button', { name: '核对并解除阻塞', exact: true }).click();
+    await expect(dialog.getByRole('alert')).toContainText('合成 UI 预览不执行');
+    expect((await readSyntheticCommands(page))[0]).toMatchObject({ kind: 'resolve-blocker', expectedVersion: 13, text: '已重新核对全部阻塞。' });
+  });
+
+  test('method switch requires exact source review and resets consent on stage change or dismiss', async ({ page }) => {
+    await openPreview(page, '?decisions=method'); await observeSyntheticCommands(page);
+    await page.getByRole('tab', { name: '决定', exact: true }).click();
+    await page.getByRole('button', { name: '切换冻结方法', exact: true }).click();
+    const dialog = page.getByRole('dialog');
+    await expect(dialog.getByRole('button', { name: '切换冻结方法', exact: true })).toBeDisabled();
+    await dialog.getByLabel('切换阶段', { exact: true }).selectOption('planning');
+    await expect(dialog).toContainText('synthetic-old-planning');
+    await expect(dialog).toContainText('a'.repeat(64));
+    await dialog.getByLabel('切换原因与影响', { exact: true }).fill('合成说明：使用已核验的规划方法。');
+    await dialog.getByRole('checkbox').check();
+    await dialog.getByLabel('切换阶段', { exact: true }).selectOption('review');
+    await expect(dialog.getByRole('checkbox')).not.toBeChecked();
+    await dialog.getByLabel('切换阶段', { exact: true }).selectOption('planning');
+    await dialog.getByRole('checkbox').check();
+    await dialog.getByRole('button', { name: '切换冻结方法', exact: true }).click();
+    await expect(dialog.getByRole('alert')).toContainText('合成 UI 预览不执行');
+    expect((await readSyntheticCommands(page))[0]).toMatchObject({ kind: 'switch-method', stage: 'planning', methodId: 'synthetic-planning', methodVersion: 'synthetic-v1', methodDigest: 'a'.repeat(64), configurationDigest: 'b'.repeat(64), impactReviewed: true, expectedVersion: 12 });
+    await page.keyboard.press('Escape');
+    await page.getByRole('button', { name: '切换冻结方法', exact: true }).click();
+    await expect(dialog.getByRole('checkbox')).not.toBeChecked();
+    await dialog.getByLabel('切换阶段', { exact: true }).selectOption('planning');
+    await dialog.getByLabel('切换原因与影响', { exact: true }).fill('再次核对');
+    await dialog.getByRole('checkbox').check();
+    await page.evaluate(() => window.dispatchEvent(new Event('pi-kanban:synthetic-change-configuration')));
+    await expect(dialog.getByRole('alert')).toContainText('配置版本已变化');
+    await expect(dialog.getByRole('button', { name: '切换冻结方法', exact: true })).toBeDisabled();
+    expect(await readSyntheticCommands(page)).toHaveLength(1);
+  });
+
+  test('late decision rejection cannot contaminate a newer form after dismissal', async ({ page }) => {
+    await openPreview(page, '?decisions=plan&latency=1000'); await observeSyntheticCommands(page);
+    await page.getByRole('tab', { name: '决定', exact: true }).click();
+    await page.getByRole('button', { name: '修订当前方案', exact: true }).click();
+    await page.getByRole('dialog').getByLabel('问题答案与修订要求', { exact: true }).fill('合成：提交旧窗口决定。');
+    await page.getByRole('dialog').getByRole('button', { name: '修订当前方案', exact: true }).click();
+    await page.keyboard.press('Escape');
+    await page.getByRole('button', { name: '新建需求', exact: true }).click();
+    await page.getByRole('dialog').getByLabel('需求标题', { exact: true }).fill('保留新窗口草稿');
+    await expect(page.getByRole('button', { name: '修订当前方案', exact: true }).first()).toBeEnabled();
+    await expect(page.getByRole('dialog').getByRole('heading', { name: '记录一条新需求', exact: true })).toBeVisible();
+    await expect(page.getByRole('dialog').getByLabel('需求标题', { exact: true })).toHaveValue('保留新窗口草稿');
+    await expect(page.getByRole('dialog').getByRole('alert')).toHaveCount(0);
+    expect(await readSyntheticCommands(page)).toHaveLength(1);
+  });
+
+  test('implementation consent keeps local commits optional, exact-plan-bound and separate from design', async ({ page }) => {
+    await openPreview(page); await observeSyntheticCommands(page);
+    await page.locator('.demand-item').filter({ hasText: '梳理审计日志的查询体验' }).click();
+    await page.getByRole('button', { name: '保存实施授权', exact: true }).click();
+    const dialog = page.getByRole('dialog');
+    await expect(dialog).toContainText('synthetic-audit-plan');
+    await expect(dialog.getByRole('checkbox')).not.toBeChecked();
+    expect(await readSyntheticCommands(page)).toEqual([]);
+    await dialog.getByRole('button', { name: '确认此方案的实施授权', exact: true }).click();
+    await expect(dialog.getByRole('alert')).toContainText('合成 UI 预览不执行');
+    expect((await readSyntheticCommands(page))[0]).toMatchObject({ kind: 'authorize-implementation', demandId: 'synthetic-audit', expectedVersion: 2, planId: 'synthetic-audit-plan', localCommit: false });
+    expect((await readSyntheticCommands(page))[0]).not.toHaveProperty('confirmDesign');
+    await dialog.getByRole('checkbox').check();
+    await expect(dialog.getByRole('button', { name: '确认此方案的实施授权', exact: true })).toBeDisabled();
+    await dialog.getByLabel('本地提交作者姓名', { exact: true }).fill('Synthetic Owner');
+    await dialog.getByLabel('本地提交作者邮箱', { exact: true }).fill('synthetic@example.invalid');
+    await dialog.getByRole('button', { name: '确认此方案的实施授权', exact: true }).click();
+    await expect.poll(async () => (await readSyntheticCommands(page)).length).toBe(2);
+    expect((await readSyntheticCommands(page))[1]).toMatchObject({ localCommit: true, authorName: 'Synthetic Owner', authorEmail: 'synthetic@example.invalid', planId: 'synthetic-audit-plan' });
+    await page.keyboard.press('Escape');
+    await page.getByRole('button', { name: '保存实施授权', exact: true }).click();
+    await expect(dialog.getByRole('checkbox')).not.toBeChecked();
+    await expect(dialog.getByLabel('本地提交作者姓名', { exact: true })).toHaveCount(0);
+  });
+
+  test('knowledge classification selects explicit roles and saves only exact result material', async ({ page }) => {
+    await openPreview(page, '?knowledge=ready'); await observeSyntheticCommands(page);
+    await page.getByRole('tab', { name: '经验', exact: true }).click();
+    await page.getByRole('button', { name: '分类并保存候选', exact: true }).click();
+    const dialog = page.getByRole('dialog');
+    await expect(dialog).toContainText('synthetic-note-n1');
+    await expect(dialog.getByRole('button', { name: '分类并保存候选', exact: true })).toBeDisabled();
+    await dialog.getByLabel('来源分类', { exact: true }).selectOption('implementation');
+    await dialog.getByLabel('陈述类型', { exact: true }).selectOption('fact');
+    await dialog.getByRole('checkbox', { name: '规划', exact: true }).check();
+    await dialog.getByLabel('模块路径（每行一个，可留空）', { exact: true }).fill('src/synthetic.ts');
+    await dialog.getByRole('button', { name: '分类并保存候选', exact: true }).click();
+    await expect(dialog.getByRole('alert')).toContainText('合成知识预览不会改变');
+    const action = (await readSyntheticCommands(page))[0];
+    expect(action).toMatchObject({ kind: 'knowledge-action', action: 'save-candidate', demandId: 'synthetic-export', expectedVersion: 12, resultId: 'synthetic-result-r1', artifactId: 'synthetic-note-n1', sourceKind: 'implementation', statementKind: 'fact', roles: ['planner'], modulePaths: ['src/synthetic.ts'] });
+    expect(action).not.toHaveProperty('body'); expect(action).not.toHaveProperty('verified');
+    await page.keyboard.press('Escape');
+    await page.getByRole('button', { name: '分类并保存候选', exact: true }).click();
+    await expect(dialog.getByRole('checkbox', { name: '规划', exact: true })).not.toBeChecked();
+  });
+
+  test('knowledge review requires actual-observation choice, exact check and semantic consent', async ({ page }, testInfo) => {
+    await openPreview(page, '?knowledge=ready'); await observeSyntheticCommands(page);
+    await page.getByRole('tab', { name: '经验', exact: true }).click();
+    await page.getByRole('button', { name: '审阅并申请复用', exact: true }).click();
+    const dialog = page.getByRole('dialog');
+    await expect(dialog).toContainText('合成精确正文：UTC 边界行为需要独立核对。');
+    await expect(dialog.getByRole('button', { name: '审阅并申请复用', exact: true })).toBeDisabled();
+    await dialog.getByLabel('真实合入观察', { exact: true }).selectOption('synthetic-merge-observation');
+    await dialog.getByLabel('核验理由与依据', { exact: true }).fill('合成：已审阅来源、范围与正文。');
+    await dialog.getByRole('checkbox', { name: /合成原生检查展示/ }).check();
+    await dialog.getByRole('checkbox', { name: /我已审阅精确正文/ }).check();
+    await page.screenshot({ path: testInfo.outputPath('synthetic-knowledge-review.png'), fullPage: true });
+    await dialog.getByRole('button', { name: '审阅并申请复用', exact: true }).click();
+    await expect(dialog.getByRole('alert')).toContainText('合成知识预览不会改变');
+    expect((await readSyntheticCommands(page))[0]).toMatchObject({ action: 'qualify', revisionId: 'synthetic-knowledge-revision', baseline: 'a'.repeat(40), observationId: 'synthetic-merge-observation', checkIds: ['synthetic-native-check'], reviewed: true, independentOfDemand: false });
+    await page.keyboard.press('Escape');
+    await page.getByRole('button', { name: '审阅并申请复用', exact: true }).click();
+    await expect(dialog.getByRole('checkbox', { name: /我已审阅精确正文/ })).not.toBeChecked();
+    await page.evaluate(() => window.dispatchEvent(new Event('pi-kanban:synthetic-change-version')));
+    await expect(dialog.getByRole('alert')).toContainText('需求或知识记录已变化');
+  });
+
+  test('synthetic or unavailable knowledge evidence never enables eligibility review', async ({ page }) => {
+    await openPreview(page, '?knowledge=blocked'); await observeSyntheticCommands(page);
+    await page.getByRole('tab', { name: '经验', exact: true }).click();
+    await expect(page.getByRole('button', { name: '审阅并申请复用', exact: true })).toBeDisabled();
+    await expect(page.getByRole('tabpanel')).toContainText('受控测试响应，不可证明真实合入');
+    expect(await readSyntheticCommands(page)).toEqual([]);
+  });
+
+  test('remote binding pins named repository and PR without accepting merge text as evidence', async ({ page }) => {
+    await openPreview(page, '?knowledge=unbound'); await observeSyntheticCommands(page);
+    await page.getByRole('tab', { name: '经验', exact: true }).click();
+    await page.getByRole('button', { name: '绑定 GitHub PR', exact: true }).click();
+    const dialog = page.getByRole('dialog');
+    await dialog.getByLabel('GitHub 所有者', { exact: true }).fill('synthetic-owner');
+    await dialog.getByLabel('GitHub 仓库名称', { exact: true }).fill('synthetic-repo');
+    await dialog.getByLabel('Pull Request 编号', { exact: true }).fill('42');
+    await expect(dialog).toContainText('之后不能静默替换');
+    await dialog.getByRole('button', { name: '绑定 GitHub PR', exact: true }).click();
+    await expect(dialog.getByRole('alert')).toContainText('合成知识预览不会改变');
+    expect((await readSyntheticCommands(page))[0]).toMatchObject({ action: 'bind-remote', owner: 'synthetic-owner', repository: 'synthetic-repo', pullRequest: 42, expectedVersion: 12 });
+  });
+
+  test('baseline proposal review cannot integrate before explicit author and version-bound consent', async ({ page }) => {
+    await openPreview(page, '?knowledge=baseline'); await observeSyntheticCommands(page);
+    await page.getByRole('tab', { name: '经验', exact: true }).click();
+    await page.getByRole('button', { name: '准备基线方案', exact: true }).click();
+    const dialog = page.getByRole('dialog');
+    await dialog.getByLabel('拟整合的精确提交', { exact: true }).fill('c'.repeat(40));
+    await dialog.getByRole('button', { name: '准备基线方案', exact: true }).click();
+    await expect(dialog.getByRole('alert')).toContainText('合成知识预览不会改变');
+    expect((await readSyntheticCommands(page))[0]).toMatchObject({ action: 'propose-baseline', sourceCommit: 'c'.repeat(40) });
+    await page.keyboard.press('Escape');
+    await page.getByRole('button', { name: '授权整合此基线', exact: true }).click();
+    await expect(dialog).toContainText('synthetic-baseline-proposal');
+    await expect(dialog).toContainText('b'.repeat(40));
+    await expect(dialog.getByRole('button', { name: '授权整合此基线', exact: true })).toBeDisabled();
+    await dialog.getByLabel('本地提交作者姓名', { exact: true }).fill('Synthetic Owner');
+    await dialog.getByLabel('本地提交作者邮箱', { exact: true }).fill('synthetic@example.invalid');
+    await dialog.getByRole('checkbox').check();
+    await dialog.getByRole('button', { name: '授权整合此基线', exact: true }).click();
+    await expect(dialog.getByRole('alert')).toContainText('合成知识预览不会改变');
+    expect((await readSyntheticCommands(page))[1]).toMatchObject({ action: 'apply-baseline', proposalId: 'synthetic-baseline-proposal', author: { name: 'Synthetic Owner', email: 'synthetic@example.invalid' } });
+  });
+
+  test('post-integration verification binds operation, fresh result and exact independent checks', async ({ page }) => {
+    await openPreview(page, '?knowledge=integrated'); await observeSyntheticCommands(page);
+    await page.getByRole('tab', { name: '经验', exact: true }).click();
+    await page.getByRole('button', { name: '核验整合后能力', exact: true }).click();
+    const dialog = page.getByRole('dialog');
+    await expect(dialog).toContainText('d'.repeat(40));
+    await dialog.getByLabel('整合后成果', { exact: true }).selectOption('synthetic-result-r1');
+    await dialog.getByRole('checkbox', { name: /合成原生检查展示/ }).check();
+    await dialog.getByRole('button', { name: '核验整合后能力', exact: true }).click();
+    await expect(dialog.getByRole('alert')).toContainText('合成知识预览不会改变');
+    expect((await readSyntheticCommands(page))[0]).toMatchObject({ action: 'verify-baseline', operationId: 'synthetic-baseline-proposal', resultId: 'synthetic-result-r1', checkIds: ['synthetic-native-check'] });
+  });
+
 });

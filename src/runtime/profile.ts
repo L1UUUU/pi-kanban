@@ -3,7 +3,7 @@ import { lstatSync, realpathSync, openSync, fstatSync, closeSync, readSync } fro
 import { isAbsolute, relative, resolve, dirname } from 'node:path';
 import { release } from 'node:os';
 import { RuntimeError } from './types.ts';
-import { MAX_WINDOWS_EVIDENCE_BYTES, REQUIRED_WINDOWS_PROBES, verifyWindowsEvidence } from './evidence-auth.ts';
+import { MAX_WINDOWS_EVIDENCE_BYTES, requireWindowsProbeCoverage, validateWindowsEvidenceTrustAnchor, verifyWindowsEvidence } from './evidence-auth.ts';
 import type { WindowsEvidenceTrustAnchor } from './evidence-auth.ts';
 export { REQUIRED_WINDOWS_PROBES } from './evidence-auth.ts';
 export type { WindowsEvidenceTrustAnchor } from './evidence-auth.ts';
@@ -82,28 +82,57 @@ function verifyProfile(input: unknown, trustedEvidenceRoot: string, trust: Windo
     throw new RuntimeError('PROFILE_RUNTIME_MISMATCH', 'Expected Node 24 and the exact official Pi package');
   if (!Array.isArray(config.evidence) || !config.evidence.length || config.evidence.length > 32)
     throw new RuntimeError('ISOLATION_UNVERIFIED', 'Bounded independently captured Windows evidence required');
-  const root = lockedPath(trustedEvidenceRoot), covered = new Set<string>(), digests: string[] = [], seenIds = new Set<string>(), seenPaths = new Set<string>();
+  const root = lockedPath(trustedEvidenceRoot), covered = new Set<string>(), digests: string[] = [];
   if (!lstatSync(root).isDirectory()) throw new RuntimeError('EVIDENCE_SOURCE_DENIED', 'Host evidence root must be a directory');
   for (const inputRef of config.evidence) {
     const ref = object(inputRef);
-    if (typeof ref.id !== 'string' || !ref.id.trim() || ref.id.length > 128 || seenIds.has(ref.id) || typeof ref.path !== 'string' ||
+    if (typeof ref.id !== 'string' || !ref.id.trim() || ref.id.length > 128 || typeof ref.path !== 'string' ||
         typeof ref.sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(ref.sha256))
-      throw new RuntimeError('EVIDENCE_INVALID', 'Evidence requires unique bounded IDs and exact file references');
+      throw new RuntimeError('EVIDENCE_INVALID', 'Evidence requires bounded IDs and exact file references');
     const path = lockedPath(ref.path), rel = relative(root, path);
-    if (rel.startsWith('..') || isAbsolute(rel) || !rel || seenPaths.has(path.toLowerCase()))
-      throw new RuntimeError('EVIDENCE_SOURCE_DENIED', 'Evidence must be a unique file under the Host-owned evidence directory');
+    if (rel.startsWith('..') || isAbsolute(rel) || !rel)
+      throw new RuntimeError('EVIDENCE_SOURCE_DENIED', 'Evidence must be a file under the Host-owned evidence directory');
     // The signature and reference digest must authenticate the SAME file snapshot.
     const bytes = boundedRead(path, MAX_WINDOWS_EVIDENCE_BYTES);
     if (digest(bytes) !== ref.sha256) throw new RuntimeError('EVIDENCE_CHANGED', 'Evidence digest changed');
     const report = verifyWindowsEvidence(bytes, { ...config, evidenceId: ref.id }, trust);
     for (const probe of report.probes) covered.add(probe.id);
-    seenIds.add(ref.id); seenPaths.add(path.toLowerCase()); digests.push(ref.sha256);
+    digests.push(ref.sha256);
   }
-  const missing = REQUIRED_WINDOWS_PROBES.filter(id => !covered.has(id));
-  if (missing.length) throw new RuntimeError('EVIDENCE_INCOMPLETE', `Unverified probes: ${missing.join(', ')}`);
+  requireWindowsProbeCoverage(covered);
   return make(config, digests);
 }
 /** The two-argument form intentionally fails closed until the Host has a pinned recorder trust anchor. */
 export function verifyWindowsRuntimeProfile(input: unknown, trustedEvidenceRoot: string, trust?: WindowsEvidenceTrustAnchor): VerifiedRuntimeProfile {
   return VerifiedRuntimeProfile.verify(input, trustedEvidenceRoot, trust);
+}
+
+/** Fixed filename under a trusted Host installation, never under an evidence/project root. */
+export const INSTALLED_WINDOWS_EVIDENCE_TRUST_FILE = 'windows-evidence-trust.json';
+/**
+ * Installation/provisioning contract:
+ * 1. Provision approved public recorder material as this fixed file with schemaVersion: 1.
+ * 2. Pin its SHA-256 in trusted Host installation code/metadata independently of the file.
+ * 3. Supply that installation directory and pinned hash here; pass the result to the verifier.
+ *
+ * Inputs may be supplied by trusted operator-only Host startup configuration, including
+ * PI_KANBAN_RUNTIME_TRUST_DIR / PI_KANBAN_RUNTIME_TRUST_SHA256 propagated only from
+ * trusted Electron to Host. Never read them from Worker-controlled environment, runtime
+ * configuration, IPC, project/evidence files, or an adjacent digest file. This loader never generates keys,
+ * accepts a TOFU key, or treats file ownership/location alone as recorder authority.
+ * There is intentionally no default key: an unprovisioned installation remains disabled.
+ */
+export function loadInstalledWindowsEvidenceTrust(installationDirectory: string, pinnedTrustFileSha256: string): Readonly<WindowsEvidenceTrustAnchor> {
+  if (typeof pinnedTrustFileSha256 !== 'string' || !/^[a-f0-9]{64}$/.test(pinnedTrustFileSha256))
+    throw new RuntimeError('EVIDENCE_TRUST_REQUIRED', 'An independently pinned installation trust-file digest is required');
+  const root = lockedPath(installationDirectory);
+  if (!lstatSync(root).isDirectory()) throw new RuntimeError('EVIDENCE_TRUST_REQUIRED', 'Trusted Host installation directory required');
+  const path = lockedPath(resolve(root, INSTALLED_WINDOWS_EVIDENCE_TRUST_FILE));
+  const bytes = boundedRead(path, 32 * 1024);
+  if (digest(bytes) !== pinnedTrustFileSha256) throw new RuntimeError('EVIDENCE_TRUST_CHANGED', 'Installed Host recorder trust does not match the independent installation pin');
+  let value: Record<string, unknown>;
+  try { value = object(JSON.parse(bytes.toString('utf8'))); } catch { throw new RuntimeError('EVIDENCE_TRUST_REQUIRED', 'Invalid installed Host recorder trust'); }
+  if (Object.keys(value).sort().join(',') !== 'keyId,publicKeyPem,recorderSha256,schemaVersion' || value.schemaVersion !== 1)
+    throw new RuntimeError('EVIDENCE_TRUST_REQUIRED', 'Installed trust must contain only versioned public recorder material');
+  return validateWindowsEvidenceTrustAnchor(value as unknown as WindowsEvidenceTrustAnchor);
 }
