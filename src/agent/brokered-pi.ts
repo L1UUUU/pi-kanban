@@ -4,7 +4,7 @@ import { InMemoryCredentialStore,InMemoryModelsStore,createAssistantMessageEvent
 import type { AssistantMessage } from '@earendil-works/pi-ai';
 import { explicitResourceLoader } from './resources.ts';
 import type { AgentMaterial } from './resources.ts';
-import { PiLifecycle } from './pi-adapter.ts';
+import { PiLifecycle } from './lifecycle.ts';
 import type { PiModelChannel,ModelPurpose } from '../runtime/pi-channel.ts';
 import { RuntimeError } from '../runtime/types.ts';
 import type { RuntimeRole } from '../runtime/types.ts';

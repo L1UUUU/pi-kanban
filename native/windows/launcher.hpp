@@ -41,6 +41,7 @@ class ControlledJob {
   // Descriptor requires already-provisioned resource ACLs. Does not change ACLs or install anything.
   DWORD Launch(const LaunchDescriptor&, const PrivateHandles&);
   DWORD Stop(DWORD exit_code = ERROR_CANCELLED);
+  DWORD SpawnNodeCheck(const LaunchDescriptor&, const std::vector<std::wstring>& args, HANDLE input, HANDLE output, PROCESS_INFORMATION* process);
   DWORD ActiveProcesses(DWORD* count) const;
   DWORD ProcessIds(std::vector<DWORD>& ids) const;
   const ProcessIdentity& Identity() const { return identity_; }

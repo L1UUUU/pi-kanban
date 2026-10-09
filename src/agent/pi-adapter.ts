@@ -10,15 +10,8 @@ import type { RuntimeRole } from '../runtime/types.ts';
 export const PI_SDK_VERSION='1.1.0';
 export const PI_SDK_PACKAGE='@earendil-works/pi-coding-agent';
 
-/** Stable SDK runtime signals are never business completion or result acceptance. */
-export class PiLifecycle {
-  settled=true;aborted=false;lowLevelEnds=0;
-  accept(event:AgentSessionEvent){
-    if(event.type==='agent_start'){this.settled=false;this.aborted=false;}
-    if(event.type==='agent_end'){this.lowLevelEnds++;this.settled=false;}
-    if(event.type==='agent_settled'){this.settled=true;this.aborted=event.aborted;}
-  }
-}
+import { PiLifecycle } from './lifecycle.ts';
+export { PiLifecycle };
 export interface SyntheticSessionOptions {
   cwd:string;agentDir:string;role:RuntimeRole;materials:readonly AgentMaterial[];
   /** The native Pi manager is the sole model history. Review must use a fresh empty manager. */

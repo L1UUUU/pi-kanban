@@ -170,4 +170,169 @@ test.describe('Synthetic renderer interaction coverage (not backend acceptance)'
     await expect(page.locator('.message.user').filter({ hasText: '合成键盘消息' })).toContainText('已保存');
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
   });
+
+  test('configuration import shows source hashes and bounded scope without authorizing or enabling runtime', async ({ page }, testInfo) => {
+    await openPreview(page);
+    await observeSyntheticCommands(page);
+    await page.locator('.runtime-button').click();
+    const dialog = page.getByRole('dialog');
+    await expect(dialog.getByRole('button', { name: '审阅模型与资源授权', exact: true })).toBeDisabled();
+    await dialog.getByRole('button', { name: '导入运行配置', exact: true }).click();
+    await expect(dialog).toContainText('已载入配置 · 版本 1');
+    await expect(dialog.getByRole('button', { name: '审阅模型与资源授权', exact: true })).toBeEnabled();
+    await dialog.locator('.configuration-method').first().locator('summary').click();
+    await expect(dialog).toContainText('/synthetic/methods/planning.md');
+    await expect(dialog).toContainText('a'.repeat(64));
+    await expect(dialog).toContainText('synthetic-provider');
+    await expect(dialog).toContainText('https://synthetic-model.example.invalid/v1/responses');
+    await expect(dialog).toContainText('synthetic-demand-brief');
+    await expect(dialog).toContainText('USD 1.250000');
+    await expect(dialog).toContainText('2099-01-01T00:00:00.000Z');
+    await expect(dialog.locator('.diagnostics-summary')).toContainText('自主执行尚未启用');
+    expect(await readSyntheticCommands(page)).toEqual([]);
+    await page.screenshot({ path: testInfo.outputPath('synthetic-runtime-configuration.png'), fullPage: true });
+    await page.keyboard.press('Escape');
+    await expect(dialog).toHaveCount(0);
+    await expect(page.locator('.live-count')).toHaveCount(0);
+  });
+
+  test('model approval requires review, explicit consent and exact captured binding; preview denies actual grant', async ({ page }, testInfo) => {
+    await openPreview(page, '?latency=200');
+    await observeSyntheticCommands(page);
+    await page.locator('.runtime-button').click();
+    const dialog = page.getByRole('dialog');
+    await dialog.getByRole('button', { name: '导入运行配置', exact: true }).click();
+    await dialog.getByRole('button', { name: '审阅模型与资源授权', exact: true }).click();
+    await expect(dialog.getByRole('heading', { name: '确认有限模型与资源授权', exact: true })).toBeVisible();
+    await expect(dialog).toContainText('synthetic-export · v12');
+    await expect(dialog).toContainText('b'.repeat(64));
+    await expect(dialog).toContainText('host:synthetic-only');
+    await expect(dialog.getByRole('region', { name: '本需求的本地资源访问范围' })).toContainText('/synthetic/worktrees/export-date-range');
+    await expect(dialog.getByRole('region', { name: '本需求的本地资源访问范围' })).toContainText('demand-worktree-private-runtime-v1');
+    await expect(dialog.getByRole('region', { name: '本需求的本地资源访问范围' })).toContainText('共享 .git 管理目录、Host 数据库、其他需求');
+    await expect(dialog.getByRole('region', { name: '本需求的本地资源访问范围' })).toContainText('只读访问此需求的工作区');
+    await expect(dialog).toContainText('synthetic-method-material');
+    await expect(dialog.locator('.configuration-context-scope')).toContainText('仅精确资料清单');
+    await expect(dialog.locator('.configuration-context-scope')).toContainText('生成的对话、工具结果及其他新增资料不在本次授权内');
+    await expect(dialog.getByRole('button', { name: '确认此范围与额度', exact: true })).toBeDisabled();
+    expect(await readSyntheticCommands(page)).toEqual([]);
+    await dialog.getByRole('checkbox').check();
+    await dialog.evaluate(node => { node.scrollTop = 0; });
+    await page.screenshot({ path: testInfo.outputPath('synthetic-model-authorization-review.png'), fullPage: true });
+    await dialog.getByRole('button', { name: '确认此范围与额度', exact: true }).evaluate(button => { (button as HTMLButtonElement).click(); (button as HTMLButtonElement).click(); });
+    await expect(dialog.getByRole('alert')).toContainText('不会创建真实模型授权');
+    const commands = await readSyntheticCommands(page);
+    expect(commands).toHaveLength(1);
+    expect(commands[0]).toMatchObject({ kind: 'authorize-model', demandId: 'synthetic-export', expectedVersion: 12, configurationDigest: 'b'.repeat(64), resourceScope: 'demand-worktree-private-runtime-v1', requestId: expect.any(String) });
+    await dialog.getByRole('button', { name: '返回运行诊断', exact: true }).click();
+    await dialog.getByRole('button', { name: '审阅模型与资源授权', exact: true }).click();
+    await expect(dialog.getByRole('checkbox')).not.toBeChecked();
+    await expect(dialog.getByRole('button', { name: '确认此范围与额度', exact: true })).toBeDisabled();
+    await page.keyboard.press('Escape');
+    await expect(dialog).toHaveCount(0);
+    expect(await readSyntheticCommands(page)).toHaveLength(1);
+    await expect(page.locator('.live-count')).toHaveCount(0);
+  });
+
+  test('configuration without selected demand cannot grant a model budget', async ({ page }) => {
+    await page.setViewportSize({ width: 1024, height: 900 });
+    await openPreview(page, '?view=onboarding');
+    await observeSyntheticCommands(page);
+    await page.locator('.runtime-button').click();
+    const dialog = page.getByRole('dialog');
+    await dialog.getByRole('button', { name: '导入运行配置', exact: true }).click();
+    await expect(dialog.getByRole('button', { name: '审阅模型与资源授权', exact: true })).toBeDisabled();
+    await expect(dialog).toContainText('请先在工作区选择需要授权的需求');
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+    expect(await readSyntheticCommands(page)).toEqual([]);
+  });
+
+  test('derived-context scope is explicitly displayed before consent and does not grant on view', async ({ page }) => {
+    await openPreview(page, '?contextPolicy=derived');
+    await observeSyntheticCommands(page);
+    await page.locator('.runtime-button').click();
+    const dialog = page.getByRole('dialog');
+    await dialog.getByRole('button', { name: '导入运行配置', exact: true }).click();
+    await dialog.getByRole('button', { name: '审阅模型与资源授权', exact: true }).click();
+    await expect(dialog.locator('.configuration-context-scope')).toContainText('精确资料 + 同一受控运行内的派生上下文');
+    await expect(dialog.locator('.configuration-context-scope')).toContainText('同一已核验隔离运行内生成的对话与工具结果');
+    await expect(dialog.locator('.configuration-context-scope')).toContainText('不得据此读取任意新来源、其他项目或其他需求');
+    await expect(dialog.getByRole('checkbox')).not.toBeChecked();
+    await expect(dialog.getByRole('button', { name: '确认此范围与额度', exact: true })).toBeDisabled();
+    await page.keyboard.press('Escape');
+    expect(await readSyntheticCommands(page)).toEqual([]);
+  });
+
+  test('unprepared workspace scope is disclosed and consent remains explicit', async ({ page }) => {
+    await openPreview(page);
+    await observeSyntheticCommands(page);
+    await page.locator('.demand-item').filter({ hasText: '让空状态更有帮助' }).click();
+    await page.locator('.runtime-button').click();
+    const dialog = page.getByRole('dialog');
+    await dialog.getByRole('button', { name: '导入运行配置', exact: true }).click();
+    await dialog.getByRole('button', { name: '审阅模型与资源授权', exact: true }).click();
+    const scope = dialog.getByRole('region', { name: '本需求的本地资源访问范围' });
+    await expect(scope).toContainText('为此需求准备的独立工作区');
+    await expect(scope).toContainText('尚未准备工作区时不执行');
+    await expect(scope).toContainText('固定运行依赖');
+    await expect(scope).toContainText('私有 scratch / session 目录');
+    await expect(scope).toContainText('不包含全磁盘访问或通用系统设置权限');
+    await expect(dialog.getByRole('checkbox')).not.toBeChecked();
+    await expect(dialog.getByRole('button', { name: '确认此范围与额度', exact: true })).toBeDisabled();
+    expect(await readSyntheticCommands(page)).toEqual([]);
+  });
+
+  test('preparation failure stays in diagnostics with no misleading consent or grant', async ({ page }) => {
+    await openPreview(page, '?prepare=blocked');
+    await observeSyntheticCommands(page);
+    await page.locator('.runtime-button').click();
+    const dialog = page.getByRole('dialog');
+    await dialog.getByRole('button', { name: '导入运行配置', exact: true }).click();
+    await dialog.getByRole('button', { name: '审阅模型与资源授权', exact: true }).click();
+    await expect(dialog.getByRole('alert')).toContainText('缺少此需求的已准备工作区或冻结方法');
+    await expect(dialog.getByRole('heading', { name: '运行诊断', exact: true })).toBeVisible();
+    await expect(dialog.getByRole('checkbox')).toHaveCount(0);
+    expect(await readSyntheticCommands(page)).toEqual([]);
+  });
+
+  test('consent uses exact newly prepared material list and fresh configuration digest', async ({ page }) => {
+    await openPreview(page, '?prepare=changed');
+    await observeSyntheticCommands(page);
+    await page.locator('.runtime-button').click();
+    const dialog = page.getByRole('dialog');
+    await dialog.getByRole('button', { name: '导入运行配置', exact: true }).click();
+    await dialog.getByRole('button', { name: '审阅模型与资源授权', exact: true }).click();
+    await expect(dialog.getByRole('heading', { name: '确认有限模型与资源授权', exact: true })).toBeVisible();
+    await expect(dialog).toContainText('synthetic-prepared-exact-source');
+    await expect(dialog).toContainText('d'.repeat(64));
+    await expect(dialog).not.toContainText('synthetic-demand-brief');
+    expect(await readSyntheticCommands(page)).toEqual([]);
+    await dialog.getByRole('checkbox').check();
+    await dialog.getByRole('button', { name: '确认此范围与额度', exact: true }).click();
+    await expect(dialog.getByRole('alert')).toContainText('不会创建真实模型授权');
+    expect((await readSyntheticCommands(page))[0]).toMatchObject({ configurationDigest: 'd'.repeat(64), expectedVersion: 12 });
+  });
+
+  test('late preparation cannot reopen consent over a newer dialog or navigation', async ({ page }) => {
+    await openPreview(page, '?latency=1000');
+    await observeSyntheticCommands(page);
+    await page.evaluate(() => {
+      const target = window as unknown as { syntheticPreparationCount: number };
+      target.syntheticPreparationCount = 0;
+      window.addEventListener('pi-kanban:synthetic-prepared', () => { target.syntheticPreparationCount += 1; });
+    });
+    await page.locator('.runtime-button').click();
+    await page.getByRole('dialog').getByRole('button', { name: '导入运行配置', exact: true }).click();
+    await page.getByRole('dialog').getByRole('button', { name: '审阅模型与资源授权', exact: true }).click();
+    await page.keyboard.press('Escape');
+    await page.getByRole('button', { name: /^待处理/ }).click();
+    await page.getByRole('button', { name: '新建需求', exact: true }).click();
+    await page.getByRole('dialog').getByLabel('需求标题', { exact: true }).fill('保留此新草稿');
+    await expect.poll(() => page.evaluate(() => (window as unknown as { syntheticPreparationCount: number }).syntheticPreparationCount)).toBe(1);
+    await expect(page.getByRole('dialog').getByRole('heading', { name: '记录一条新需求', exact: true })).toBeVisible();
+    await expect(page.getByRole('dialog').getByLabel('需求标题', { exact: true })).toHaveValue('保留此新草稿');
+    await page.keyboard.press('Escape');
+    await expect(page.getByRole('heading', { name: '待处理', exact: true })).toBeVisible();
+    expect(await readSyntheticCommands(page)).toEqual([]);
+  });
 });

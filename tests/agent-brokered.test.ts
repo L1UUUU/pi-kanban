@@ -19,7 +19,7 @@ function harness(send:(request:BoundedTransportRequest)=>Promise<ProviderRespons
   const db=new DatabaseSync(':memory:'),ledger=new ModelBudgetLedger(db,()=>{}),cwd=mkdtempSync(join(tmpdir(),'pi-brokered-'));
   const sessionManager=SessionManager.inMemory(cwd),binding={runId:'A-run',generation:'generation-1',sessionId:sessionManager.getSessionId(),capability:randomBytes(32).toString('hex'),grantId:'g',role:'implementation',reserveTokens:10000,reserveCostMicros:1000};
   ledger.grant({id:'g',demandId:'A',decisionId:'explicit-synthetic-derived-transcripts',provider:'bounded-test',modelId:'one-model',destination:'https://provider.invalid/v1/messages',credentialRef:'HOST-ONLY-FAKE-REFERENCE',
-    data:[{id:'initial-synthetic-scope',sha256:createHash('sha256').update('synthetic fixture').digest('hex')}],allowedRoles:['implementation'],maxRequests:10,maxTokens:100000,maxCostMicros:10000,currency:'USD',expiresAt:new Date(Date.now()+60000).toISOString(),meteringPolicy:'finite-synthetic'});
+    data:[{id:'initial-synthetic-scope',sha256:createHash('sha256').update('synthetic fixture').digest('hex')}],allowedRoles:['implementation'],maxRequests:10,maxTokens:100000,maxCostMicros:10000,currency:'USD',expiresAt:new Date(Date.now()+60000).toISOString(),meteringPolicy:'finite-synthetic',contextPolicy:'approved-run-derived-v1'});
   let endpoint:HostPiBrokerEndpoint;const purposes:string[]=[];let calls=0;let allowed=true;
   const broker=new ModelBroker({ledger,transport:{provider:'bounded-test',modelId:'one-model',destination:'https://provider.invalid/v1/messages',mode:'synthetic-no-network',send:async request=>{calls++;return send(request);}},
     readMaterial:async id=>endpoint.readMaterial(id),authorizeRun:()=>{if(!allowed)throw new Error('paused');}});

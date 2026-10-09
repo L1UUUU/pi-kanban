@@ -7,6 +7,7 @@ export interface ModelGrant {
   destination: string; credentialRef: string; data: { id: string; sha256: string }[];
   allowedRoles: string[]; maxRequests: number; maxTokens: number; maxCostMicros: number;
   currency: string; expiresAt: string; meteringPolicy: string;
+  contextPolicy?: 'exact-materials-only' | 'approved-run-derived-v1';
 }
 export interface ReservationRequest {
   id: string; grantId: string; runId: string; role: string; purpose: 'prompt' | 'retry' | 'compaction' | 'auxiliary';
@@ -71,7 +72,8 @@ export class ModelBudgetLedger {
   }
   /** Host-only registration under existing bounded data permission. It never creates spending authority. */
   authorizeData(input:{grantId:string;decisionId:string;material:{id:string;sha256:string}}, authorize:(value:typeof input)=>void) {
-    authorize(input);this.getGrant(input.grantId);
+    authorize(input);const grant=this.getGrant(input.grantId);
+    if(grant.contextPolicy!=='approved-run-derived-v1'&&!grant.data.some(x=>x.id===input.material.id&&x.sha256===input.material.sha256))throw new RuntimeError('DERIVED_CONTEXT_DENIED','Grant permits exact materials only; derived session/tool context is not authorized');
     if(!input.decisionId||!input.material.id||!/^[a-f0-9]{64}$/.test(input.material.sha256))throw new RuntimeError('DATA_PERMISSION_MISSING','Immutable material and authorization evidence required');
     this.db.prepare('INSERT OR IGNORE INTO model_material_permissions VALUES(?,?,?,?)').run(input.grantId,input.material.id,input.material.sha256,input.decisionId);
   }
@@ -137,6 +139,7 @@ export class ModelBudgetLedger {
       const prev=this.db.prepare('SELECT * FROM model_budget_additions WHERE id=?').get(add.id) as Record<string,string|number>|undefined;
       if(prev){if(prev.grant_id===add.grantId&&prev.decision_id===add.decisionId&&prev.requests===add.requests&&prev.tokens===add.tokens&&prev.cost===add.costMicros)return;
         throw new RuntimeError('IDEMPOTENCY_CONFLICT','Budget addition ID changed');}
+      const current=this.snapshot(add.grantId);integer(current.limits.requests+add.requests,'combined request budget');integer(current.limits.tokens+add.tokens,'combined token budget');integer(current.limits.costMicros+add.costMicros,'combined cost budget');
       this.db.prepare('INSERT INTO model_budget_additions VALUES(?,?,?,?,?,?)').run(add.id,add.grantId,add.decisionId,add.requests,add.tokens,add.costMicros);
     });
   }

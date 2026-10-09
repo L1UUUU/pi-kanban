@@ -1,7 +1,7 @@
 /** Isolated synthetic preview entry. Never imported by main.tsx or included in production output. */
 import { createRoot } from 'react-dom/client';
 import { App } from './App.tsx';
-import type { ViewState, WorkbenchBridge } from './types.ts';
+import type { ConfigurationSummary, ViewState, WorkbenchBridge } from './types.ts';
 import './styles.css';
 
 const now = '2026-10-08T14:30:00Z';
@@ -47,6 +47,17 @@ export const syntheticPreview: ViewState = {
     version: 1, phase: 'idea', control: 'active', runState: 'idle', blockers: [], activities: [], messages: [],
   }],
 };
+const syntheticConfiguration = (): ConfigurationSummary => {
+  const sha256 = 'a'.repeat(64);
+  const method = (stage: 'planning' | 'implementation' | 'review') => ({ id: `synthetic-${stage}`, path: `/synthetic/methods/${stage}.md`, sha256, logicalName: stage === 'planning' ? 'design-feature' : `synthetic-${stage}`, version: 'synthetic-v1', adapter: 'synthetic-only', dependencies: [] });
+  const methods = { planning: method('planning'), implementation: method('implementation'), review: method('review') };
+  return {
+    schemaVersion: 1, revision: 1, configurationDigest: 'b'.repeat(64), sourceStatus: 'configured', executionEnabled: false,
+    configuration: { schemaVersion: 1, revision: 1, runtime: null, methods, provider: { provider: 'synthetic-provider', modelId: 'synthetic-model', destination: 'https://synthetic-model.example.invalid/v1/responses', credentialRef: 'host:synthetic-only', contextPolicy: params.get('contextPolicy') === 'derived' ? 'approved-run-derived-v1' : 'exact-materials-only', data: [{ id: 'synthetic-demand-brief', sha256 }, { id: 'synthetic-method-material', sha256: 'c'.repeat(64) }], allowedRoles: ['planning', 'review'], limits: { maxRequests: 6, maxTokens: 12000, maxCostMicros: 1250000, currency: 'USD', expiresAt: '2099-01-01T00:00:00.000Z', meteringPolicy: 'synthetic-exact-usage' } } },
+    methods: (['planning', 'implementation', 'review'] as const).map(stage => ({ stage, logicalName: methods[stage]!.logicalName, status: 'configured', source: methods[stage], snapshot: { id: methods[stage]!.id, version: 'synthetic-v1', digest: sha256, adapter: 'synthetic-only' }, dependencyCount: 0, blockers: [] })),
+    planningMethodMissing: false, provider: { status: 'configured-unapproved', blockers: [] }, runtime: { status: 'missing', blockers: ['合成样例未验证原生隔离、受控进程与真实模型通道。'] }, blockers: ['合成样例不会启用实际执行。'],
+  };
+};
 const params = new URLSearchParams(location.search);
 let state: ViewState = params.get('view') === 'empty' ? { ...syntheticPreview, projects: [], demands: [], selected: undefined } : params.get('view') === 'onboarding' ? { ...syntheticPreview, selected: undefined } : structuredClone(syntheticPreview);
 const latency = Math.min(1000, Math.max(0, Number(params.get('latency')) || 0));
@@ -56,6 +67,20 @@ const publish = () => { state = { ...state, sequence: state.sequence + 1 }; for 
 const previewBridge: WorkbenchBridge = {
   snapshot: async () => structuredClone(state),
   subscribe: listener => { listeners.add(listener); return () => listeners.delete(listener); },
+  importConfiguration: async () => { await waitForSyntheticResponse(); state.configuration = syntheticConfiguration(); return publish(); },
+  prepareModelApproval: async input => {
+    await waitForSyntheticResponse();
+    const demand = state.demands.find(item => item.id === input.demandId);
+    if (!demand || demand.version !== input.expectedVersion) throw new Error('合成需求版本已变化。');
+    if (params.get('prepare') === 'blocked') throw new Error('合成准备失败：缺少此需求的已准备工作区或冻结方法。');
+    if (params.get('prepare') === 'changed' && state.configuration?.configuration.provider) {
+      state.configuration.configurationDigest = 'd'.repeat(64);
+      state.configuration.configuration.provider.data = [{ id: 'synthetic-prepared-exact-source', sha256: 'e'.repeat(64) }];
+    }
+    window.dispatchEvent(new CustomEvent('pi-kanban:synthetic-prepared', { detail: structuredClone(input) }));
+    return publish();
+  },
+  authorizeModel: async input => { window.dispatchEvent(new CustomEvent('pi-kanban:synthetic-command', { detail: { kind: 'authorize-model', ...structuredClone(input) } })); await waitForSyntheticResponse(); throw new Error('合成配置仅用于审阅 UI，不会创建真实模型授权、发送资料或产生费用。'); },
   createProject: async () => { throw new Error('合成预览不能选择真实项目。请从桌面应用接入本地目录。'); },
   createDemand: async input => { await waitForSyntheticResponse(); state.demands.push({ ...input, id: `synthetic-${crypto.randomUUID()}`, version: 1, phase: 'idea', control: 'active', runState: 'idle', blockers: [], activities: [], messages: [] }); return publish(); },
   command: async input => { window.dispatchEvent(new CustomEvent('pi-kanban:synthetic-command', { detail: structuredClone(input) })); await waitForSyntheticResponse(); throw new Error('合成 UI 预览不执行授权、验收或运行控制。请在真实桌面 Host 中操作。'); },

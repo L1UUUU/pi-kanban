@@ -4,6 +4,9 @@ import type { WorkbenchBridge } from './renderer/types.ts';
 const bridge: WorkbenchBridge = {
   snapshot: () => ipcRenderer.invoke('workbench:snapshot'),
   createProject: () => ipcRenderer.invoke('workbench:createProject'),
+  importConfiguration: () => ipcRenderer.invoke('workbench:importConfiguration'),
+  authorizeModel: input => ipcRenderer.invoke('workbench:authorizeModel', input),
+  prepareModelApproval: input => ipcRenderer.invoke('workbench:prepareModelApproval', input),
   createDemand: input => ipcRenderer.invoke('workbench:createDemand', input),
   command: input => ipcRenderer.invoke('workbench:command', input),
   sendMessage: input => ipcRenderer.invoke('workbench:sendMessage', input),

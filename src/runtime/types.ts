@@ -38,7 +38,7 @@ export interface Observation {
 }
 export interface RuntimeDriver {
   readonly id: string;
-  readonly isolation: 'unverified-windows-candidate' | 'synthetic-process-supervision-only';
+  readonly isolation: 'unverified-windows-candidate' | 'verified-windows-native' | 'synthetic-process-supervision-only';
   setStopHandler?(handler: (runId: string, reason: string) => Promise<void>): void;
   preflight(request: LaunchRequest): void;
   launch(run: RunRecord): Promise<ProcessIdentity>;

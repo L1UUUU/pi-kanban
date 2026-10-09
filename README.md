@@ -52,5 +52,6 @@ Git Hooks、过滤器、fsmonitor 和签名等未验证组合会明确阻塞，�
 - [实施状态、验收证据与剩余条件](docs/implementation-status.md)
 - [安全边界与已知限制](docs/security.md)
 - [开发与测试说明](docs/development.md)
+- [运行配置与有限授权](docs/configuration.md)
 - [需求规则 API](src/domain/README.md)
 - [Windows 原生候选](native/windows/README.md)

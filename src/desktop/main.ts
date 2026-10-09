@@ -6,6 +6,7 @@ import { pathToFileURL } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { assetName, isTrustedSender, WORKBENCH_URL } from './security.ts';
 import { assertFrame } from '../host/protocol.ts';
+import { ConfigurationStore } from '../host/configuration.ts';
 
 protocol.registerSchemesAsPrivileged([{ scheme: 'app', privileges: { standard: true, secure: true, supportFetchAPI: true } }]);
 let window: BrowserWindow | null = null;
@@ -31,8 +32,20 @@ async function startHost(): Promise<void> {
   const version = execFileSync(executable, ['--version'], { encoding: 'utf8', timeout: 5000 }).trim();
   if (!/^v24\./.test(version)) throw new Error(`Expected Node.js 24, received ${version}.`);
   const environment: NodeJS.ProcessEnv = { PI_KANBAN_DATA_DIR: join(app.getPath('userData'), 'host'), NODE_NO_WARNINGS: '1' };
+  if (process.env.PI_KANBAN_GIT && isAbsolute(process.env.PI_KANBAN_GIT)) environment.PI_KANBAN_GIT = process.env.PI_KANBAN_GIT;
   // Native OS loader/temp settings only. No API tokens, shell config, proxy, or HOME.
   for (const key of ['SystemRoot', 'WINDIR', 'TEMP', 'TMP', 'TMPDIR', 'LANG']) if (process.env[key]) environment[key] = process.env[key];
+  // A configured reference selects at most one credential for the trusted Host.
+  // The native Worker environment never inherits it. Importing settings alone
+  // does not grant a request; the Host ledger requires separate finite consent.
+  try {
+    const settings = new ConfigurationStore(join(app.getPath('userData'), 'host', 'configuration')).load();
+    const reference = settings.provider?.credentialRef;
+    if (reference?.startsWith('env:')) {
+      const key = reference.slice(4);
+      if (process.env[key]) environment[key] = process.env[key];
+    }
+  } catch { /* Host diagnostics will show invalid/missing config; no ambient key fallback. */ }
   host = fork(join(app.getAppPath(), 'dist/host/main.mjs'), [], { execPath: executable, execArgv: [], env: environment, stdio: ['ignore', 'ignore', 'pipe', 'ipc'] });
   host.stderr?.on('data', () => { /* Do not forward untrusted logs onto control IPC. */ });
   host.on('message', (value: any) => {
@@ -58,17 +71,34 @@ async function startHost(): Promise<void> {
 }
 
 function registerControl(): void {
-  for (const method of ['snapshot', 'createDemand', 'command', 'sendMessage']) ipcMain.handle(`workbench:${method}`, async (event, params = {}) => {
+  for (const method of ['snapshot', 'createDemand', 'command', 'sendMessage', 'prepareModelApproval', 'authorizeModel']) ipcMain.handle(`workbench:${method}`, async (event, params = {}) => {
     if (!window || event.sender !== window.webContents || !isTrustedSender(event.senderFrame?.url ?? '', event.senderFrame === event.sender.mainFrame)) throw new Error('Untrusted control origin.');
     assertFrame(params);
     const state = await request(method, params);
     window.webContents.send('workbench:state', state);
     return state;
   });
+  ipcMain.handle('workbench:importConfiguration', async event => {
+    if (!window || event.sender !== window.webContents || !isTrustedSender(event.senderFrame?.url ?? '', event.senderFrame === event.sender.mainFrame)) throw new Error('Untrusted control origin.');
+    const selection = await dialog.showOpenDialog(window, { title: '导入运行配置（不会授予模型费用或启动执行）', properties: ['openFile'], filters: [{ name: 'JSON configuration', extensions: ['json'] }] });
+    const state = selection.canceled ? await request('snapshot') : await request('importConfiguration', { filePath: selection.filePaths[0] });
+    window.webContents.send('workbench:state', state); return state;
+  });
   ipcMain.handle('workbench:createProject', async event => {
     if (!window || event.sender !== window.webContents || !isTrustedSender(event.senderFrame?.url ?? '', event.senderFrame === event.sender.mainFrame)) throw new Error('Untrusted control origin.');
     const selection = await dialog.showOpenDialog(window, { title: '选择项目目录（只接入，不会自动开工）', properties: ['openDirectory'] });
-    const state = selection.canceled ? await request('snapshot') : await request('createProject', { rootPath: selection.filePaths[0] });
+    if (selection.canceled) return request('snapshot');
+    const observed = await request('inspectProject', { rootPath: selection.filePaths[0] });
+    let projectInput: Record<string, unknown> = { rootPath: observed.rootPath };
+    if (observed.formalTarget) {
+      const decision = await dialog.showMessageBox(window, { type: 'question', title: '确认项目的固定起点', message: `正式目标：${observed.formalTarget}`, detail: `目录：${observed.rootPath}\n固定起点：${observed.baseline ?? '空仓库，尚无提交'}\n\n接入后只有明确开始规划，才会准备一条需求一个工作区。不会自动实施、推送或合入。`, buttons: ['确认此目标和起点', '仅记录项目', '取消'], defaultId: 0, cancelId: 2 });
+      if (decision.response === 2) return request('snapshot');
+      if (decision.response === 0) projectInput = { ...projectInput, formalTarget: observed.formalTarget, baseline: observed.baseline };
+    } else {
+      const decision = await dialog.showMessageBox(window, { type: 'info', message: '可先记录项目与想法', detail: `Git 准备条件未满足：${observed.blockers.join('\n')}\n不会创建工作区或自动开始实施。`, buttons: ['记录项目', '取消'], defaultId: 0, cancelId: 1 });
+      if (decision.response === 1) return request('snapshot');
+    }
+    const state = await request('createProject', projectInput);
     window.webContents.send('workbench:state', state); return state;
   });
 }

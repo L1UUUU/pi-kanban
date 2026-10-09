@@ -81,7 +81,7 @@ int ProbeChild() {
   const bool db_read = CanRead(root/L"host.sqlite", &e_db);
   const bool git_read = CanRead(root/L"shared-git"/L"object", &e_git);
   wchar_t leaked[64]{}; const bool env_leak = GetEnvironmentVariableW(L"FORBIDDEN_HOST_CREDENTIAL", leaked, 64) != 0;
-  WSADATA sockets{}; const bool sockets_ok = WSAStartup(MAKEWORD(2,2), &sockets) == 0;
+  WSADATA sockets{}; const int wsa_startup_error = WSAStartup(MAKEWORD(2,2), &sockets); const bool sockets_ok = wsa_startup_error == 0;
   SOCKET socket_value = sockets_ok ? socket(AF_INET, SOCK_STREAM, IPPROTO_TCP) : INVALID_SOCKET;
   sockaddr_in addr{}; addr.sin_family = AF_INET; addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK); addr.sin_port = htons(static_cast<u_short>(std::stoi(port_text)));
   bool network = false; int network_error = 0;
@@ -95,13 +95,15 @@ int ProbeChild() {
   std::wstring command = L"\"" + Self() + L"\" --descendant \"" + (root/L"scratch"/L"child-heartbeat.txt").wstring() + L"\"";
   STARTUPINFOW startup{}; startup.cb=sizeof(startup); PROCESS_INFORMATION spawned{};
   const bool spawned_child=!!CreateProcessW(Self().c_str(),command.data(),nullptr,nullptr,FALSE,CREATE_NO_WINDOW,nullptr,nullptr,&startup,&spawned);
+  const DWORD child_spawn_error=spawned_child?0:GetLastError();
   if(spawned_child){CloseHandle(spawned.hThread);CloseHandle(spawned.hProcess);}
   PROCESS_INFORMATION escape{};const bool escaped=!!CreateProcessW(Self().c_str(),command.data(),nullptr,nullptr,FALSE,CREATE_NO_WINDOW|CREATE_BREAKAWAY_FROM_JOB,nullptr,nullptr,&startup,&escape);
+  const DWORD breakaway_error=escaped?0:GetLastError();
   if(escaped){TerminateProcess(escape.hProcess,1);CloseHandle(escape.hThread);CloseHandle(escape.hProcess);}
-  const bool expected=own_read&&(own_write==(role==L"implementation"))&&!other_read&&!db_read&&!git_read&&!env_leak&&!network&&spawned_child&&!escaped;
+  const bool expected=own_read&&(own_write==(role==L"implementation"))&&!other_read&&!db_read&&!git_read&&!env_leak&&!network&&!escaped;
   std::ostringstream report;report<<"{\"phase\":\"native-child-probes\",\"role\":\""<<(role==L"implementation"?"implementation":"review")<<"\",\"ownRead\":"<<own_read<<",\"ownWrite\":"<<own_write
     <<",\"otherRead\":"<<other_read<<",\"hostDbRead\":"<<db_read<<",\"sharedGitRead\":"<<git_read<<",\"environmentLeak\":"<<env_leak<<",\"loopbackConnected\":"<<network
-    <<",\"networkError\":"<<network_error<<",\"childSpawned\":"<<spawned_child<<",\"breakawaySucceeded\":"<<escaped<<",\"readError\":"<<e_read<<",\"writeError\":"<<e_write<<",\"crossReadError\":"<<e_other<<",\"passed\":"<<expected<<"}\n";
+    <<",\"networkError\":"<<network_error<<",\"wsaStartupError\":"<<wsa_startup_error<<",\"childSpawned\":"<<spawned_child<<",\"childSpawnError\":"<<child_spawn_error<<",\"breakawaySucceeded\":"<<escaped<<",\"breakawayError\":"<<breakaway_error<<",\"readError\":"<<e_read<<",\"writeError\":"<<e_write<<",\"crossReadError\":"<<e_other<<",\"passed\":"<<expected<<"}\n";
   const auto text=report.str();DWORD written=0;Require(!!WriteFile(GetStdHandle(STD_OUTPUT_HANDLE),text.data(),static_cast<DWORD>(text.size()),&written,nullptr),"private report");
   Heartbeat(root/L"scratch"/L"parent-heartbeat.txt"); return 0;
 }
@@ -117,7 +119,7 @@ void RunRole(const fs::path& root,const std::wstring& role,SOCKET listener) {
   Acl(root/L"bin"/L"entry.fixture",profile.sid,FILE_GENERIC_READ);
   Acl(root/L"own",profile.sid,FILE_GENERIC_READ|(role==L"implementation"?FILE_GENERIC_WRITE:0),true);
   Acl(root/L"own"/L"source.txt",profile.sid,FILE_GENERIC_READ|(role==L"implementation"?FILE_GENERIC_WRITE:0));
-  fs::remove(root/L"scratch"/L"parent-heartbeat.txt");fs::remove(root/L"scratch"/L"child-heartbeat.txt");
+  fs::remove(root/L"scratch"/L"parent-heartbeat.txt");fs::remove(root/L"scratch"/L"child-heartbeat.txt");fs::remove(root/L"scratch"/L"mediated-heartbeat.txt");
   Acl(root/L"scratch",profile.sid,FILE_ALL_ACCESS,true);
   SECURITY_ATTRIBUTES sa{sizeof(sa),nullptr,TRUE};HANDLE in_read=nullptr,in_write=nullptr,out_read=nullptr,out_write=nullptr,log_read=nullptr,log_write=nullptr;
   Require(!!CreatePipe(&in_read,&in_write,&sa,0)&&!!CreatePipe(&out_read,&out_write,&sa,0)&&!!CreatePipe(&log_read,&log_write,&sa,0),"private pipes");
@@ -139,13 +141,22 @@ void RunRole(const fs::path& root,const std::wstring& role,SOCKET listener) {
   Require(available>0&&available<16384,"bounded private report timeout");std::vector<char> report(available);DWORD received=0;
   Require(!!ReadFile(out_read,report.data(),available,&received,nullptr),"private report read");const std::string raw(report.data(),received);std::cout<<raw<<std::flush;
   Require(raw.find("\"passed\":1")!=std::string::npos,"one or more access probes failed");
-  DWORD active=0;Require(job.ActiveProcesses(&active)==ERROR_SUCCESS&&active>=2,"actual descendant membership");
+  // Direct child creation remains recorded (including its failure). The supported command
+  // path is native-mediated into the SAME SID and Job, never unrestricted Host execution.
+  SECURITY_ATTRIBUTES tool_sa{sizeof(tool_sa),nullptr,TRUE};HANDLE tool_in=nullptr,tool_in_write=nullptr,tool_out=nullptr,tool_out_write=nullptr;
+  Require(!!CreatePipe(&tool_in,&tool_in_write,&tool_sa,0)&&!!CreatePipe(&tool_out,&tool_out_write,&tool_sa,0),"mediated tool pipes");
+  SetHandleInformation(tool_out,HANDLE_FLAG_INHERIT,0);CloseHandle(tool_in_write);PROCESS_INFORMATION tool{};
+  const DWORD mediated=job.SpawnNodeCheck(d,{L"--descendant",(root/L"scratch"/L"mediated-heartbeat.txt").wstring()},tool_in,tool_out_write,&tool);
+  std::cout<<"{\"phase\":\"native-mediated-tool\",\"status\":"<<mediated<<",\"pid\":"<<tool.dwProcessId<<",\"sameJobAndSidVerified\":"<<(mediated==0)<<"}"<<std::endl;
+  Require(mediated==ERROR_SUCCESS,"pinned native-mediated command must run under the same SID and Job");
+  CloseHandle(tool_in);CloseHandle(tool_out_write);CloseHandle(tool.hThread);CloseHandle(tool.hProcess);
+  DWORD active=0;Require(job.ActiveProcesses(&active)==ERROR_SUCCESS&&active>=2,"actual mediated command membership");
   Sleep(120);const DWORD stopped=job.Stop();Require(stopped==ERROR_SUCCESS,"entire Job stop");
-  const auto parent_size=fs::file_size(root/L"scratch"/L"parent-heartbeat.txt"),child_size=fs::file_size(root/L"scratch"/L"child-heartbeat.txt");
-  Sleep(120);Require(fs::file_size(root/L"scratch"/L"parent-heartbeat.txt")==parent_size&&fs::file_size(root/L"scratch"/L"child-heartbeat.txt")==child_size,"writes quiescent after actual Job stop");
+  const auto parent_size=fs::file_size(root/L"scratch"/L"parent-heartbeat.txt"),child_size=fs::file_size(root/L"scratch"/L"mediated-heartbeat.txt");
+  Sleep(120);Require(fs::file_size(root/L"scratch"/L"parent-heartbeat.txt")==parent_size&&fs::file_size(root/L"scratch"/L"mediated-heartbeat.txt")==child_size,"writes quiescent after actual Job stop");
   Require(job.ActiveProcesses(&active)==ERROR_SUCCESS&&active==0,"Job active processes zero");
   std::cout<<"{\"phase\":\"native-stop\",\"status\":"<<stopped<<",\"activeProcesses\":"<<active<<",\"writesQuiescent\":true,\"fullG1\":false}"<<std::endl;
-  CloseHandle(in_write);CloseHandle(out_read);CloseHandle(log_read);
+  CloseHandle(in_write);CloseHandle(out_read);CloseHandle(log_read);CloseHandle(tool_out);
 }
 } // namespace
 int wmain(int argc,wchar_t** argv) {

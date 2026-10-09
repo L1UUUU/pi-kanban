@@ -1,11 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { HostApplication } from '../src/host/application.ts';
 import { MAX_FRAME_BYTES, parseRequest } from '../src/host/protocol.ts';
 import { assetName, isTrustedSender, WORKBENCH_URL } from '../src/desktop/security.ts';
+import { emptyConfiguration } from '../src/host/configuration.ts';
 
 test('desktop control has a bounded allowlist, no worker report or raw service access', () => {
   assert.deepEqual(parseRequest({ id: 'r', method: 'snapshot' }), { id: 'r', method: 'snapshot', params: {} });
@@ -62,5 +63,46 @@ test('Host restart preserves user stop and messages, and does not silently start
     assert.equal(app.snapshot().demands[0].control, 'paused');
     assert.equal(app.store.listRuns().length, 0);
     assert.deepEqual(app.shutdown(), { safe: true, blockers: [] });
+  } finally { app.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('configuration import is not spending authority; explicit finite approval is scoped, version-bound and cannot reset budget', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'pi-host-approval-'));
+  const app = new HostApplication();
+  try {
+    let state = app.handle('createProject', { rootPath: directory });
+    state = app.handle('createDemand', { requestId: 'approval-demand', projectId: state.projects[0].id, title: 'Synthetic scope', description: '' });
+    const demand = state.demands[0], config = emptyConfiguration();
+    config.provider = { provider: 'synthetic', modelId: 'fixture', destination: 'https://synthetic.invalid/v1', credentialRef: 'env:SYNTHETIC_REF', contextPolicy: 'exact-materials-only', data: [{ id: 'fixture', sha256: 'a'.repeat(64) }], allowedRoles: ['planning'], limits: { maxRequests: 3, maxTokens: 100, maxCostMicros: 300, currency: 'USD', expiresAt: new Date(Date.now()+60_000).toISOString(), meteringPolicy: 'synthetic-test' } };
+    const filePath = join(directory, 'settings.json'); writeFileSync(filePath, JSON.stringify(config));
+    state = app.handle('importConfiguration', { filePath });
+    assert.equal(app.store.db.prepare('SELECT count(*) n FROM model_grants').get()!.n, 0);
+    const approval = { requestId: 'approve-once', demandId: demand.id, expectedVersion: demand.version, configurationDigest: state.configuration!.configurationDigest, resourceScope: 'demand-worktree-private-runtime-v1' };
+    state = app.handle('authorizeModel', approval);
+    const grantId = state.configuration!.authorization!.grantId;
+    assert.equal(app.budget.snapshot(grantId).limits.requests, 3);
+    app.handle('authorizeModel', approval);
+    app.handle('authorizeModel', { ...approval, requestId: 'same-scope-again' });
+    assert.equal(app.store.db.prepare('SELECT count(*) n FROM model_grants').get()!.n, 1);
+    assert.equal(app.store.db.prepare('SELECT runtime_scope FROM host_model_decisions').get()!.runtime_scope, 'demand-worktree-private-runtime-v1');
+    assert.equal(app.budget.snapshot(grantId).requests, 0); assert.equal(state.runtime.executionEnabled, false);
+    assert.throws(() => app.handle('authorizeModel', { ...approval, configurationDigest: 'b'.repeat(64) }), /changed content/);
+    app.handle('importConfiguration', { filePath });
+    assert.throws(() => app.handle('authorizeModel', { ...approval, requestId: 'stale-approval' }), /changed/);
+  } finally { app.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test('Host shutdown remains unsafe for durable orphan auxiliary execution after reconstruction', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'pi-host-aux-')), database = join(directory, 'host.sqlite');
+  let app = new HostApplication(database);
+  try {
+    const request = { demandId: 'synthetic-demand', role: 'boundary-review', writes: false, grantId: 'synthetic-old-planner', workspace: directory, profileId: 'synthetic', timeoutMs: 1000, maxOutputBytes: 1000 };
+    app.store.db.prepare('INSERT INTO runtime_runs VALUES(?,?,?,?,?,?,?,?,?,?,?,?)').run('synthetic-orphan','synthetic-demand','synthetic-generation','unknown',0,0,JSON.stringify(request),null,'synthetic interruption',new Date().toISOString(),new Date().toISOString(),null);
+    assert.equal(app.shutdown().safe, false);
+    app.close(); app = new HostApplication(database);
+    const stopped = await app.requestShutdown();
+    assert.equal(stopped.safe, false); assert.match(stopped.blockers.join(' '), /boundary-review|boundary review/);
+    assert.equal(app.coordinator.supervisor.list()[0].state, 'stop_requested');
+    assert.equal(app.coordinator.supervisor.list()[0].stopReason, 'synthetic interruption');
   } finally { app.close(); rmSync(directory, { recursive: true, force: true }); }
 });

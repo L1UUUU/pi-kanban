@@ -28,6 +28,8 @@ ctest --test-dir build/native -C Release --output-on-failure
 
 The native smoke manages unique temporary synthetic identities/resources. Preserve `build/native/Testing/Temporary/LastTest.log` including failures. Do not install a new backend or disable failed negative cases to make the suite green. The product targets Windows 11 x64/NTFS; hosted Windows Server CI is useful partial Win32 evidence, not proof of that target combination.
 
+The locked Worker is emitted as `dist/worker/main.mjs`, including SDK dependencies rather than exposing the Host's node_modules directory. Runtime evidence binds its exact byte digest. On Windows, set `PI_KANBAN_GIT` to the verified absolute git.exe path before `npm start`. The launcher forwards only that path, necessary OS loader fields and the single explicitly configured `env:NAME` credential to the trusted Host. No credential enters the Worker. Restart after changing the referenced environment credential name.
+
 ## Completing live validation
 
 The original actual `design-feature` source and all dependencies must be supplied, hashed and reviewed. Implementation/Review method candidates must be explicitly versioned. A real model requires provider/model, Host credential reference, exact data/destination authorization, finite request/token/cost policy and metering behavior. The complete native Worker + private channel must be verified for the chosen Node/Git Bash/Pi build before any live fixture run. Finally, run a dedicated real GitHub merge/read-only verification + later-demand reuse scenario and user acceptance; mock observations cannot substitute.

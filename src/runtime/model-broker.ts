@@ -8,7 +8,7 @@ export interface BoundedTransportRequest {
   requestId:string; provider:string; modelId:string; destination:string; credentialRef:string;
   materials:readonly BrokerMaterial[]; maxTokens:number; signal:AbortSignal;
 }
-export type BrokerJsonValue = null | boolean | number | string | BrokerJsonValue[] | {[key:string]:BrokerJsonValue};
+export type BrokerJsonValue = null | boolean | number | string | readonly BrokerJsonValue[] | {[key:string]:BrokerJsonValue};
 export interface ProviderResponse { text:string; toolCalls?:{id:string;name:string;arguments:{[key:string]:BrokerJsonValue}}[]; usage?:{tokens:number;costMicros:number;source:string} }
 /** This is trusted Host code, never a Worker-provided fetch callback or arbitrary URL proxy. */
 export interface BoundedProviderTransport {

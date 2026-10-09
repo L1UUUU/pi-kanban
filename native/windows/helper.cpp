@@ -7,6 +7,8 @@
 #include <iostream>
 #include <mutex>
 #include <thread>
+#include <atomic>
+#include <algorithm>
 using namespace pi_kanban;
 namespace {
 constexpr DWORD kMax=1024*1024;
@@ -26,6 +28,32 @@ LaunchDescriptor Descriptor(const Json& input){
   d.node_executable=input.at(L"nodeExecutable").str();d.worker_entry=input.at(L"workerEntry").str();d.workspace=input.at(L"workspace").str();d.scratch=input.at(L"scratch").str();d.node_sha256=Hash(input.at(L"nodeSha256"));d.worker_sha256=Hash(input.at(L"workerSha256"));
   d.policy_evidence=input.at(L"policyEvidence").str();d.acl_evidence=input.at(L"aclEvidence").str();d.private_channel_evidence=input.at(L"privateChannelEvidence").str();d.timeout_ms=Dword(input.at(L"timeoutMs"));d.process_limit=Dword(input.at(L"processLimit"));d.memory_limit_bytes=static_cast<SIZE_T>(input.at(L"memoryLimitBytes").num());d.output_limit_bytes=input.at(L"outputLimitBytes").num();return d;
 }
+std::string Base64(const std::string& bytes){static constexpr char chars[]="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";std::string out;for(size_t i=0;i<bytes.size();i+=3){const uint32_t a=static_cast<unsigned char>(bytes[i]),b=i+1<bytes.size()?static_cast<unsigned char>(bytes[i+1]):0,c=i+2<bytes.size()?static_cast<unsigned char>(bytes[i+2]):0;const uint32_t n=(a<<16)|(b<<8)|c;out+=chars[(n>>18)&63];out+=chars[(n>>12)&63];out+=i+1<bytes.size()?chars[(n>>6)&63]:'=';out+=i+2<bytes.size()?chars[n&63]:'=';}return out;}
+void Check(ControlledJob& job,const LaunchDescriptor& d,const Json command,std::atomic<bool>& checking){
+  try{
+    const auto id=ToUtf8(JsonString(command.at(L"requestId").str()));const auto& input_args=command.at(L"args");
+    if(command.fields.size()!=5||input_args.kind!=Json::Kind::array||input_args.items.empty()||input_args.items.size()>64)throw std::runtime_error("invalid check arguments");
+    const DWORD timeout=Dword(command.at(L"timeoutMs")),limit=Dword(command.at(L"maxOutputBytes"));if(!timeout||timeout>d.timeout_ms||timeout>120000||!limit||limit>524288)throw std::runtime_error("invalid check bounds");
+    std::vector<std::wstring> args;for(const auto& item:input_args.items)args.push_back(item.str());
+    SECURITY_ATTRIBUTES security{sizeof(security),nullptr,TRUE};HANDLE in_read=nullptr,in_write=nullptr,out_read=nullptr,out_write=nullptr;
+    if(!CreatePipe(&in_read,&in_write,&security,0)||!CreatePipe(&out_read,&out_write,&security,0))throw std::runtime_error("check pipes");
+    SetHandleInformation(out_read,HANDLE_FLAG_INHERIT,0);CloseHandle(in_write);
+    std::vector<DWORD> baseline;if(job.ProcessIds(baseline))throw std::runtime_error("Job census before check");
+    PROCESS_INFORMATION process{};const DWORD launched=job.SpawnNodeCheck(d,args,in_read,out_write,&process);CloseHandle(in_read);CloseHandle(out_write);
+    if(launched){CloseHandle(out_read);Event("{\"type\":\"native.check-result\",\"requestId\":"+id+",\"generation\":\""+ToUtf8(d.generation)+"\",\"pid\":0,\"status\":"+std::to_string(launched)+",\"reason\":\"launch-failed\",\"exitCode\":null,\"outputBase64\":\"\",\"arguments\":"+ToUtf8(Serialize(input_args))+"}");checking=false;return;}
+    CloseHandle(process.hThread);std::atomic<bool> output_done=false,overflow=false;std::string output;
+    std::thread reader([&]{char buffer[4096];DWORD received=0;while(ReadFile(out_read,buffer,sizeof(buffer),&received,nullptr)&&received){if(output.size()+received>limit){overflow=true;Event("{\"type\":\"native.limit\",\"reason\":\"check-output-limit\"}");job.Stop();break;}output.append(buffer,received);}output_done=true;});
+    const DWORD waited=WaitForSingleObject(process.hProcess,timeout);std::string reason="exited";
+    if(waited!=WAIT_OBJECT_0){reason="timeout";Event("{\"type\":\"native.limit\",\"reason\":\"check-timeout\"}");job.Stop();WaitForSingleObject(process.hProcess,5000);}
+    DWORD exit_code=0;GetExitCodeProcess(process.hProcess,&exit_code);CloseHandle(process.hProcess);
+    std::vector<DWORD> after;if(job.ProcessIds(after))throw std::runtime_error("Job census after check");
+    if(std::any_of(after.begin(),after.end(),[&](DWORD pid){return pid!=process.dwProcessId&&std::find(baseline.begin(),baseline.end(),pid)==baseline.end();})){reason="descendants-survived";Event("{\"type\":\"native.limit\",\"reason\":\"check-descendants-survived\"}");job.Stop();}
+    for(unsigned i=0;i<25&&!output_done;i++)Sleep(10);
+    if(!output_done){reason="descendants-survived";job.Stop();}
+    reader.join();CloseHandle(out_read);if(overflow)reason="output-limit";
+    Event("{\"type\":\"native.check-result\",\"requestId\":"+id+",\"generation\":\""+ToUtf8(d.generation)+"\",\"pid\":"+std::to_string(process.dwProcessId)+",\"status\":0,\"reason\":\""+reason+"\",\"exitCode\":"+std::to_string(exit_code)+",\"outputBase64\":\""+Base64(output)+"\",\"arguments\":"+ToUtf8(Serialize(input_args))+"}");checking=false;
+  }catch(...){Event("{\"type\":\"native.error\",\"reason\":\"check-failed-unconfirmed\"}");job.Stop();ExitProcess(ERROR_INVALID_DATA);}
+}
 void Observation(ControlledJob& job,const std::string& generation){std::vector<DWORD> ids;const DWORD error=job.ProcessIds(ids);std::string list;for(DWORD pid:ids){if(!list.empty())list+=",";list+=std::to_string(pid);}Event("{\"type\":\"native.observation\",\"generation\":\""+generation+"\",\"status\":"+std::to_string(error)+",\"activePids\":["+list+"]}");}
 }
 int wmain(){
@@ -43,15 +71,17 @@ int wmain(){
     if(launch){resources.Revoke();Event("{\"type\":\"native.launch-failed\",\"status\":"+std::to_string(launch)+",\"stage\":\""+job.LastStage()+"\"}");return 2;}
     const auto& identity=job.Identity();const uint64_t birth=(static_cast<uint64_t>(identity.creation_time.dwHighDateTime)<<32)|identity.creation_time.dwLowDateTime;
     Event("{\"type\":\"native.started\",\"generation\":\""+generation+"\",\"pid\":"+std::to_string(identity.pid)+",\"birth\":\""+std::to_string(birth)+"\"}");
+    std::atomic<bool> checking=false;
     std::mutex queue_mutex;std::condition_variable queue_ready;std::deque<std::string> queue;
     // All threads are bounded to this helper process. Process exit closes the only Job handle.
     std::thread([&]{for(;;){std::string body;{std::unique_lock lock(queue_mutex);queue_ready.wait(lock,[&]{return !queue.empty();});body=std::move(queue.front());queue.pop_front();}if(!Frame(in_write,body))ExitProcess(ERROR_BROKEN_PIPE);}}).detach();
     std::thread([&]{try{uint64_t bytes=0;std::string body;while(ReadFrame(out_read,body)){bytes+=body.size();if(bytes>d.output_limit_bytes){Event("{\"type\":\"native.limit\",\"reason\":\"output-limit\"}");job.Stop();ExitProcess(ERROR_BUFFER_OVERFLOW);}JsonParser(body).parse();if(!Frame(GetStdHandle(STD_OUTPUT_HANDLE),body))ExitProcess(ERROR_BROKEN_PIPE);}}catch(...){job.Stop();ExitProcess(ERROR_INVALID_DATA);}}).detach();
     std::thread([&]{uint64_t total=0;char bytes[4096];DWORD read=0;while(ReadFile(log_read,bytes,sizeof(bytes),&read,nullptr)&&read){total+=read;if(total>d.output_limit_bytes){Event("{\"type\":\"native.limit\",\"reason\":\"log-limit\"}");job.Stop();ExitProcess(ERROR_BUFFER_OVERFLOW);}}}).detach();
-    std::thread([&]{for(;;){Sleep(25);DWORD active=0;if(job.ActiveProcesses(&active)==ERROR_SUCCESS&&!active){const DWORD cleanup=resources.Revoke();Event("{\"type\":\"native.resources\",\"phase\":\"revoke\",\"generation\":\""+generation+"\",\"status\":"+std::to_string(cleanup)+"}");Observation(job,generation);ExitProcess(0);}}}).detach();
+    std::thread([&]{for(;;){Sleep(25);DWORD active=0;if(!checking&&job.ActiveProcesses(&active)==ERROR_SUCCESS&&!active){const DWORD cleanup=resources.Revoke();Event("{\"type\":\"native.resources\",\"phase\":\"revoke\",\"generation\":\""+generation+"\",\"status\":"+std::to_string(cleanup)+"}");Observation(job,generation);ExitProcess(0);}}}).detach();
     try { std::string body;while(ReadFrame(GetStdHandle(STD_INPUT_HANDLE),body)){
       const auto command=JsonParser(body).parse();const auto type=command.at(L"type").str();
-      if(type==L"stop"&&command.fields.size()==1){const DWORD stopped=job.Stop();if(!stopped){const DWORD cleanup=resources.Revoke();Event("{\"type\":\"native.resources\",\"phase\":\"revoke\",\"generation\":\""+generation+"\",\"status\":"+std::to_string(cleanup)+"}");}Observation(job,generation);ExitProcess(stopped==0?0:3);}
+      if(type==L"run-node"){if(checking.exchange(true))throw std::runtime_error("check already active");std::thread([&,command]{Check(job,d,command,checking);}).detach();continue;}
+      if(type==L"stop"&&command.fields.size()==1){const DWORD stopped=job.Stop();for(unsigned n=0;n<500&&checking;n++)Sleep(10);if(!stopped){const DWORD cleanup=resources.Revoke();Event("{\"type\":\"native.resources\",\"phase\":\"revoke\",\"generation\":\""+generation+"\",\"status\":"+std::to_string(cleanup)+"}");}Observation(job,generation);ExitProcess(stopped==0?0:3);}
       if(type==L"query"&&command.fields.size()==1){Observation(job,generation);continue;}
       if(type!=L"worker-input"||command.fields.size()!=2)throw std::runtime_error("unknown native control command");
       const auto payload=ToUtf8(Serialize(command.at(L"payload")));std::lock_guard lock(queue_mutex);if(queue.size()>=4)throw std::runtime_error("worker input backpressure");queue.push_back(payload);queue_ready.notify_one();

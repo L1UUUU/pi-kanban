@@ -27,6 +27,6 @@ export interface RpcRequest { id: string; method: string; params: Record<string,
 export function parseRequest(value: unknown): RpcRequest {
   assertFrame(value); const frame = record(value);
   const method = text(frame.method, 'method', 40);
-  if (!new Set(['snapshot', 'createProject', 'createDemand', 'command', 'sendMessage', 'shutdown']).has(method)) throw new ProtocolError('UNKNOWN_METHOD', 'This action is not part of the desktop control protocol.');
+  if (!new Set(['snapshot', 'inspectProject', 'createProject', 'createDemand', 'command', 'sendMessage', 'importConfiguration', 'prepareModelApproval', 'authorizeModel', 'shutdown']).has(method)) throw new ProtocolError('UNKNOWN_METHOD', 'This action is not part of the desktop control protocol.');
   return { id: id(frame.id, 'request identifier'), method, params: frame.params === undefined ? {} : record(frame.params) };
 }

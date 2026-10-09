@@ -1,15 +1,17 @@
-import { basename, resolve } from 'node:path';
-import { lstatSync, realpathSync } from 'node:fs';
+import { basename, dirname, join, resolve } from 'node:path';
+import { lstatSync, realpathSync, mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { createHash } from 'node:crypto';
 import { WorkflowService, WorkbenchStore } from '../domain/index.ts';
 import type { Demand, UserCommand } from '../domain/types.ts';
 import type { ViewState, DemandView } from '../desktop/renderer/types.ts';
 import { COMMANDS, ProtocolError, id, record, revision, text } from './protocol.ts';
-import { WindowsCandidateDriver } from '../runtime/windows-driver.ts';
 import { ModelBudgetLedger } from '../runtime/budget.ts';
 import { WorkspaceService, ImmutableObjectStore } from '../workspace/index.ts';
 import { KnowledgeService } from '../knowledge/index.ts';
 import { ExecutionCoordinator } from './coordinator.ts';
+import { ConfigurationStore, configurationDigest, createModelGrant, loadMethods } from './configuration.ts';
+import { createProductionServices } from './production.ts';
 
 export const EXECUTION_BLOCKERS = [
   'Windows AppContainer / Job Objects 运行组合尚未验证；不会在无隔离环境启动 Agent。',
@@ -25,6 +27,9 @@ export class HostApplication {
   readonly coordinator: ExecutionCoordinator;
   readonly knowledge: KnowledgeService;
   readonly budget: ModelBudgetLedger;
+  readonly configuration: ConfigurationStore;
+  readonly production: ReturnType<typeof createProductionServices>;
+  #temporaryConfiguration: string | undefined;
   #workspace?: WorkspaceService;
   #closing = false;
   #user;
@@ -32,31 +37,47 @@ export class HostApplication {
     this.store = new WorkbenchStore(databasePath);
     this.workflow = new WorkflowService(this.store);
     this.#user = this.workflow.trustedUser('local-desktop-owner');
+    const configDirectory = databasePath === ':memory:' ? this.#temporaryConfiguration = mkdtempSync(join(tmpdir(), 'pi-config-host-')) : join(dirname(resolve(databasePath)), 'configuration');
+    this.configuration = new ConfigurationStore(configDirectory);
     this.store.db.exec('CREATE TABLE IF NOT EXISTS host_snapshot_sequence(singleton INTEGER PRIMARY KEY CHECK(singleton=1), value INTEGER NOT NULL); INSERT OR IGNORE INTO host_snapshot_sequence VALUES(1,0)');
+    this.store.db.exec('CREATE TABLE IF NOT EXISTS host_model_decisions(request_id TEXT PRIMARY KEY, input_hash TEXT NOT NULL, demand_id TEXT NOT NULL, configuration_digest TEXT NOT NULL, grant_id TEXT NOT NULL, decision_id TEXT NOT NULL, created_at TEXT NOT NULL)');
+    this.store.db.exec('CREATE TABLE IF NOT EXISTS host_project_baselines(project_id TEXT PRIMARY KEY, baseline TEXT, formal_target TEXT NOT NULL)');
+    if (!this.store.db.prepare('PRAGMA table_info(host_model_decisions)').all().some(column => column.name === 'runtime_scope')) this.store.db.exec("ALTER TABLE host_model_decisions ADD COLUMN runtime_scope TEXT NOT NULL DEFAULT 'none'");
     this.knowledge = new KnowledgeService({ db: this.store.db, resolveStore: projectId => {
       const project = this.workspace.getProject(projectId);
       return ImmutableObjectStore.open(project.anchorPath, projectId);
     } });
-    this.budget = new ModelBudgetLedger(this.store.db, () => { throw new ProtocolError('MODEL_AUTHORIZATION_MISSING', 'No trusted model/data/spend approval adapter has been configured.'); });
-    this.coordinator = new ExecutionCoordinator(this.store, this.workflow, new WindowsCandidateDriver(), {
-      inspect: () => ({ profileVerified: false, budgetAvailable: false, workspaceVerified: false, blockers: EXECUTION_BLOCKERS }),
-      launchFor: () => { throw new ProtocolError('ISOLATION_UNVERIFIED', 'No verified launch descriptor is available.'); },
-      verifyWorkspaceAfterStop: () => false,
-      verifyReport: () => { throw new ProtocolError('WORKER_CHANNEL_UNAVAILABLE', 'No verified private Worker channel is connected.'); },
+    this.budget = new ModelBudgetLedger(this.store.db, grant => {
+      const decision = this.store.db.prepare('SELECT * FROM host_model_decisions WHERE decision_id=? AND demand_id=? AND grant_id=?').get(grant.decisionId, grant.demandId, grant.id);
+      if (!decision) throw new ProtocolError('MODEL_AUTHORIZATION_MISSING', 'No independently recorded trusted model/data/spend approval exists.');
     });
+    this.production = createProductionServices({ store: this.store, workflow: this.workflow, configuration: () => this.configuration.load(), workspace: () => this.workspace, knowledge: this.knowledge, budget: this.budget, stateDirectory: join(configDirectory, 'runtime') });
+    this.coordinator = new ExecutionCoordinator(this.store, this.workflow, this.production.driver, this.production.prerequisites);
+    this.production.bindCoordinator(this.coordinator);
   }
   /** Host-only lazy service: absent Windows Git configuration does not prevent
    * users recording ideas. It blocks only repository preparation/execution. */
   get workspace(): WorkspaceService {
     return this.#workspace ??= new WorkspaceService({ db: this.store.db, gitExecutable: process.env.PI_KANBAN_GIT });
   }
+  inspectProject(input: unknown) {
+    const params = record(input), rootPath = realpathSync(resolve(text(params.rootPath, 'project directory', 4096)));
+    try {
+      const formalTarget = this.workspace.git.branch(rootPath), baseline = this.workspace.git.head(rootPath);
+      return { rootPath, formalTarget, baseline, blockers: [] as string[] };
+    } catch (error) { return { rootPath, formalTarget: null, baseline: null, blockers: [error instanceof Error ? error.message : 'Project Git preparation is unavailable.'] }; }
+  }
   snapshot(): ViewState {
     this.store.db.prepare('UPDATE host_snapshot_sequence SET value=value+1 WHERE singleton=1').run();
+    const configuration = this.configuration.inspect();
+    const runtime = this.production.diagnostics();
+    const approval = this.store.db.prepare('SELECT * FROM host_model_decisions WHERE configuration_digest=? ORDER BY rowid DESC LIMIT 1').get(configuration.configurationDigest);
     return {
       sequence: Number(this.store.db.prepare('SELECT value FROM host_snapshot_sequence WHERE singleton=1').get()!.value),
       projects: this.store.listProjects().map(p => ({ id: p.id, name: p.name, rootPath: p.rootPath })),
       demands: this.store.listDemands().map(d => this.#view(d)),
-      runtime: { platform: process.platform, node: process.version, executionEnabled: false, blockers: [...EXECUTION_BLOCKERS], connection: 'connected' },
+      runtime: { platform: process.platform, node: process.version, executionEnabled: runtime.executionEnabled, blockers: [...new Set([...runtime.blockers, ...configuration.methods.flatMap(method => method.blockers), ...configuration.provider.blockers])], connection: 'connected', model: configuration.configuration.provider?.modelId },
+      configuration: { ...configuration, authorization: approval ? { demandId: String(approval.demand_id), grantId: String(approval.grant_id), configurationDigest: String(approval.configuration_digest) } : undefined },
     };
   }
   #view(d: Demand): DemandView {
@@ -68,7 +89,7 @@ export class HostApplication {
       id: d.id, projectId: d.projectId, title: d.title, description: d.description, version: d.revision, phase: d.phase, control: d.control,
       plan: plan ? { id: plan.id, scope: plan.scope, ready: plan.ready, confirmed: d.confirmedPlanId === plan.id, specPath: plan.spec.location, requiredChecks: plan.requiredChecks.map(c => c.name) } : undefined,
       result: result ? { id: result.id, contentId: result.contentId, notes: result.notes, createdAt: result.createdAt, codeRef: result.K.location, knowledgeRefs: result.N.map(n => n.id), accepted: d.acceptances.some(a => a.resultId === result.id && a.decision === 'accepted') } : undefined,
-      blockers: [...d.blockedReasons, ...(d.planningStarted && d.control === 'active' && !result ? EXECUTION_BLOCKERS : [])],
+      blockers: [...d.blockedReasons, ...(d.planningStarted && d.control === 'active' && !result ? this.production.diagnostics(d.id).blockers : [])],
       activities: this.store.history(d.id).slice(-200).map((h, index) => ({ id: `${d.id}-${index}`, kind: 'workflow', title: h.kind, timestamp: h.createdAt, status: 'complete' })),
       messages: d.messages.map(m => ({ id: m.id, role: 'user', text: m.text, state: m.state })),
       checks: d.checks.map(c => ({ id: c.id, name: plan?.requiredChecks.find(r => r.id === c.requirementId)?.name ?? c.requirementId, status: c.status, evidence: c.evidence.location, contentId: c.contentId })),
@@ -88,9 +109,62 @@ export class HostApplication {
         const stat = lstatSync(rootPath);
         if (!stat.isDirectory() || stat.isSymbolicLink()) throw new ProtocolError('INVALID_PROJECT', 'Select a real project directory.');
         const realPath = realpathSync(rootPath);
-        if (this.store.listProjects().some(p => p.rootPath === realPath)) throw new ProtocolError('PROJECT_EXISTS', 'This project is already connected.');
-        this.workflow.createProject({ name: basename(realPath), rootPath: realPath });
+        const existing = this.store.listProjects().find(p => p.rootPath === realPath);
+        const project = existing ?? this.workflow.createProject({ name: basename(realPath), rootPath: realPath, methods: this.production.captureMethods() });
+        if (params.formalTarget !== undefined) {
+          const observed = this.inspectProject({ rootPath: realPath });
+          if (observed.formalTarget !== params.formalTarget || observed.baseline !== params.baseline) throw new ProtocolError('PROJECT_BASE_CHANGED', 'The selected formal branch or exact baseline changed before confirmation.');
+          this.workspace.bindProject({ projectId: project.id, anchorPath: realPath, formalTarget: text(params.formalTarget, 'formal target', 150) });
+          const old = this.store.db.prepare('SELECT baseline,formal_target FROM host_project_baselines WHERE project_id=?').get(project.id);
+          if (old && (old.baseline !== observed.baseline || old.formal_target !== observed.formalTarget)) throw new ProtocolError('BASELINE_CHANGE_REQUIRES_DECISION', 'Existing project baseline is preserved. Use a separately authorized baseline update.');
+          if (!old) this.store.db.prepare('INSERT INTO host_project_baselines VALUES(?,?,?)').run(project.id,observed.baseline,observed.formalTarget);
+        }
+        selected = { projectId: project.id };
         break;
+      }
+      case 'importConfiguration': {
+        if (this.store.listRuns().some(run => run.status !== 'stopped')) throw new ProtocolError('RUN_ACTIVE', 'Stop and verify existing runs before importing execution settings.');
+        const config = this.configuration.importFromFile(text(params.filePath, 'configuration file', 4096));
+        const methods = this.production.captureMethods(config);
+        for (const project of this.store.listProjects()) this.workflow.updateProjectMethods(project.id, methods, this.#user);
+        for (const demand of this.store.listDemands()) this.workflow.completeMissingMethods(demand.id);
+        break;
+      }
+      case 'prepareModelApproval': {
+        const demandId = id(params.demandId), demand = this.store.getDemand(demandId);
+        if (demand.revision !== revision(params.expectedVersion)) throw new ProtocolError('STALE_CONTROL', 'Refresh the selected demand before preparing its data scope.');
+        const config = this.configuration.load();
+        if (!config.provider) throw new ProtocolError('MODEL_CONFIGURATION_MISSING', 'Import the intended provider, model, endpoint, credential reference and finite limits first.');
+        const data = this.production.requiredModelData(demandId);
+        if (JSON.stringify(config.provider.data) !== JSON.stringify(data)) this.configuration.save({ ...config, provider: { ...config.provider, data } });
+        selected = { projectId: demand.projectId, demandId }; break;
+      }
+      case 'authorizeModel': {
+        const requestId = id(params.requestId), demandId = id(params.demandId);
+        if (params.resourceScope !== 'demand-worktree-private-runtime-v1') throw new ProtocolError('RUNTIME_SCOPE_UNREVIEWED', 'Review the bounded per-demand local resource scope before authorizing.');
+        const digest = text(params.configurationDigest, 'configuration digest', 64);
+        const inputHash = createHash('sha256').update(JSON.stringify({ requestId, demandId, expectedVersion: revision(params.expectedVersion), configurationDigest: digest, resourceScope: params.resourceScope })).digest('hex');
+        const prior = this.store.db.prepare('SELECT * FROM host_model_decisions WHERE request_id=?').get(requestId);
+        if (prior) {
+          if (prior.input_hash !== inputHash) throw new ProtocolError('IDEMPOTENCY_CONFLICT', 'The model approval request changed content.');
+          selected = { projectId: this.store.getDemand(demandId).projectId, demandId }; break;
+        }
+        const demand = this.store.getDemand(demandId), config = this.configuration.load();
+        if (demand.revision !== params.expectedVersion) throw new ProtocolError('STALE_CONTROL', 'The demand version changed before model approval.');
+        if (demand.control === 'cancelled') throw new ProtocolError('CANCELLED', 'Cancelled demands cannot receive new model authority.');
+        if (configurationDigest(config) !== digest) throw new ProtocolError('STALE_CONFIGURATION', 'The model/data/spend configuration changed. Review it again.');
+        const existing = this.store.db.prepare('SELECT * FROM host_model_decisions WHERE demand_id=? AND configuration_digest=? LIMIT 1').get(demandId, digest);
+        if (!existing) {
+          const suffix = createHash('sha256').update(`${demandId}:${digest}`).digest('hex').slice(0,32), grantId = `model_${suffix}`, decisionId = `decision_${suffix}`;
+          const grant = createModelGrant(config, { id: grantId, demandId, decisionId }, candidate => {
+            if (candidate.demandId !== demandId || configurationDigest(config) !== digest) throw new ProtocolError('MODEL_SCOPE_CHANGED', 'Approval scope changed.');
+          });
+          this.store.transaction(() => {
+            this.store.db.prepare('INSERT INTO host_model_decisions(request_id,input_hash,demand_id,configuration_digest,grant_id,decision_id,created_at,runtime_scope) VALUES(?,?,?,?,?,?,?,?)').run(requestId,inputHash,demandId,digest,grantId,decisionId,new Date().toISOString(),'demand-worktree-private-runtime-v1');
+            this.budget.grant(grant);
+          });
+        }
+        selected = { projectId: demand.projectId, demandId }; break;
       }
       case 'createDemand': {
         const requestId = id(params.requestId, 'creation request identifier');
@@ -111,7 +185,18 @@ export class HostApplication {
         else if (kind === 'accept-result') command = { ...common, type: kind, resultId: id(params.resultId, 'result version') };
         else if (kind === 'return-result') command = { ...common, type: kind, resultId: id(params.resultId, 'result version'), reason: text(params.text, 'return reason') };
         else command = { ...common, type: kind as 'start-planning' | 'pause' | 'resume' | 'cancel' };
+        if (kind === 'accept-result') {
+          const demand = this.store.getDemand(common.demandId), result = demand.results.find(result => result.id === params.resultId);
+          if (result && (!this.production.evidence.stable(demand.id, result.K) || result.N.some(ref => { try { this.production.evidence.read(demand.id, ref); return false; } catch { return true; } }))) {
+            this.workflow.invalidateCurrentContent(demand.id, 'The actual source or local material differs from this immutable result.');
+            throw new ProtocolError('RESULT_CHANGED', 'Result content changed after verification. Recheck before acceptance.');
+          }
+        }
         this.workflow.execute(command, this.#user);
+        if (kind === 'start-planning' || kind === 'resume') {
+          const demand = this.store.getDemand(common.demandId), base = this.store.db.prepare('SELECT baseline FROM host_project_baselines WHERE project_id=?').get(demand.projectId);
+          if (base) this.production.prepareDemand(demand.id, base.baseline === null ? null : String(base.baseline));
+        }
         break;
       }
       case 'sendMessage': {
@@ -130,14 +215,18 @@ export class HostApplication {
       if (d.control === 'active' && d.planningStarted && !['accepted', 'awaiting-acceptance'].includes(d.phase)) this.workflow.execute({ type: 'exit', requestId: `exit-${d.id}-${d.revision}`, demandId: d.id, expectedRevision: d.revision }, this.#user);
     }
     const remaining = this.store.listRuns().filter(r => r.status !== 'stopped');
-    return { safe: remaining.length === 0, blockers: remaining.map(r => `${r.demandId}: ${r.status}`) };
+    const actual = this.coordinator.supervisor.list().filter(run => run.state !== 'stopped');
+    const auxiliary = this.production.auxiliaryStatus();
+    return { safe: remaining.length === 0 && actual.length === 0 && auxiliary.safe, blockers: [...new Set([...remaining.map(r => `${r.demandId}: ${r.status}`), ...actual.map(run => `${run.demandId} / ${run.role}: ${run.state}`), ...auxiliary.blockers])] };
   }
   async requestShutdown(): Promise<{ safe: boolean; blockers: string[] }> {
     this.#closing = true;
     this.shutdown();
+    await this.production.stopAllAuxiliary('explicit-exit');
     await this.coordinator.flushStops();
     await this.coordinator.observeCompletedRuns();
     return this.shutdown();
   }
-  close(): void { this.store.close(); }
+  async tick(): Promise<void> { await this.production.tick(); }
+  close(): void { this.store.close(); if (this.#temporaryConfiguration) rmSync(this.#temporaryConfiguration, { recursive: true, force: true }); }
 }

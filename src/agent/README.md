@@ -39,18 +39,31 @@ permissions add no spending authority and every call uses the same surviving bud
 `PrivateModelPipeClient` / `PrivateModelPipeServer` implement bounded length framing,
 response correlation, maximum in-flight/buffer sizes and cancellation independent of
 output drain. They are tested with real Node streams, not native Windows inherited pipes;
-the latter transport association and runtime evidence gate still require integration.
+the native helper/driver association and evidence gate are implemented, with actual Windows validation still pending.
 
 The brokered SDK tests use the real installed SDK and deterministic Host provider transport,
 including a custom tool invocation, actual automatic retry with unknown earlier usage held,
 and actual compaction. They demonstrate interception/accounting, not paid model quality.
 
+## Native Worker bootstrap (source complete; Windows validation pending)
+
+`worker-main.ts` is a separate Windows x64 entry accepting only the locked native generation.
+`worker-runtime.ts` binds a fresh Pi native session ID, immutable role/material/method context,
+capability model channel, report receipts and lifecycle events. It imports no synthetic adapter.
+`controlled-tools.ts` offers bounded source read/list/write, isolated Node execution and typed
+Host reporting. Read-only roles have no source-write tool. Tool timeout/output overflow asks
+for whole-Job stop instead of claiming killing one child controls its descendants.
+
+The complete Worker -> actual SDK -> controlled report -> framed Host broker -> persisted budget
+-> report receipt -> settled path has executed with synthetic Node streams and deterministic
+provider responses. The same native entry is wired to `VerifiedWindowsDriver`; its machine,
+artifact hashes, private handles and actual ACL/Job evidence must pass before real launch.
+
 ## Deliberately remaining
 
-- Wire a native Windows private capability channel to the Host model broker and controlled
-  file/report tools after the complete isolation evidence is verified.
-- Connect the implemented brokered adapter/codec to authenticated native handles and validate
-  real provider cancellation/late billing under the authorized single provider/model.
+- Validate the implemented native private-handle bootstrap end-to-end with Windows Node/Pi,
+  and collect all required isolation evidence; no in-process test substitutes for this.
+- Validate real provider cancellation/late billing under explicitly authorized data/spend limits.
 - Obtain actual design-feature and downstream method sources/digests.
 - Verify Windows Node/Git Bash/Pi compatibility and full role/ACL/read boundary matrix.
 - Run genuine planning, implementation, independent review, repair, and human acceptance.

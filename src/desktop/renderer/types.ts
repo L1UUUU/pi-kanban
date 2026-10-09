@@ -1,3 +1,5 @@
+import type { ConfigurationSummary } from '../../host/configuration.ts';
+export type { ConfigurationSummary, ProviderConfiguration } from '../../host/configuration.ts';
 /** Display-only Host snapshot. This is not an authorization boundary or a second workflow engine. */
 export type Phase = 'idea' | 'planning' | 'awaiting-design' | 'awaiting-authorization' | 'implementing' | 'checking' | 'reviewing' | 'rework' | 'awaiting-acceptance' | 'accepted' | 'blocked';
 export type Control = 'active' | 'paused' | 'cancelled' | 'exited';
@@ -55,6 +57,7 @@ export interface ViewState {
     model?: string;
   };
   selected?: { projectId?: string; demandId?: string };
+  configuration?: ConfigurationSummary & { authorization?: { demandId: string; grantId: string; configurationDigest: string } };
   /** Only set by the isolated synthetic preview entry; never inferred from a missing bridge. */
   preview?: boolean;
 }
@@ -68,10 +71,20 @@ export interface Command {
   text?: string;
   requestId: string;
 }
+export interface ModelAuthorizationCommand {
+  demandId: string;
+  expectedVersion: number;
+  requestId: string;
+  configurationDigest: string;
+  resourceScope: 'demand-worktree-private-runtime-v1';
+}
 export interface WorkbenchBridge {
   snapshot(): Promise<ViewState>;
   subscribe(listener: (state: ViewState) => void): () => void;
   createProject(): Promise<ViewState>;
+  importConfiguration(): Promise<ViewState>;
+  prepareModelApproval(input: { demandId: string; expectedVersion: number }): Promise<ViewState>;
+  authorizeModel(input: ModelAuthorizationCommand): Promise<ViewState>;
   createDemand(input: { projectId: string; title: string; description: string; requestId: string }): Promise<ViewState>;
   command(input: Command): Promise<ViewState>;
   sendMessage(input: { demandId: string; text: string; requestId: string }): Promise<ViewState>;

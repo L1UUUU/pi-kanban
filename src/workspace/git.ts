@@ -2,7 +2,7 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, readdirSync, lstatSync, appendFileSync, openSync, closeSync, fsyncSync } from 'node:fs';
 import { dirname, join, resolve, isAbsolute } from 'node:path';
 import { homedir } from 'node:os';
-import { insist, noLinks, readRegular, sourcePath, WorkspaceError, canonicalDirectory } from './paths.ts';
+import { insist, noLinks, readRegular, sourcePath, WorkspaceError, canonicalDirectory, canonicalDestination } from './paths.ts';
 
 export interface GitOptions { gitExecutable?: string; timeoutMs?: number; maxBuffer?: number }
 /** Host-only bounded Git broker. No public arbitrary-command or network interface. */
@@ -129,7 +129,7 @@ export class ControlledGit {
     const entries = this.run(cwd,['worktree','list','--porcelain','-z']).toString().split('\0');
     const output: Array<{path:string;branch:string|null;head:string|null}> = []; let current: any;
     for (const entry of entries) {
-      if (entry.startsWith('worktree ')) { current = {path:resolve(entry.slice(9)),branch:null,head:null}; output.push(current); }
+      if (entry.startsWith('worktree ')) { current = {path:canonicalDestination(entry.slice(9)),branch:null,head:null}; output.push(current); }
       else if (entry.startsWith('branch ') && current) current.branch = entry.slice(7).replace(/^refs\/heads\//,'');
       else if (entry.startsWith('HEAD ') && current) current.head = /^0+$/.test(entry.slice(5)) ? null : entry.slice(5);
     } return output;
@@ -142,7 +142,9 @@ export class ControlledGit {
       const separator=record.indexOf('\t');const metadata=record.slice(0,separator);const path=record.slice(separator+1);sourcePath(path);paths.push(path);
       insist(!metadata.startsWith('120000') && !metadata.startsWith('160000'), 'UNSUPPORTED_TREE', 'Symlinks and submodules require an explicitly verified filesystem adapter.');
     }
-    this.guardActiveDrivers(cwd,this.config(cwd),paths,commit);
+    const currentPaths=this.invoke(cwd,['ls-files','--cached','--others','--exclude-standard','-z']).toString().split('\0').filter(Boolean);
+    const combined=[...new Set([...paths,...currentPaths])];const configuration=this.config(cwd);
+    this.guardActiveDrivers(cwd,configuration,combined);this.guardActiveDrivers(cwd,configuration,combined,commit);
   }
   addWorktree(cwd: string, path: string, branch: string, base: string | null): void {
     this.validateBranch(branch); noLinks(path,true); if (base) { this.validateOid(base); this.verifyTree(cwd,base); }
@@ -156,6 +158,7 @@ export class ControlledGit {
   branchExists(cwd: string, branch: string): boolean { this.validateBranch(branch); return this.run(cwd,['for-each-ref','--format=%(refname)',`refs/heads/${branch}`]).length > 0; }
   makeTree(cwd: string, head: string|null, paths: string[], indexPath: string): string {
     noLinks(indexPath,true); for (const path of paths) sourcePath(path);
+    this.guard(cwd);this.guardActiveDrivers(cwd,this.config(cwd),paths);
     const env = {GIT_INDEX_FILE:indexPath}; this.run(cwd, head ? ['read-tree',head] : ['read-tree','--empty'],undefined,env);
     this.run(cwd,['add','--',...paths],undefined,env); const tree = this.run(cwd,['write-tree'],undefined,env).toString().trim();
     this.verifyTree(cwd,tree); return tree;
@@ -186,7 +189,13 @@ export class ControlledGit {
     return {mergeHead,unmergedPaths};
   }
   mergeFormal(cwd:string,source:string,message:string,timestamp:string,author:{name:string;email:string}):void {
-    this.validateOid(source);this.verifyTree(cwd,source);insist(!/[\r\n<>\0]/.test(author.name+author.email) && author.name.length>0 && author.email.includes('@'),'INVALID_AUTHOR','Explicit integration identity is required.');
+    this.validateOid(source);this.verifyTree(cwd,source);
+    const head=this.head(cwd);const configuration=this.config(cwd);
+    if(head && !this.isAncestor(cwd,head,source) && [...configuration.keys()].some(key=>/^(filter\..*\.(clean|smudge|process|required)|diff\..*\.(command|textconv)|merge\..*\.driver)$/.test(key))) {
+      const attributeFiles=(commit:string)=>this.invoke(cwd,['ls-tree','-r','-z',commit]).toString().split('\0').filter(record=>/(?:\t|\/)\.gitattributes$/.test(record)).sort().join('\0');
+      insist(attributeFiles(head)===attributeFiles(source),'ATTRIBUTE_MERGE_UNVERIFIED','Divergent attribute-changing merges with executable drivers require a restricted adapter; no filter was bypassed or executed.');
+    }
+    insist(!/[\r\n<>\0]/.test(author.name+author.email) && author.name.length>0 && author.email.includes('@'),'INVALID_AUTHOR','Explicit integration identity is required.');
     this.run(cwd,['merge','--no-edit','--no-stat','-m',message,source],undefined,{
       GIT_AUTHOR_NAME:author.name,GIT_COMMITTER_NAME:author.name,GIT_AUTHOR_EMAIL:author.email,GIT_COMMITTER_EMAIL:author.email,
       GIT_AUTHOR_DATE:timestamp,GIT_COMMITTER_DATE:timestamp,

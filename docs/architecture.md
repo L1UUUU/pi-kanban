@@ -6,7 +6,7 @@ The React renderer has no Node.js access. Electron uses a sandboxed renderer, co
 
 Electron starts a separately selected Node 24 executable with a private IPC channel and a minimal environment. The Host alone writes business facts to SQLite. No TCP control service is exposed. A snapshot sequence, persisted across restarts, prevents delayed responses from replacing newer whole-state views.
 
-Untrusted project code and Pi Workers must run outside the Host in the verified native boundary. Production dispatch is currently disabled because that complete boundary is not yet verified or wired to a production Worker channel. Nothing falls back to unrestricted Host execution. The native candidate and deterministic SDK fixtures are explicit, separate artifacts.
+Untrusted project code and Pi Workers run outside the Host through the native helper and private production Worker channel. Dispatch remains disabled until that complete exact boundary is actually verified and finite model/data/resource consent is recorded. Nothing falls back to unrestricted Host execution. The native candidate and deterministic SDK fixtures are explicit, separate artifacts.
 
 ## Modules
 

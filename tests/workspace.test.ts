@@ -183,3 +183,25 @@ test('synthetic global LFS and Windows textconv defaults are actually discovered
  execFileSync(process.execPath,['--input-type=module','-e',script],{cwd:f.repo,env:{...process.env,HOME:home,USERPROFILE:home,XDG_CONFIG_HOME:join(home,'.config')},stdio:'pipe',timeout:60000});
  assert.equal(existsSync(marker),false);assert.equal(existsSync(join(f.repo,'global-driver-ran')),false);assert.equal(existsSync(join(f.req.worktreePath,'global-driver-ran')),false);
 });
+
+test('merge checks the union of source and demand paths against both attribute views',t=>{
+ const f=fixture(t);const w=f.service.prepare(f.req);writeFileSync(join(w.worktreePath,'only-demand.bin'),'demand data');f.service.commit({...saveRequest(w.worktreePath,f.base),paths:['only-demand.bin'],expectedFiles:{'only-demand.bin':digest('demand data')}});
+ writeFileSync(join(f.repo,'.gitattributes'),'*.bin filter=lfs\n');git(f.repo,'add','.gitattributes');git(f.repo,'commit','-m','Formal attribute update');const source=git(f.repo,'rev-parse','HEAD');git(f.repo,'config','filter.lfs.smudge','touch should-never-run');
+ assert.throws(()=>f.service.updateBaseline(updateRequest(source)),/Active filter driver lfs/);assert.equal(f.service.git.mergeState(w.worktreePath).mergeHead,null);assert.equal(existsSync(join(w.worktreePath,'should-never-run')),false);
+});
+
+test('a divergent attribute merge cannot synthesize previously inactive executable macros',t=>{
+ const f=fixture(t);const w=f.service.prepare(f.req);writeFileSync(join(w.worktreePath,'.gitattributes'),'[attr]danger filter=lfs\n');f.service.commit({...saveRequest(w.worktreePath,f.base),paths:['.gitattributes'],expectedFiles:{'.gitattributes':digest('[attr]danger filter=lfs\n')}});
+ writeFileSync(join(f.repo,'.gitattributes'),'code.txt danger\n');git(f.repo,'add','.gitattributes');git(f.repo,'commit','-m','Attribute usage on formal branch');const source=git(f.repo,'rev-parse','HEAD');git(f.repo,'config','filter.lfs.smudge','touch should-never-run');
+ assert.throws(()=>f.service.updateBaseline(updateRequest(source)),/Divergent attribute-changing merges/);assert.equal(f.service.git.mergeState(w.worktreePath).mergeHead,null);assert.equal(existsSync(join(w.worktreePath,'should-never-run')),false);
+});
+
+test('worktree reconciliation accepts alternate canonical filesystem spelling but rejects other directories',t=>{
+ const f=fixture(t);const crash=new WorkspaceService({db:f.db,gitExecutable,fault:p=>{if(p==='prepare.created')throw new Error('crash');}});assert.throws(()=>crash.prepare(f.req),/crash/);
+ const actual=f.service.git.worktrees(f.repo).find(w=>w.branch===f.req.branch)!;assert.ok(actual);
+ const row=f.db.prepare('SELECT data FROM workspace_intents WHERE operation_id=?').get(f.req.operationId) as any;const intent=JSON.parse(row.data);
+ intent.request.worktreePath=process.platform==='win32'?intent.request.worktreePath.replaceAll('\\','/').toUpperCase():join(intent.request.worktreePath,'.');
+ f.db.prepare('UPDATE workspace_intents SET data=? WHERE operation_id=?').run(JSON.stringify(intent),f.req.operationId);
+ const recovered=f.service.reconcile(f.req.operationId) as any;assert.equal(recovered.demandId,'a');assert.equal(f.service.inspectContent({demandId:'a',expectedCommit:f.base}).changed,false);
+ const wrong=join(f.root,'other');mkdirSync(wrong);const binding=f.service.getBinding('a')!;f.db.prepare('UPDATE workspace_bindings SET data=? WHERE demand_id=?').run(JSON.stringify({...binding,worktreePath:wrong}),'a');assert.throws(()=>f.service.inspectContent({demandId:'a',expectedCommit:f.base}));
+});

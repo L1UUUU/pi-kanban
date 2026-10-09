@@ -2,7 +2,8 @@
 
 Status: substantive candidate source; **not compiled or executed in the Linux authoring
 container**. The production TypeScript driver remains disabled even if a JSON profile says
-`verified: true`. The candidate does not implement the Host IPC/evidence-verification bridge.
+`verified: true`. The general helper, bounded IPC/Host driver, scoped resource provisioning and independent
+evidence verifier are now implemented; all units have now compiled in Windows CI; runtime validation remains incomplete.
 
 ## Native Windows 11 / Windows CI build
 
@@ -61,12 +62,38 @@ ACLs and launches through the same candidate library. It records JSON lines for:
 A successful smoke would prove only those probes on that exact CI host. It would **not**
 prove complete PV-01/G1, Node/Git Bash/Pi execution, arbitrary-network denial, reparse attack
 races, Host/helper crash recovery, all shell/service escape paths, mandatory hooks/signing,
-or role-transition ACL cleanup. The library takes trusted native descriptor structs; a
-bounded serialized transport and authenticated Host verifier remain unimplemented.
-Output-frame/log quotas must be enforced by that bridge; the native memory/process/runtime
-limits do not substitute for protocol backpressure and stop-priority checks.
+or role-transition ACL cleanup. The library takes trusted native descriptor structs. `helper.cpp` validates a bounded strict
+JSON launch descriptor, duplicate keys, fields, depth and numeric ranges before calling it.
+The general helper now enforces separate bounded model/report frames, bounded queued bootstrap
+responses and independent output/log byte limits. Its stderr lifecycle channel is separate
+from Worker stdout so output backpressure cannot block receipt of a native stop command.
 
 Official references checked 2026-10-09:
 - https://learn.microsoft.com/en-us/windows/win32/secauthz/implementing-an-appcontainer
 - https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects
 - https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-updateprocthreadattribute
+
+## General helper and provisioning
+
+The build also produces `pi_kanban_native_helper.exe`. stdin is a length-prefixed launch
+descriptor followed by `query`, `stop` or `worker-input` controls; stdout carries bounded
+Worker frames and stderr carries separate trusted native identity/Job/ACL events. Native
+helper EOF/crash closes the only Job handle. The Node driver validates the exact helper
+binary and requires independent profile evidence before exposing this transport.
+
+`provision.cpp` accepts only a bounded explicit resource-authorization reference and a new
+per-demand/role/generation profile. It rejects reparse trees, grants read/execute to exact
+readonly runtime roots, role-specific source rights and private scratch rights, and denies
+`.git`/`.local`. Runtime roots cannot enclose source or scratch. Ancestors receive traverse
+only. It appends/removes only the generated SID, preserving unrelated principals. Verified
+stop includes explicit revocation status; unexpected reparse changes retain a cleanup
+blocker rather than following links or deleting user files. Crashes still require cleanup
+reconciliation; successful process termination alone is not clean-resource evidence.
+
+First remote Windows Server 2025 CI: the original launcher/smoke compiled with MSVC /W4 /WX,
+but launch failed with Win32 203 before any access probe ran. No isolation pass is claimed.
+API-stage telemetry and private profile-environment replacements were added for the next
+run; raw failure is retained by the parent CI evidence. The next Windows CI compiled helper/provision too, and launch succeeded with actual own-source
+read/write and cross-demand/Git/Host/environment/network denial probes. Legal descendant creation
+failed, so the smoke still failed and no G1 release is claimed. Additional immediate Win32 error
+telemetry preserves that unresolved behavior for diagnosis.

@@ -1,12 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { FormEvent, ReactNode } from 'react';
 import { Icon } from './icons.tsx';
+import { ConfigurationPanel, ModelAuthorizationReview } from './Configuration.tsx';
+import { LOCAL_RESOURCE_SCOPE, makeModelAuthorization, modelAuthorizationChanged, modelAuthorizationUnavailable, preparedModelReview } from './configuration-model.ts';
 import { commandUnavailable, demandStatus, errorMessage, makeCommand, MESSAGE_STATES, needsAttention, PHASE_LABELS, primaryAction, reconcileSnapshot, shortId } from './model.ts';
-import type { CommandKind, Demand, ViewState, WorkbenchBridge } from './types.ts';
+import type { CommandKind, ConfigurationSummary, Demand, ViewState, WorkbenchBridge } from './types.ts';
 
 type Nav = 'workspace' | 'attention' | 'ideas';
 type DetailTab = 'result' | 'plan' | 'checks' | 'knowledge';
-type Dialog = { kind: 'new' } | { kind: 'return'; demand: Demand } | { kind: 'cancel'; demand: Demand } | { kind: 'diagnostics' } | null;
+type Dialog = { kind: 'new' } | { kind: 'return'; demand: Demand } | { kind: 'cancel'; demand: Demand } | { kind: 'diagnostics' } | { kind: 'model-authorization'; demand: Demand; configuration: ConfigurationSummary } | null;
 const requestId = () => crypto.randomUUID();
 const timeLabel = (value?: string) => value && !Number.isNaN(Date.parse(value)) ? new Date(value).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }) : '';
 
@@ -14,6 +16,7 @@ export function App({ bridge }: { bridge: WorkbenchBridge }) {
   const [state, setState] = useState<ViewState | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [selection, setSelection] = useState<string>();
+  const selectionRef = useRef(selection); selectionRef.current = selection;
   const [projectId, setProjectId] = useState<string>();
   const [nav, setNav] = useState<Nav>('workspace');
   const [search, setSearch] = useState('');
@@ -82,6 +85,32 @@ export function App({ bridge }: { bridge: WorkbenchBridge }) {
     if (ok) operationIds.current.delete(fingerprint);
     return ok;
   }, [bridge, run, offline]);
+  const prepareModelReview = async (target: Demand) => {
+    if (offline) { setError('本地连接已断开。请重新连接后操作。'); return; }
+    const submittedDialog = dialogRef.current;
+    if (submittedDialog?.kind !== 'diagnostics') return;
+    const prepared: { snapshot?: ViewState } = {};
+    const ok = await run(`prepare-model:${target.id}`, async () => {
+      prepared.snapshot = await bridge.prepareModelApproval({ demandId: target.id, expectedVersion: target.version });
+      return prepared.snapshot;
+    });
+    if (!ok || !prepared.snapshot || dialogRef.current !== submittedDialog || selectionRef.current !== target.id) return;
+    try {
+      const review = preparedModelReview(stateRef.current!, prepared.snapshot, target.id);
+      setDialog(current => current === submittedDialog ? { kind: 'model-authorization', ...review } : current);
+    } catch (failure) { setError(errorMessage(failure)); }
+  };
+  const authorizeModel = async (target: Demand, configuration: ConfigurationSummary) => {
+    const latest = stateRef.current;
+    if (!latest || offline) { setError('本地连接已断开。请重新连接后操作。'); return false; }
+    if (modelAuthorizationChanged(latest, target, configuration)) { setError('需求或配置已变化，请重新审阅模型授权。'); return false; }
+    const reason = modelAuthorizationUnavailable(latest, target);
+    if (reason) { setError(reason); return false; }
+    const fingerprint = JSON.stringify(['authorize-model', target.id, target.version, configuration.configurationDigest, LOCAL_RESOURCE_SCOPE]);
+    const ok = await run(`model:${target.id}`, () => bridge.authorizeModel(makeModelAuthorization(target, configuration, stableRequestId(fingerprint))));
+    if (ok) operationIds.current.delete(fingerprint);
+    return ok;
+  };
   const selectProject = () => run('project', () => bridge.createProject());
   const attention = state?.demands.filter(needsAttention) ?? [];
   const ideas = state?.demands.filter(item => item.phase === 'idea' && item.control !== 'cancelled') ?? [];
@@ -100,7 +129,7 @@ export function App({ bridge }: { bridge: WorkbenchBridge }) {
     {state.preview && <div className="preview-ribbon">合成 UI 预览 · 示例内容不代表实际运行、检查通过或产品验收</div>}
     <aside className="sidebar" aria-label="项目与需求导航">
       <Brand />
-      <button className="new-demand" onClick={() => state.projects.length ? setDialog({ kind: 'new' }) : void selectProject()} disabled={pending.has('project') || bridgeOffline}><Icon name="plus" size={17} />{state.projects.length ? '新建需求' : '接入项目'}<span className="shortcut">＋</span></button>
+      <button className="new-demand" aria-label={state.projects.length ? '新建需求' : '接入项目'} onClick={() => state.projects.length ? setDialog({ kind: 'new' }) : void selectProject()} disabled={pending.has('project') || bridgeOffline}><Icon name="plus" size={17} />{state.projects.length ? '新建需求' : '接入项目'}<span className="shortcut" aria-hidden="true">＋</span></button>
       <nav className="primary-nav" aria-label="工作区导航">
         <NavButton icon="layers" label="工作区" active={nav === 'workspace'} onClick={() => setNav('workspace')} />
         <NavButton icon="inbox" label="待处理" active={nav === 'attention'} count={attention.length} onClick={() => { setNav('attention'); setSelection(undefined); }} />
@@ -133,7 +162,7 @@ export function App({ bridge }: { bridge: WorkbenchBridge }) {
       <footer className="workspace-status"><span><Icon name="shield" size={12} />{state.preview ? '合成预览 · 无真实执行' : '用户控制与 Agent 输出分离'}</span><span>{demand ? `需求版本 ${demand.version}` : `${state.projects.length} 个本地项目`}<span className="status-separator">·</span>{state.runtime.platform}</span></footer>
     </section>
     {detailsOpen && <Inspector state={state} demand={demand} tab={tab} setTab={setTab} diagnostics={() => setDialog({ kind: 'diagnostics' })} />}
-    {dialog && <DialogView dialog={dialog} error={error} state={state} projectId={projectId} pending={pending} close={() => setDialog(null)} onCreate={async input => { const submittedDialog = dialog; const before = new Set(state.demands.map(item => item.id)); const ok = await run('create-demand', () => bridge.createDemand(input)); if (ok && dialogRef.current === submittedDialog) { const created = stateRef.current?.demands.find(item => item.id === stateRef.current?.selected?.demandId || !before.has(item.id)); if (created) { choose(created); setNav('workspace'); } setDialog(current => current === submittedDialog ? null : current); } }} onControl={async (kind, target, text) => { const submittedDialog = dialog; if (await execute(kind, target, text)) setDialog(current => current === submittedDialog ? null : current); }} refresh={refresh} />}
+    {dialog && <DialogView key={dialog.kind} dialog={dialog} error={error} state={state} projectId={projectId} selectedDemand={demand} offline={!!bridgeOffline} pending={pending} onImport={() => { void run('import-configuration', () => bridge.importConfiguration()); }} onReviewModel={target => { void prepareModelReview(target); }} onBackToDiagnostics={() => { setError(null); setDialog({ kind: 'diagnostics' }); }} onAuthorizeModel={async (target, configuration) => { const submittedDialog = dialog; if (await authorizeModel(target, configuration)) setDialog(current => current === submittedDialog ? { kind: 'diagnostics' } : current); }} close={() => setDialog(null)} onCreate={async input => { const submittedDialog = dialog; const before = new Set(state.demands.map(item => item.id)); const ok = await run('create-demand', () => bridge.createDemand(input)); if (ok && dialogRef.current === submittedDialog) { const created = stateRef.current?.demands.find(item => item.id === stateRef.current?.selected?.demandId || !before.has(item.id)); if (created) { choose(created); setNav('workspace'); } setDialog(current => current === submittedDialog ? null : current); } }} onControl={async (kind, target, text) => { const submittedDialog = dialog; if (await execute(kind, target, text)) setDialog(current => current === submittedDialog ? null : current); }} refresh={refresh} />}
   </div>;
 }
 
@@ -197,7 +226,7 @@ function SectionTitle({ icon, title, caption }: { icon: Parameters<typeof Icon>[
 function DetailEmpty({ icon, title, text }: { icon: Parameters<typeof Icon>[0]['name']; title: string; text: string }) { return <div className="detail-empty"><Icon name={icon} size={24} /><h3>{title}</h3><p>{text}</p></div>; }
 function Metadata({ label, value }: { label: string; value: string }) { return <div className="metadata"><span>{label}</span><code>{value}</code></div>; }
 
-function Modal({ title, subtitle, children, close }: { title: string; subtitle?: string; children: ReactNode; close: () => void }) {
+function Modal({ title, subtitle, children, close, wide = false }: { title: string; subtitle?: string; children: ReactNode; close: () => void; wide?: boolean }) {
   const ref = useRef<HTMLDivElement>(null);
   useEffect(() => {
     const previous = document.activeElement as HTMLElement | null;
@@ -210,9 +239,9 @@ function Modal({ title, subtitle, children, close }: { title: string; subtitle?:
     };
     document.addEventListener('keydown', handle); return () => { document.removeEventListener('keydown', handle); previous?.focus(); };
   }, [close]);
-  return <div className="modal-backdrop" onMouseDown={event => { if (event.target === event.currentTarget) close(); }}><div className="modal" ref={ref} role="dialog" aria-modal="true" aria-labelledby="dialog-title"><header><div><h2 id="dialog-title">{title}</h2>{subtitle && <p>{subtitle}</p>}</div><button className="icon-button" aria-label="关闭对话框" onClick={close}><Icon name="close" size={18} /></button></header>{children}</div></div>;
+  return <div className="modal-backdrop" onMouseDown={event => { if (event.target === event.currentTarget) close(); }}><div className={`modal ${wide ? 'modal-wide' : ''}`} ref={ref} role="dialog" aria-modal="true" aria-labelledby="dialog-title"><header><div><h2 id="dialog-title">{title}</h2>{subtitle && <p>{subtitle}</p>}</div><button className="icon-button" aria-label="关闭对话框" onClick={close}><Icon name="close" size={18} /></button></header>{children}</div></div>;
 }
-function DialogView({ dialog, error, state, projectId, pending, close, onCreate, onControl, refresh }: { dialog: NonNullable<Dialog>; error: string | null; state: ViewState; projectId?: string; pending: Set<string>; close: () => void; onCreate: (input: { projectId: string; title: string; description: string; requestId: string }) => Promise<void>; onControl: (kind: CommandKind, demand: Demand, text?: string) => Promise<void>; refresh: () => Promise<void> }) {
+function DialogView({ dialog, error, state, projectId, selectedDemand, offline, pending, close, onCreate, onControl, onImport, onReviewModel, onAuthorizeModel, onBackToDiagnostics, refresh }: { dialog: NonNullable<Dialog>; error: string | null; state: ViewState; projectId?: string; selectedDemand?: Demand; offline: boolean; pending: Set<string>; onImport: () => void; onReviewModel: (target: Demand) => void; onAuthorizeModel: (target: Demand, configuration: ConfigurationSummary) => Promise<void>; onBackToDiagnostics: () => void; close: () => void; onCreate: (input: { projectId: string; title: string; description: string; requestId: string }) => Promise<void>; onControl: (kind: CommandKind, demand: Demand, text?: string) => Promise<void>; refresh: () => Promise<void> }) {
   const [title, setTitle] = useState('');
   const [description, setDescription] = useState('');
   const [project, setProject] = useState(projectId ?? state.projects[0]?.id ?? '');
@@ -221,7 +250,8 @@ function DialogView({ dialog, error, state, projectId, pending, close, onCreate,
   const createId = () => { const fingerprint = JSON.stringify([project, title.trim(), description.trim()]); if (createRequest.current?.fingerprint !== fingerprint) createRequest.current = { fingerprint, id: requestId() }; return createRequest.current.id; };
   const closeRef = useRef(close); closeRef.current = close;
   const stableClose = useCallback(() => closeRef.current(), []);
-  if (dialog.kind === 'diagnostics') return <Modal title="运行诊断" subtitle="只有已验证的前置条件，才能启用自主执行。" close={stableClose}><div className="diagnostics-summary"><Icon name={state.runtime.executionEnabled ? 'shield' : 'alert'} size={23} /><div><strong>{state.runtime.executionEnabled ? '当前运行组合已启用' : '自主执行尚未启用'}</strong><p>{state.runtime.executionEnabled ? '每次派发仍由 Host 核验授权、版本、工作区和额度。' : '你可以接入项目、保存需求并查看已有记录。'}</p></div></div><div className="diagnostic-facts"><Metadata label="平台" value={state.runtime.platform} /><Metadata label="Node.js" value={state.runtime.node} /><Metadata label="模型" value={state.runtime.model ?? '未配置 / 未启用'} /><Metadata label="连接" value={state.runtime.connection === 'disconnected' ? '已断开' : '本地 Host'} /></div><h3 className="dialog-section-label">尚未满足的条件</h3>{state.runtime.blockers.length ? <ul className="diagnostic-blockers">{state.runtime.blockers.map((blocker, index) => <li key={index}><Icon name="alert" size={16} /><span>{blocker}</span></li>)}</ul> : <p className="detail-muted">Host 未报告全局配置阻塞。需求级授权与检查仍分别核验。</p>}<div className="dialog-note">运行配置包括方法、模型与资料范围、实际隔离、有限额度和恢复能力。未配置不会被视为无限制。</div><div className="modal-actions"><button className="button" onClick={stableClose}>关闭</button><button className="button primary" onClick={() => void refresh()}><Icon name="refresh" size={14} />重新检查</button></div></Modal>;
+  if (dialog.kind === 'model-authorization') return <Modal wide title="确认有限模型与资源授权" subtitle="仅批准此需求的模型额度、资料范围与下述本地资源访问。" close={stableClose}><ModelAuthorizationReview key={`${dialog.demand.id}:${dialog.demand.version}:${dialog.configuration.configurationDigest}`} state={state} target={dialog.demand} configuration={dialog.configuration} error={error} pending={pending.has(`model:${dialog.demand.id}`)} offline={offline} onBack={onBackToDiagnostics} onConfirm={() => void onAuthorizeModel(dialog.demand, dialog.configuration)} /></Modal>;
+  if (dialog.kind === 'diagnostics') return <Modal wide title="运行诊断" subtitle="只有已验证的前置条件，才能启用自主执行。" close={stableClose}><div className="diagnostics-summary"><Icon name={state.runtime.executionEnabled ? 'shield' : 'alert'} size={23} /><div><strong>{state.runtime.executionEnabled ? '当前运行组合已启用' : '自主执行尚未启用'}</strong><p>{state.runtime.executionEnabled ? '每次派发仍由 Host 核验授权、版本、工作区和额度。' : '你可以接入项目、保存需求并查看已有记录。'}</p></div></div><div className="diagnostic-facts"><Metadata label="平台" value={state.runtime.platform} /><Metadata label="Node.js" value={state.runtime.node} /><Metadata label="模型" value={state.runtime.model ?? '未配置 / 未启用'} /><Metadata label="连接" value={state.runtime.connection === 'disconnected' ? '已断开' : '本地 Host'} /></div><ConfigurationPanel state={state} demand={selectedDemand} pending={pending.has('import-configuration')} preparing={!!selectedDemand && pending.has(`prepare-model:${selectedDemand.id}`)} offline={offline} onImport={onImport} onReview={onReviewModel} />{error && <p className="stale-warning" role="alert">{error}</p>}<h3 className="dialog-section-label">Host 报告的运行条件</h3>{state.runtime.blockers.length ? <ul className="diagnostic-blockers">{state.runtime.blockers.map((blocker, index) => <li key={index}><Icon name="alert" size={16} /><span>{blocker}</span></li>)}</ul> : <p className="detail-muted">Host 未报告全局配置阻塞。需求级授权与检查仍分别核验。</p>}<div className="dialog-note">运行配置包括方法、模型与资料范围、实际隔离、有限额度和恢复能力。未配置不会被视为无限制。</div><div className="modal-actions"><button className="button" onClick={stableClose}>关闭</button><button className="button primary" onClick={() => void refresh()}><Icon name="refresh" size={14} />重新检查</button></div></Modal>;
   if (dialog.kind === 'new') return <Modal title="记录一条新需求" subtitle="先把想法保存下来，再决定何时开始规划。" close={stableClose}><form onSubmit={event => { event.preventDefault(); if (title.trim() && project && !pending.has('create-demand')) void onCreate({ projectId: project, title: title.trim(), description: description.trim(), requestId: createId() }); }}><label className="form-field">所属项目<select value={project} onChange={event => setProject(event.target.value)} required>{state.projects.map(item => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label><label className="form-field">需求标题<input autoFocus required maxLength={160} placeholder="例如：为导出功能增加时间范围筛选" value={title} onChange={event => setTitle(event.target.value)} /></label><label className="form-field">目标与背景<span className="field-optional">可稍后补充</span><textarea rows={5} maxLength={20000} placeholder="希望解决什么问题？有哪些约束、参考或验收要求？" value={description} onChange={event => setDescription(event.target.value)} /></label><div className="dialog-note"><Icon name="bulb" size={15} />保存想法不会启动 Agent，也不会创建实施授权。</div>{error && <p className="stale-warning" role="alert">{error}</p>}<div className="modal-actions"><button type="button" className="button" onClick={stableClose}>取消</button><button className="button primary" type="submit" disabled={!title.trim() || !project || pending.has('create-demand')}>{pending.has('create-demand') ? '正在保存…' : '保存想法'}<Icon name="arrow" size={14} /></button></div></form></Modal>;
   const target = dialog.demand;
   const stale = state.demands.find(item => item.id === target.id)?.version !== target.version;

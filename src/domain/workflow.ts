@@ -40,6 +40,21 @@ export class WorkflowService {
   getDemand(demandId: string): Demand { return this.store.getDemand(demandId); }
   listDemands(projectId?: string): Demand[] { return this.store.listDemands(projectId); }
   listProjects(): Project[] { return this.store.listProjects(); }
+  /** Trusted adapter query. Keep stage decisions in this single rule engine. */
+  nextRequestedStage(demandId: string): Stage | null { return this.nextStage(this.store.getDemand(demandId)); }
+  /** An explicit settings import may fill missing slots before first dispatch;
+   * it never replaces a captured method or upgrades an already-started run. */
+  completeMissingMethods(demandId: string): Demand {
+    return this.store.transaction(() => {
+      const demand = this.store.getDemand(demandId);
+      if (!demand.planningStarted || this.store.listRuns(demandId).length) return demand;
+      const defaults = this.store.getProject(demand.projectId).methods;
+      let changed = false;
+      for (const stage of ['planning','implementation','review'] as const) if (!demand.methodSnapshot[stage] && defaults[stage]) { demand.methodSnapshot[stage] = structuredClone(defaults[stage]); changed = true; }
+      if (changed) { this.audit(demandId,'missing-methods-configured',demand.methodSnapshot); this.reconcile(demand); demand.revision++; this.store.saveDemand(demand); }
+      return demand;
+    });
+  }
   getRun(runId: string): RunAttempt { return this.store.getRun(runId); }
   listRuns(demandId?: string): RunAttempt[] { return this.store.listRuns(demandId); }
 

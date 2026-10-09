@@ -21,9 +21,9 @@ This document reports implementation, test evidence and missing execution inputs
 
 ## User-visible limitations
 
-1. The production desktop records projects, demands, messages and version-bound decisions and displays results/diagnostics. It does not yet autonomously complete a real request: the production Windows Worker launch/channel/evidence integration is not released.
+1. The production desktop records projects, demands, messages and version-bound decisions. Generic configuration, independent native helper/Worker, model broker, frozen methods, source evidence and independent boundary-review orchestration are implemented. Real autonomous execution remains gated on the complete exact Windows profile and explicit user inputs; it has not been validated end to end with a real model.
 2. The package lacks the actual `design-feature` Skill and downstream dependencies. No substitute is presented as the user's original method. Implementation/Review method choices and actual models also need a verified configuration.
-3. Model credentials, permitted material/destination, finite spend and live metering are not authorized/configured. No real model calls were made while building the project.
+3. Model credentials, permitted material/destination, finite spend and live metering are not authorized/configured. The built-in real transport supports the pinned Pi-ai OpenAI Responses catalog at its exact official endpoint. Configuration import, Host-prepared exact input hashes and separate finite consent are implemented; no real model calls were made while building the project.
 4. Native CTest covers synthetic Win32 resources and processes. It does not establish Node, Git Bash, Pi, hooks/signing, all reparse/network variants or complete Windows 11 behavior. Hosted Windows Server CI is not the promised target OS validation.
 5. Actual remote merge, final-content equivalence and later-demand experience reuse were not performed. The application has no remote-write operation. The implementation PR itself is not evidence of the application's complete remote/reuse workflow.
 6. Native tray, notification and interrupted desktop flows need target-machine verification. Browser preview tests use a separate clearly labeled synthetic fixture.

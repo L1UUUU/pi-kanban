@@ -4,7 +4,7 @@ import { dirname, join, resolve } from 'node:path';
 import { ControlledGit } from './git.ts';
 import type { GitOptions } from './git.ts';
 import { ImmutableObjectStore, digest, canonicalJson } from './objects.ts';
-import { canonicalDirectory, id, insist, noLinks, readRegular, secureMkdir, sourcePath } from './paths.ts';
+import { canonicalDirectory, id, insist, noLinks, readRegular, secureMkdir, sourcePath, canonicalDestination, sameDirectory, sameDestination, destinationsCollide } from './paths.ts';
 export { ImmutableObjectStore, digest, canonicalJson } from './objects.ts';
 export type { ObjectRef } from './objects.ts';
 export { ControlledGit } from './git.ts';
@@ -58,17 +58,17 @@ export class WorkspaceService {
   private updateIntent(operationId:string,data:any,status='pending'):void { this.db.prepare('UPDATE workspace_intents SET data=?,status=? WHERE operation_id=?').run(canonicalJson(data),status,operationId); }
   prepare(input:PrepareRequest):WorkspaceBinding {
     id(input.operationId); id(input.demandId); insist(input.prepareAuthorized,'NOT_AUTHORIZED','Workspace preparation requires an effective grant.');
-    const p = this.getProject(input.projectId); this.git.validateBranch(input.branch); const worktreePath = noLinks(input.worktreePath,true);
+    const p = this.getProject(input.projectId); this.git.validateBranch(input.branch); const worktreePath = canonicalDestination(input.worktreePath);
     insist(input.branch !== p.formalTarget,'FORMAL_BRANCH','A demand requires its own development branch.');
     const request = {...input,worktreePath}; const prior = this.intent(input.operationId);
-    if (prior) { insist(prior.kind==='prepare' && prior.data.requestHash===digest(canonicalJson(request)), 'OPERATION_CONFLICT','Operation identifier was reused with different content.'); return this.reconcile(input.operationId) as WorkspaceBinding; }
+    if (prior) { insist(prior.kind==='prepare' && sameDestination(prior.data.request.worktreePath,worktreePath) && digest(canonicalJson({...prior.data.request,worktreePath}))===digest(canonicalJson(request)), 'OPERATION_CONFLICT','Operation identifier was reused with different content.'); return this.reconcile(input.operationId) as WorkspaceBinding; }
     const existing = this.getBinding(input.demandId);
     if (existing) {
-      insist(existing.projectId===input.projectId && existing.worktreePath===worktreePath && existing.branch===input.branch && existing.initialBaseline===input.baseline,'WORKSPACE_CONFLICT','A demand already has a different workspace.');
+      insist(existing.projectId===input.projectId && sameDirectory(existing.worktreePath,worktreePath) && existing.branch===input.branch && existing.initialBaseline===input.baseline,'WORKSPACE_CONFLICT','A demand already has a different workspace.');
       this.checkBinding(existing); return existing;
     }
     const reservations=this.db.prepare("SELECT data FROM workspace_intents WHERE kind='prepare' AND status='pending'").all() as any[];
-    insist(!reservations.some(row=>{const r=JSON.parse(row.data).request;return r.worktreePath===worktreePath || (r.projectId===input.projectId && r.branch===input.branch);}),'WORKSPACE_RESERVED','Another unfinished preparation reserves this branch or worktree path.');
+    insist(!reservations.some(row=>{const r=JSON.parse(row.data).request;return destinationsCollide(r.worktreePath,worktreePath) || (r.projectId===input.projectId && r.branch===input.branch);}),'WORKSPACE_RESERVED','Another unfinished preparation reserves this branch or worktree path.');
     insist(!existsSync(worktreePath),'PATH_OCCUPIED','Existing files are preserved; explicit takeover verification is required.');
     insist(!this.git.branchExists(p.anchorPath,input.branch),'BRANCH_OCCUPIED','The branch already exists and cannot be overwritten.');
     this.git.guardPrivate(p.anchorPath);
@@ -88,16 +88,18 @@ export class WorkspaceService {
     const prior=this.intent(input.operationId);if(prior){insist(prior.kind==='takeover' && prior.data.requestHash===digest(canonicalJson(input)),'OPERATION_CONFLICT','Takeover operation identifier was reused with different content.');return this.reconcile(input.operationId) as WorkspaceBinding;}
     const project=this.getProject(input.projectId);const worktreePath=canonicalDirectory(input.worktreePath);this.git.validateBranch(input.branch);this.git.validateOid(input.expectedHead);
     insist(input.branch!==project.formalTarget,'FORMAL_BRANCH','The formal branch cannot become a demand workspace.');
+    const otherBindings=this.db.prepare('SELECT data FROM workspace_bindings WHERE demand_id<>?').all(input.demandId) as any[];
+    insist(!otherBindings.some(row=>sameDirectory(JSON.parse(row.data).worktreePath,worktreePath)),'WORKSPACE_CONFLICT','This physical directory already belongs to another demand.');
     const existing=this.getBinding(input.demandId);
-    if(existing){insist(existing.projectId===input.projectId && existing.worktreePath===worktreePath && existing.branch===input.branch,'WORKSPACE_CONFLICT','The demand already owns a different workspace.');this.checkBinding(existing);return existing;}
-    insist(this.git.commonDirectory(worktreePath)===this.git.commonDirectory(project.anchorPath) && this.git.worktrees(project.anchorPath).some(w=>w.path===worktreePath && w.branch===input.branch),'WORKSPACE_DRIFT','The selected workspace is not owned by this repository and branch.');
+    if(existing){insist(existing.projectId===input.projectId && sameDirectory(existing.worktreePath,worktreePath) && existing.branch===input.branch,'WORKSPACE_CONFLICT','The demand already owns a different workspace.');this.checkBinding(existing);return existing;}
+    insist(sameDirectory(this.git.commonDirectory(worktreePath),this.git.commonDirectory(project.anchorPath)) && this.git.worktrees(project.anchorPath).some(w=>sameDirectory(w.path,worktreePath) && w.branch===input.branch),'WORKSPACE_DRIFT','The selected workspace is not owned by this repository and branch.');
     insist(this.git.head(worktreePath)===input.expectedHead,'CONTENT_DRIFT','Existing work has a different HEAD.');this.git.guardPrivate(worktreePath);
     insist(this.git.status(worktreePath).length===0,'USER_DIRTY','Existing uncommitted or staged work is preserved; takeover requires separate reconciliation.');
     insist(input.baseline && this.git.isAncestor(worktreePath,input.baseline,input.expectedHead),'BASELINE_UNVERIFIED','A verified ancestor baseline is required for takeover.');
     const formal=this.git.formalHead(project.anchorPath,project.formalTarget);insist(formal && this.git.isAncestor(worktreePath,input.baseline,formal),'BASELINE_UNVERIFIED','Takeover baseline is outside the formal target.');
     this.git.verifyTree(worktreePath,input.expectedHead);
     const reservations=this.db.prepare("SELECT data FROM workspace_intents WHERE kind='prepare' AND status='pending'").all() as any[];
-    insist(!reservations.some(row=>{const r=JSON.parse(row.data).request;return r.worktreePath===worktreePath || (r.projectId===input.projectId && r.branch===input.branch);}),'WORKSPACE_RESERVED','Another unfinished preparation reserves this workspace.');
+    insist(!reservations.some(row=>{const r=JSON.parse(row.data).request;return destinationsCollide(r.worktreePath,worktreePath) || (r.projectId===input.projectId && r.branch===input.branch);}),'WORKSPACE_RESERVED','Another unfinished preparation reserves this workspace.');
     const binding:WorkspaceBinding={projectId:input.projectId,demandId:input.demandId,worktreePath,branch:input.branch,initialBaseline:input.baseline,currentBaseline:input.baseline,head:input.expectedHead,preparationOperation:input.operationId};
     this.db.exec('BEGIN IMMEDIATE');try {
       this.db.prepare('INSERT INTO workspace_bindings VALUES(?,?,?,?,?)').run(input.demandId,input.projectId,worktreePath,input.branch,canonicalJson(binding));
@@ -107,8 +109,8 @@ export class WorkspaceService {
   }
   private checkBinding(binding:WorkspaceBinding):void {
     const p = this.getProject(binding.projectId); canonicalDirectory(binding.worktreePath);
-    insist(this.git.commonDirectory(binding.worktreePath)===this.git.commonDirectory(p.anchorPath),'WORKSPACE_DRIFT','Worktree Git administration points outside the bound project.');
-    insist(this.git.worktrees(p.anchorPath).some(w=>w.path===binding.worktreePath && w.branch===binding.branch),'WORKSPACE_DRIFT','Workspace ownership or branch changed.');
+    insist(sameDirectory(this.git.commonDirectory(binding.worktreePath),this.git.commonDirectory(p.anchorPath)),'WORKSPACE_DRIFT','Worktree Git administration points outside the bound project.');
+    insist(this.git.worktrees(p.anchorPath).some(w=>sameDirectory(w.path,binding.worktreePath) && w.branch===binding.branch),'WORKSPACE_DRIFT','Workspace ownership or branch changed.');
     insist(this.git.branch(binding.worktreePath)===binding.branch,'WORKSPACE_DRIFT','Worktree branch changed.');
   }
   private fileHash(binding:WorkspaceBinding,path:string):string|null {
@@ -142,10 +144,10 @@ export class WorkspaceService {
       const r=d.request; const p=this.getProject(r.projectId);
       if(intent.status==='complete') {const complete=this.getBinding(r.demandId);insist(complete,'WORKSPACE_MISSING','Completed workspace binding is missing.');this.checkBinding(complete);return complete;}
       let rows=this.git.worktrees(p.anchorPath);
-      if(!rows.some(w=>w.path===r.worktreePath || w.branch===r.branch) && !existsSync(r.worktreePath) && !this.git.branchExists(p.anchorPath,r.branch)) {
+      if(!rows.some(w=>sameDirectory(w.path,r.worktreePath) || w.branch===r.branch) && !existsSync(r.worktreePath) && !this.git.branchExists(p.anchorPath,r.branch)) {
         this.git.addWorktree(p.anchorPath,r.worktreePath,r.branch,r.baseline);rows=this.git.worktrees(p.anchorPath);
       }
-      const found=rows.find(w=>w.path===r.worktreePath && w.branch===r.branch);
+      const found=rows.find(w=>sameDirectory(w.path,r.worktreePath) && w.branch===r.branch);
       insist(found && found.head===r.baseline,'SIDE_EFFECT_UNKNOWN','Workspace creation requires inspection; no second workspace was created.');
       const binding:WorkspaceBinding={projectId:r.projectId,demandId:r.demandId,worktreePath:r.worktreePath,branch:r.branch,initialBaseline:r.baseline,currentBaseline:r.baseline,head:r.baseline,preparationOperation:operationId};
       const existing=this.getBinding(r.demandId); if(existing) {this.checkBinding(existing); return existing;}

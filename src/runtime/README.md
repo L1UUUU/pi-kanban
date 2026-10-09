@@ -14,6 +14,9 @@ request, installs software, changes a Windows ACL, or launches a production Work
   real Node parent/child processes, check `/proc` birth identity/process group membership,
   signal only owned groups, and observe stopped writing. This is **not containment**:
   `setsid` escape, hostile code, and kill-on-Host-crash are not supported or claimed.
+- `VerifiedWindowsDriver`: real helper transport/bootstrap, enabled only by the independent
+  exact-machine/artifact/evidence verifier. It binds per-generation capability messages and
+  native lifecycle proof; forged flags or class objects cannot enable it.
 - `native/windows`: real Win32 candidate source and a Windows CTest probe, independently
   gated from production. See its README for commands and unverified limits.
 

@@ -38,6 +38,20 @@ const finding=(id='F1',severity:FindingInput['severity']='blocking'):FindingInpu
 test('AC-001: saving an idea creates no workspace/run intent and grants no authority',()=>{
   const f=fixture();assert.equal(f.service.getDemand('demand-a').phase,'idea');assert.equal(f.store.outbox().length,0);assert.deepEqual(f.service.listRuns(),[]);assert.equal(f.service.getDemand('demand-a').grant,undefined);f.store.close();
 });
+test('explicit configuration fills only missing method slots before first dispatch and never upgrades a frozen method',()=>{
+  const f=fixture();
+  f.service.updateProjectMethods(f.project.id,{planning:methods.planning},f.user);
+  f.command({type:'start-planning'});
+  f.service.updateProjectMethods(f.project.id,{...methods,planning:{...methods.planning,version:'2.0.0'}},f.user);
+  const completed=f.service.completeMissingMethods(f.demand.id);
+  assert.equal(completed.methodSnapshot.planning?.version,'1.0.0');
+  assert.equal(completed.methodSnapshot.review?.version,'1.0.0');
+  const before=completed.revision;assert.equal(f.service.completeMissingMethods(f.demand.id).revision,before);
+  f.claim();
+  f.service.updateProjectMethods(f.project.id,{},f.user);
+  assert.deepEqual(f.service.completeMissingMethods(f.demand.id).methodSnapshot,completed.methodSnapshot);
+  f.store.close();
+});
 test('AC-005,006: plan readiness rejects unresolved scope, missing artifacts, non-independent review',()=>{
   const f=fixture();const run=f.start();f.draft(run,'P1',['Required decision']);assert.throws(()=>f.ready(run),code('UNRESOLVED_DESIGN'));assert.equal(f.service.getDemand('demand-a').phase,'planning');f.store.close();
   const g=fixture();const p=g.start();g.draft(p);const body={type:'plan-ready',planId:'P1',boundaryReview:{contextId:p.contextId,planningContextId:p.contextId,evidence:ref('boundary'),unresolvedBlockingFindings:[]}};

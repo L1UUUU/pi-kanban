@@ -203,6 +203,42 @@ DWORD ControlledJob::Launch(const LaunchDescriptor& d, const PrivateHandles& cha
   });
   return ERROR_SUCCESS;
 }
+DWORD ControlledJob::SpawnNodeCheck(const LaunchDescriptor& d, const std::vector<std::wstring>& args, HANDLE input, HANDLE output, PROCESS_INFORMATION* result) {
+  if (!job_ || !result || args.empty() || args.size() > 64 || d.generation != identity_.generation) return ERROR_INVALID_PARAMETER;
+  DWORD error = ValidateDescriptor(d); if (error) return error;
+  size_t total = 0; for (const auto& argument : args) { total += argument.size(); if (argument.find(L'\0') != std::wstring::npos) return ERROR_INVALID_PARAMETER; }
+  if (total > 32768) return ERROR_INVALID_PARAMETER;
+  Sid sid; const HRESULT sid_result = DeriveAppContainerSidFromAppContainerName(d.profile_name.c_str(), &sid.value); if (FAILED(sid_result)) return HRESULT_CODE(sid_result);
+  SECURITY_CAPABILITIES security{}; security.AppContainerSid = sid.value; // Same identity, no capabilities.
+  HANDLE handles[] = {input, output};
+  for (HANDLE h : handles) { DWORD flags = 0; if (!GetHandleInformation(h, &flags) || !(flags & HANDLE_FLAG_INHERIT) || GetFileType(h) != FILE_TYPE_PIPE) return ERROR_INVALID_HANDLE; }
+  SIZE_T size = 0; InitializeProcThreadAttributeList(nullptr, 3, 0, &size); if (!size) return GetLastError();
+  Attributes attributes; attributes.bytes.resize(size); auto* list = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attributes.bytes.data());
+  if (!InitializeProcThreadAttributeList(list, 3, 0, &size)) return GetLastError(); attributes.list = list;
+  DWORD policy = PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT;
+  if (!UpdateProcThreadAttribute(list, 0, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, &security, sizeof(security), nullptr, nullptr) ||
+      !UpdateProcThreadAttribute(list, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, handles, sizeof(handles), nullptr, nullptr) ||
+      !UpdateProcThreadAttribute(list, 0, PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY, &policy, sizeof(policy), nullptr, nullptr)) return GetLastError();
+  STARTUPINFOEXW startup{}; startup.StartupInfo.cb = sizeof(startup); startup.lpAttributeList = list; startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+  startup.StartupInfo.hStdInput = input; startup.StartupInfo.hStdOutput = output; startup.StartupInfo.hStdError = output;
+  std::wstring command = Quote(d.node_executable); for (const auto& argument : args) command += L" " + Quote(argument);
+  wchar_t windows[MAX_PATH]{}; if (!GetWindowsDirectoryW(windows, MAX_PATH)) return GetLastError();
+  std::vector<std::wstring> environment = {L"APPDATA=" + d.scratch, L"LOCALAPPDATA=" + d.scratch, L"PI_OFFLINE=1", L"SystemDrive=" + std::wstring(windows, 2), L"SystemRoot=" + std::wstring(windows), L"TEMP=" + d.scratch, L"TMP=" + d.scratch, L"USERPROFILE=" + d.scratch};
+  std::sort(environment.begin(), environment.end()); std::vector<wchar_t> block;
+  for (const auto& item : environment) { block.insert(block.end(), item.begin(), item.end()); block.push_back(L'\0'); } block.push_back(L'\0');
+  PROCESS_INFORMATION created{};
+  if (!CreateProcessW(d.node_executable.c_str(), command.data(), nullptr, nullptr, TRUE, CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW,
+      block.data(), d.workspace.c_str(), &startup.StartupInfo, &created)) return GetLastError();
+  Handle process{created.hProcess}, thread{created.hThread};
+  const auto fail = [&](DWORD failure) { TerminateProcess(process.value, failure); WaitForSingleObject(process.value, 5000); return failure; };
+  if (!AssignProcessToJobObject(job_, process.value)) return fail(GetLastError());
+  BOOL in_job = FALSE; if (!IsProcessInJob(process.value, job_, &in_job) || !in_job) return fail(ERROR_ACCESS_DENIED);
+  Handle token; if (!OpenProcessToken(process.value, TOKEN_QUERY, &token.value)) return fail(GetLastError());
+  DWORD bytes = 0; GetTokenInformation(token.value, TokenAppContainerSid, nullptr, 0, &bytes); std::vector<unsigned char> data(bytes);
+  if (!bytes || !GetTokenInformation(token.value, TokenAppContainerSid, data.data(), bytes, &bytes) || !EqualSid(reinterpret_cast<TOKEN_APPCONTAINER_INFORMATION*>(data.data())->TokenAppContainer, sid.value)) return fail(ERROR_ACCESS_DENIED);
+  if (ResumeThread(thread.value) == static_cast<DWORD>(-1)) return fail(GetLastError());
+  *result = created; result->hProcess = process.release(); result->hThread = thread.release(); return ERROR_SUCCESS;
+}
 DWORD ControlledJob::ActiveProcesses(DWORD* count) const {
   if (!job_ || !count) return ERROR_INVALID_HANDLE;
   JOBOBJECT_BASIC_ACCOUNTING_INFORMATION info{};

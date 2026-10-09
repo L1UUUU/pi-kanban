@@ -1,5 +1,5 @@
-import { lstatSync, realpathSync, mkdirSync, openSync, closeSync, fsyncSync, readFileSync, fstatSync, readSync, constants } from 'node:fs';
-import { resolve, relative, isAbsolute, dirname, parse, sep } from 'node:path';
+import { lstatSync, realpathSync, mkdirSync, openSync, closeSync, fsyncSync, readFileSync, fstatSync, readSync, constants, statSync, existsSync } from 'node:fs';
+import { resolve, relative, isAbsolute, dirname, basename, join, parse, sep } from 'node:path';
 
 export class WorkspaceError extends Error {
   code: string;
@@ -26,7 +26,32 @@ export function noLinks(path: string, allowMissing = false): string {
 export function canonicalDirectory(path: string): string {
   const checked = noLinks(path);
   insist(lstatSync(checked).isDirectory(), 'INVALID_PATH', 'Expected a directory.');
-  return realpathSync(checked);
+  return realpathSync.native(checked);
+}
+/** Canonicalize an existing destination or its nearest existing parent without following links. */
+export function canonicalDestination(path:string):string {
+  const absolute=noLinks(path,true);let cursor=absolute;const missing:string[]=[];
+  while(!existsSync(cursor)){missing.unshift(basename(cursor));const parent=dirname(cursor);insist(parent!==cursor,'INVALID_PATH','No existing filesystem root for destination.');cursor=parent;}
+  return join(canonicalDirectory(cursor),...missing);
+}
+/** Existing directories are equal only when no-link-checked filesystem identities agree. */
+export function sameDirectory(left:string,right:string):boolean {
+  noLinks(left,true);noLinks(right,true);if(!existsSync(left) || !existsSync(right))return false;
+  const a=canonicalDirectory(left),b=canonicalDirectory(right);
+  const first=statSync(a,{bigint:true}),second=statSync(b,{bigint:true});
+  if(first.ino!==0n && second.ino!==0n)return first.dev===second.dev && first.ino===second.ino;
+  // Fail closed on platforms without file IDs. Do not blindly case-fold existing names.
+  return a===b;
+}
+/** Same operation path, including stable aliases of an existing directory. */
+export function sameDestination(left:string,right:string):boolean {
+  if(existsSync(left) && existsSync(right))return sameDirectory(left,right);
+  return canonicalDestination(left)===canonicalDestination(right);
+}
+/** Reservations conservatively collide on Windows spelling variants even before creation. */
+export function destinationsCollide(left:string,right:string):boolean {
+  if(existsSync(left) && existsSync(right))return sameDirectory(left,right);
+  const a=canonicalDestination(left),b=canonicalDestination(right);return process.platform==='win32'?a.toLowerCase()===b.toLowerCase():a===b;
 }
 export function within(root: string, path: string): string {
   const target = resolve(root, path); const rel = relative(root, target);
