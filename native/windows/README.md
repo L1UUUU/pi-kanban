@@ -161,6 +161,16 @@ transcripts are retained, including bounded Worker diagnostics. Fixtures contain
 synthetic data and remain available for ACL inspection. A nonzero process status, timeout,
 missing observation, failed revoke or access-policy failure fails the probe.
 
+Native command receipts retain a `completion` diagnostic with the process wait result,
+exit confirmation, before/after/unexpected Job PID lists, census status, output-reader
+status and whether its unchanged 25 x 10 ms drain bound elapsed. An exit code of zero and
+successful census API alone do not prove command completion: an unexpected process or
+unfinished output drain still fails. These fields explain the existing failure reason;
+they grant no success authority. Five bounded commands in the concurrent-cleanup probe
+exercise command completion and receipt-to-next-command handoff without extending its
+existing helper deadline. Both launch failure and normal completion release their single
+check slot before publishing the receipt; the prior command never clears a newer slot.
+
 The report identifies `toolScope: "node-native-tools-only"`; adding `--git-bash` produces
 the separately labeled `node-and-git-bash-diagnostic` report. The recorder always emits
 `releaseAuthorized: false`: it is partial real-runtime

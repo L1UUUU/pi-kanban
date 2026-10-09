@@ -44,6 +44,7 @@ LaunchDescriptor Descriptor(const Json& input){
   const auto& files=input.at(L"shellFiles");if(files.kind!=Json::Kind::array||files.items.size()>512)throw std::runtime_error("bounded shell files required");if(!d.shell_executable.empty())d.shell_sha256=Hash(input.at(L"shellSha256"));else if(!input.at(L"shellSha256").str().empty())throw std::runtime_error("disabled shell hash");for(const auto& file:files.items){if(file.fields.size()!=2)throw std::runtime_error("shell lock fields");d.shell_files.push_back({file.at(L"path").str(),Hash(file.at(L"sha256"))});}return d;
 }
 std::string Base64(const std::string& bytes){static constexpr char chars[]="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";std::string out;for(size_t i=0;i<bytes.size();i+=3){const uint32_t a=static_cast<unsigned char>(bytes[i]),b=i+1<bytes.size()?static_cast<unsigned char>(bytes[i+1]):0,c=i+2<bytes.size()?static_cast<unsigned char>(bytes[i+2]):0;const uint32_t n=(a<<16)|(b<<8)|c;out+=chars[(n>>18)&63];out+=chars[(n>>12)&63];out+=i+1<bytes.size()?chars[(n>>6)&63]:'=';out+=i+2<bytes.size()?chars[n&63]:'=';}return out;}
+std::string ProcessListJson(const std::vector<DWORD>& ids){std::string out="[";for(const DWORD pid:ids){if(out.size()>1)out+=",";out+=std::to_string(pid);}return out+"]";}
 void Check(ControlledJob& job,const LaunchDescriptor& d,const Json command,std::atomic<bool>& checking){
   try{
     const auto request_id=command.at(L"requestId").str();
@@ -57,23 +58,31 @@ void Check(ControlledJob& job,const LaunchDescriptor& d,const Json command,std::
     SetHandleInformation(out_read,HANDLE_FLAG_INHERIT,0);CloseHandle(in_write);
     std::vector<DWORD> baseline;if(job.ProcessIds(baseline))throw std::runtime_error("Job census before check");
     PROCESS_INFORMATION process{};const bool shell=command.at(L"type").str()==L"run-shell";const DWORD launched=shell?job.SpawnShellCheck(d,args,in_read,out_write,&process):job.SpawnNodeCheck(d,args,in_read,out_write,&process);CloseHandle(in_read);CloseHandle(out_write);
-    if(launched){CloseHandle(out_read);Event("{\"type\":\"native.check-result\",\"requestId\":"+id+",\"generation\":\""+ToUtf8(d.generation)+"\",\"pid\":0,\"status\":"+std::to_string(launched)+",\"reason\":\"launch-failed\",\"exitCode\":null,\"outputBase64\":\"\",\"arguments\":"+ToUtf8(Serialize(input_args))+"}");checking=false;return;}
+    if(launched){CloseHandle(out_read);checking=false;Event("{\"type\":\"native.check-result\",\"requestId\":"+id+",\"generation\":\""+ToUtf8(d.generation)+"\",\"pid\":0,\"status\":"+std::to_string(launched)+",\"reason\":\"launch-failed\",\"exitCode\":null,\"outputBase64\":\"\",\"arguments\":"+ToUtf8(Serialize(input_args))+"}");return;}
     FILETIME birth{},exited{},kernel{},user{};
     if(!GetProcessTimes(process.hProcess,&birth,&exited,&kernel,&user))throw std::runtime_error("check process identity");
     const uint64_t creation=(static_cast<uint64_t>(birth.dwHighDateTime)<<32)|birth.dwLowDateTime;
-    CloseHandle(process.hThread);std::atomic<bool> output_done=false,overflow=false;std::string output;
-    std::thread reader([&]{char buffer[4096];DWORD received=0;while(ReadFile(out_read,buffer,sizeof(buffer),&received,nullptr)&&received){if(output.size()+received>limit){overflow=true;job.Stop();break;}output.append(buffer,received);}output_done=true;});
+    CloseHandle(process.hThread);std::atomic<bool> output_done=false,overflow=false;std::string output;DWORD output_read_status=ERROR_SUCCESS;
+    std::thread reader([&]{char buffer[4096];DWORD received=0;for(;;){const BOOL read=ReadFile(out_read,buffer,sizeof(buffer),&received,nullptr);if(!read){output_read_status=GetLastError();break;}if(!received)break;if(output.size()+received>limit){overflow=true;job.Stop();break;}output.append(buffer,received);}output_done=true;});
     const DWORD waited=WaitForSingleObject(process.hProcess,timeout);std::string reason="exited";
     if(waited!=WAIT_OBJECT_0){reason="timeout";job.Stop();WaitForSingleObject(process.hProcess,5000);}
     DWORD exit_code=STILL_ACTIVE;const bool exit_confirmed=!!GetExitCodeProcess(process.hProcess,&exit_code)&&exit_code!=STILL_ACTIVE;CloseHandle(process.hProcess);
     if(!exit_confirmed){job.Stop();reason="descendants-survived";}
     std::vector<DWORD> after;const DWORD census_error=job.ProcessIds(after);
     if(census_error){reason="descendants-survived";job.Stop();}
-    if(std::any_of(after.begin(),after.end(),[&](DWORD pid){return pid!=process.dwProcessId&&std::find(baseline.begin(),baseline.end(),pid)==baseline.end();})){reason="descendants-survived";job.Stop();}
+    std::vector<DWORD> unexpected;for(const DWORD pid:after)if(pid!=process.dwProcessId&&std::find(baseline.begin(),baseline.end(),pid)==baseline.end())unexpected.push_back(pid);
+    if(!unexpected.empty()){reason="descendants-survived";job.Stop();}
+    const ULONGLONG drain_started=GetTickCount64();
     for(unsigned i=0;i<25&&!output_done;i++)Sleep(10);
-    if(!output_done){reason="descendants-survived";job.Stop();}
+    const bool drain_timed_out=!output_done;const ULONGLONG drain_wait_ms=GetTickCount64()-drain_started;
+    if(drain_timed_out){reason="descendants-survived";job.Stop();}
     reader.join();CloseHandle(out_read);if(overflow)reason="output-limit";
-    checking=false;Event("{\"type\":\"native.check-result\",\"requestId\":"+id+",\"generation\":\""+ToUtf8(d.generation)+"\",\"pid\":"+std::to_string(process.dwProcessId)+",\"birth\":\""+std::to_string(creation)+"\",\"status\":"+std::to_string(census_error)+",\"reason\":\""+reason+"\",\"exitCode\":"+std::to_string(exit_code)+",\"outputBase64\":\""+Base64(output)+"\",\"arguments\":"+ToUtf8(Serialize(input_args))+"}");checking=false;
+    // Observation only: preserve the existing failure reasons and 25 x 10 ms
+    // drain bound, but distinguish unexpected Job PIDs from reader completion.
+    const std::string completion="{\"waitStatus\":"+std::to_string(waited)+",\"exitConfirmed\":"+(exit_confirmed?"true":"false")+",\"censusStatus\":"+std::to_string(census_error)+",\"baselinePids\":"+ProcessListJson(baseline)+",\"afterPids\":"+ProcessListJson(after)+",\"unexpectedPids\":"+ProcessListJson(unexpected)+",\"outputDrainTimedOut\":"+(drain_timed_out?"true":"false")+",\"outputDrainWaitMs\":"+std::to_string(drain_wait_ms)+",\"outputReadStatus\":"+std::to_string(output_read_status)+"}";
+    // Release once before publishing. A second clear after Event could overwrite
+    // the true value belonging to the next check queued on receipt delivery.
+    checking=false;Event("{\"type\":\"native.check-result\",\"requestId\":"+id+",\"generation\":\""+ToUtf8(d.generation)+"\",\"pid\":"+std::to_string(process.dwProcessId)+",\"birth\":\""+std::to_string(creation)+"\",\"status\":"+std::to_string(census_error)+",\"reason\":\""+reason+"\",\"exitCode\":"+std::to_string(exit_code)+",\"outputBase64\":\""+Base64(output)+"\",\"arguments\":"+ToUtf8(Serialize(input_args))+",\"completion\":"+completion+"}");
   }catch(...){Shutdown(ERROR_INVALID_DATA);}
 }
 void Observation(ControlledJob& job,const std::string& generation){std::vector<DWORD> ids;const DWORD error=job.ProcessIds(ids);std::string list;for(DWORD pid:ids){if(!list.empty())list+=",";list+=std::to_string(pid);}Event("{\"type\":\"native.observation\",\"generation\":\""+generation+"\",\"status\":"+std::to_string(error)+",\"activePids\":["+list+"]}");}

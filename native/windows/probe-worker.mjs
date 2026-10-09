@@ -227,14 +227,21 @@ try {
   const concurrentB = launch('review', 'concurrent-b');
   await Promise.all([concurrentA.wait(() => concurrentA.event('native.started'), 'concurrent A launch'), concurrentB.wait(() => concurrentB.event('native.started'), 'concurrent B launch')]);
   const concurrentArgs = ['-e', `const fs=require('node:fs');let ticks=0;const timer=setInterval(()=>{try{if(!fs.readFileSync(${JSON.stringify(bundledWorker)}).length)process.exit(2);if(fs.readFileSync(${JSON.stringify(join(concurrentB.workspace, 'source.txt'))},'utf8')!=='original')process.exit(3);try{fs.readFileSync(${JSON.stringify(join(workerRoot, 'private-sibling.txt'))});process.exit(4)}catch(e){if(!['EACCES','EPERM'].includes(e.code))process.exit(5)}if(++ticks===50){clearInterval(timer);process.stdout.write(${JSON.stringify(challenge)})}}catch(e){process.stderr.write(String(e));process.exit(1)}},10)`];
-  concurrentB.send({ type: 'run-node', requestId: 'concurrent-check', args: concurrentArgs, timeoutMs: 10000, maxOutputBytes: 4096 });
-  await concurrentA.stop();
-  await concurrentB.wait(() => concurrentB.event('native.check-result', event => event.requestId === 'concurrent-check'), 'unaffected concurrent helper check');
-  const concurrentReceipt = concurrentB.event('native.check-result', event => event.requestId === 'concurrent-check');
-  assert.equal(concurrentReceipt.status, 0); assert.equal(concurrentReceipt.exitCode, 0); assert.equal(concurrentReceipt.reason, 'exited'); assert.deepEqual(concurrentReceipt.arguments, concurrentArgs); assert.equal(Buffer.from(concurrentReceipt.outputBase64, 'base64').toString('utf8'), challenge);
+  // Five bounded commands also exercise receipt-to-next-command handoff. A real
+  // unexpected PID or output-drain deadline remains a failed native probe.
+  for (let attempt = 1; attempt <= 5; attempt++) {
+    const requestId = `concurrent-check-${attempt}`;
+    concurrentB.send({ type: 'run-node', requestId, args: concurrentArgs, timeoutMs: 10000, maxOutputBytes: 4096 });
+    if (attempt === 1) await concurrentA.stop();
+    await concurrentB.wait(() => concurrentB.event('native.check-result', event => event.requestId === requestId), 'unaffected concurrent helper check');
+    const concurrentReceipt = concurrentB.event('native.check-result', event => event.requestId === requestId);
+    const diagnostic = JSON.stringify({ attempt, status: concurrentReceipt.status, exitCode: concurrentReceipt.exitCode, reason: concurrentReceipt.reason, completion: concurrentReceipt.completion });
+    assert.equal(concurrentReceipt.status, 0, diagnostic); assert.equal(concurrentReceipt.exitCode, 0, diagnostic); assert.equal(concurrentReceipt.reason, 'exited', diagnostic); assert.deepEqual(concurrentReceipt.arguments, concurrentArgs); assert.equal(Buffer.from(concurrentReceipt.outputBase64, 'base64').toString('utf8'), challenge);
+    assert.equal(concurrentReceipt.completion?.waitStatus, 0, diagnostic); assert.equal(concurrentReceipt.completion?.exitConfirmed, true, diagnostic); assert.equal(concurrentReceipt.completion?.censusStatus, 0, diagnostic); assert.deepEqual(concurrentReceipt.completion?.unexpectedPids, [], diagnostic); assert.equal(concurrentReceipt.completion?.outputDrainTimedOut, false, diagnostic);
+  }
   concurrentB.send({ type: 'query' }); await concurrentB.wait(() => concurrentB.event('native.observation', event => event.status === 0 && event.activePids.includes(concurrentB.event('native.started').pid)), 'other helper remains alive');
   await concurrentB.stop();
-  passed('concurrent-acl-isolation', 'Two overlapping helpers shared exact runtime files; A revoked and independently checked old-SID absence while B repeatedly read allowed runtime/source, remained denied sibling data and survived A stop.');
+  passed('concurrent-acl-isolation', 'Two overlapping helpers shared exact runtime files; A revoked and independently checked old-SID absence while B completed five bounded Node commands that repeatedly read allowed runtime/source and remained denied sibling data. Each receipt retained successful process-wait/Job-census/output-drain observations; B survived A stop and receipt-to-next-command handoffs.');
   // Break both Host output readers while a native-contained command produces
   // continuous output. Native Event/forwarding failure must finalize just like EOF.
   const broken = launch('implementation', 'broken-output', undefined, true);
