@@ -31,13 +31,16 @@ unlimited, approved, a default provider, a working method or verified isolation.
 ```
 
 All listed keys are required, except the backward-compatible optional
-`runtime.shell` and `runtime.policyVariant` fields described below. Unknown keys are rejected, including `authorized`,
+`runtime.shell`, `runtime.policyVariant`, and conditional method `skillBundle`
+fields described below. Unknown keys are rejected, including `authorized`,
 `verified`, `executionEnabled`, `apiKey`, arbitrary headers, and authorization
 IDs inside the provider configuration. Current schema version is exactly `1`.
 
 The user’s actual `design-feature` content is **not supplied by this repository**.
-Leave `methods.planning` null until the actual source and all its declared
-transitive dependencies are available. The implementation and review stages may
+Leave `methods.planning` null until the actual source and its explicit
+digest-locked graph are selected. The public downstream closure is supplied in
+`vendor/mattpocock-skills`, pinned to commit
+`b0618bc436ad893b3c5e84e55fba86586d34a404`; no private entry is included. The implementation and review stages may
 use separately and explicitly named candidate methods. A logical method name or
 a passing fixture is not evidence that the actual user method was validated.
 
@@ -52,33 +55,31 @@ so external methods do not need to guess report fields or native evidence IDs.
 
 ## Exact method sources
 
-Each non-null method has this shape (illustrative paths and hashes must be
-replaced with the actual file selections and hashes):
+Implementation/review text methods use this shape (illustrative paths and hashes
+must be replaced with the actual file selections and hashes):
 
 ```json
 {
-  "id": "user-design-feature",
-  "logicalName": "design-feature",
+  "id": "selected-implementation",
+  "logicalName": "implementation-candidate-v1",
   "version": "2026-10-08",
   "adapter": "explicit-text-v1",
-  "path": "C:\\Methods\\design-feature\\SKILL.md",
+  "path": "C:\\Methods\\implementation-candidate-v1.md",
   "sha256": "<64 lowercase hexadecimal characters>",
-  "dependencies": [
-    {
-      "id": "design-boundaries",
-      "path": "C:\\Methods\\design-feature\\boundaries.md",
-      "sha256": "<64 lowercase hexadecimal characters>"
-    }
-  ]
+  "dependencies": []
 }
 ```
 
-- Planning requires the logical name `design-feature`.
+- Production planning requires logical name `design-feature`, adapter
+  `design-feature-staged-v1`, and its explicit `skillBundle`. An old
+  `explicit-text-v1` planning selection can remain inspectable, but the production
+  dispatcher blocks it. Legacy synthetic fixtures do not establish production
+  compatibility.
 - Implementation and review require explicit logical names, e.g.
   `implementation-candidate-v1` and `independent-review-candidate-v1`.
 - Every method declares `dependencies`, including `[]` when none are needed.
   Declare **all** files the method requires, including transitive dependencies.
-  The loader follows no textual links, shell paths, imports, extension files,
+  The file loader follows no textual links, shell paths, imports, extension files,
   ancestor `AGENTS.md`, global settings or user skill directories.
 - Paths are exact, absolute and local. Relative paths, `..`, UNC/device aliases,
   alternate streams, symbolic links and directory junctions are rejected.
@@ -95,6 +96,37 @@ replaced with the actual file selections and hashes):
 - Each stage receives fresh `AgentMaterial` objects with exact content hashes;
   a failed stage gets no partial material. The explicit Pi resource loader still
   enforces its independent role/resource restrictions.
+
+### Staged planning bundle
+
+Use the exported `bundledPlanningMethod(entry, vendorRoot)` constructor to build
+the planning configuration from the user's exact `{id,path,sha256}` entry
+reference and an explicit absolute path to `vendor/mattpocock-skills`. Serialize
+the resulting object as `methods.planning`; the ordinary configuration import
+validates it. The helper names the twelve pinned files directly and performs no
+global discovery. The private entry is read only from its selected external path.
+
+The `skillBundle` graph maps every material ID and SHA-256 to a portable relative
+resource path. Each of the four stage skills names its entry, original
+`agents/openai.yaml` and owned references; license and invocation-policy files
+are explicit supporting resources. The graph records the scoped automatic Host
+invocation, local artifact destination and agent-owned internal split overrides.
+Neither a new upstream revision nor changed invocation metadata is accepted by
+editing a hash in settings. See [the complete adapter contract](planning-method-bundle.md).
+
+Loading freezes the full graph and adds the generated `<entry-id>:skill-bundle`
+material to the method snapshot's explicit dependencies. Its bytes count toward
+the aggregate material bound. The generated identity is reserved across all
+configured stages. Restart reconstructs the selected graph from frozen evidence,
+not current files or settings.
+
+The initial model context receives no method body. Pi registers only the active
+skill metadata; `controlled_skill` and `controlled_skill_resource` release exact
+bodies only after an authenticated Host read receipt. Relative references are
+restricted to declared links inside the active skill's pinned closure. Other
+stage bodies, global skills and scripts cannot be loaded through these tools.
+Source and planning artifacts travel as labeled task data, not `AGENTS.md`
+system instructions.
 
 To compute a hash without executing the file, Node 24 can be used locally:
 
@@ -295,7 +327,9 @@ Requirements before producing a grant:
 - Explicit `contextPolicy`: `exact-materials-only` permits only the listed exact
   materials. `approved-run-derived-v1` additionally proposes transmission of the
   generated conversation and tool results derived from that exact initial
-  material set inside the same verified isolated run. It does not include new
+  material set inside verified isolated runs for the approved demand. For staged
+  planning this includes verified local artifacts passed into the next fresh
+  stage context. It does not include new
   arbitrary sources or another project. Null means unknown and blocks grant
   creation. The chosen scope must be displayed in the separate user approval;
   a configuration file cannot approve this transmission.
@@ -307,6 +341,15 @@ Requirements before producing a grant:
   and must still be in the future. A metering-policy identifier is mandatory.
 - Expired proposals may be loaded for inspection, but cannot create a grant.
   Restart, resume and re-import do not add budget or extend expiration.
+
+Staged planning requires both `planning` and `boundary-review` roles and the
+explicit `approved-run-derived-v1` policy. The initial candidate lists the full
+frozen method closure, even though each Worker receives only its active stage
+resources. Human answers, requirement confirmation, final-design confirmation
+and revision instructions change the exact planning-input digest. A previous
+grant does not automatically cover those new bytes: prepare and approve the
+current exact data candidate before the next model request. This data/spend
+authorization is separate from both product decisions and implementation consent.
 
 `createModelGrant(config, {id,demandId,decisionId}, trustedAuthorizer)` constructs
 an exact deeply frozen candidate and calls a **separately supplied synchronous
@@ -365,3 +408,11 @@ revision conflicts and corrupted state.
 
 These tests do not certify the actual user `design-feature` method, Windows
 isolation, real provider egress, paid usage or G1–G5 completion.
+
+`tests/planning-skills.test.ts` additionally checks the actual pinned public Git
+blobs, complete frozen graph, stage isolation, original invocation flags,
+unsafe-reference failures and progressive tool loading through installed Pi.
+The staged production journey uses those public files with a synthetic private
+entry and deterministic transport. An external private entry can be locally
+validated without copying it into the test suite; validation of its bytes is
+not a real-model planning run. CI for the new final commit remains to be checked.

@@ -59,32 +59,66 @@ Import `WorkbenchStore`, `WorkflowService`, `DomainError`, and contract types fr
 
 All complete contracts and discriminated command/report unions are in `types.ts`.
 
-## Handoff sequence
+## Production planning handoff
 
-1. Save an idea. No worktree or run is requested.
-2. Execute `start-planning`. Freeze all configured stage method snapshots.
-3. After actual runtime, budget, and workspace gates are verified, claim/start a
-   planning run. Missing methods never fall back to a guessed implementation.
-4. Receive `plan-draft`: immutable scope, exact spec/ticket references, demand
-   checks, and unresolved questions. Confirm/authorize this plan in either order.
-5. Receive `plan-ready` only with verified artifacts and a trusted independent
-   boundary-review attestation. Its reviewer run/context, planning run, plan,
-   evidence digest, actual execution, and isolated input checks must match.
-6. Actual planner stop is required before implementation dispatch. Authority must
-   still target the active, confirmed, ready plan.
-7. Receive `content-ready` with Host-verified stable K and N. A `contentStable`
+1. Save an idea. No worktree or run is requested. `start-planning` freezes the
+   selected method snapshots and creates the versioned `PlanningFlow` for
+   `design-feature-staged-v1`.
+2. After native, finite-model and workspace gates hold, `facts` runs in a fresh
+   read-only context. Its evidence records observed source facts and leaves
+   human choices unresolved.
+3. `clarification` uses grilling and the persisted valid answers. The owner
+   answers each exact question ID/digest through `answer-planning-question`,
+   then uses `confirm-understanding` for the current understanding ID/digest.
+   Waiting for answers or confirmation schedules no autonomous next stage.
+4. `design` produces a draft bound to the confirmed understanding. A new ordinary
+   read-only `design-review` run derives scenarios from requirements before
+   comparing the draft. It cannot reuse the clarifier/designer run, context or
+   conversation. `design-resolution` records dispositions and obtains owner
+   answers for unresolved behavioral decisions.
+5. `confirm-final-design` is a distinct owner action binding the final resolution
+   digest, including the reviewed design and testing seams. Requirement
+   confirmation never stands in for this decision. Only current confirmed
+   requirements and a resolved independently reviewed design permit `spec`.
+6. Fresh read-only stage contexts generate `PlanningSpec` and then
+   `PlanningTicket` records. A spec is a non-executable document. Tickets contain
+   immutable local evidence, the actual spec identity, clause references and
+   blockers in dependency order. Missing/self/cyclic/duplicate dependencies are
+   rejected. Internal technical split granularity requires no extra approval.
+7. A valid ticket handoff forms the ready plan and binds it to both confirmations.
+   Planning leaves `demand.grant` absent. `authorize-implementation` must still
+   name that exact active plan; local commit authority is separately explicit.
+
+Every staged handoff requires Host verification of the current flow revision,
+step, exact input digest, frozen skill read, artifact bytes, observed model run
+and actual process stop. Independent stages additionally require isolated
+read-only input attestation. Worker flags cannot supply these observations.
+Legacy `plan-draft`/`plan-ready` cannot bypass this adapter. Generic legacy domain
+behavior remains for synthetic compatibility and other explicit text methods;
+production planning refuses an `explicit-text-v1` selection.
+
+`revise-planning` reopens requirements or design and invalidates affected
+downstream artifacts/confirmations, preserving history. Saved answers are reused
+only while their questions and source decisions remain valid. Each answer,
+confirmation or revision changes the exact model-input digest. The Host requires
+a current matching data grant before transmitting it; a domain decision never
+increases model/data/budget authority.
+
+## Implementation and acceptance handoff
+
+1. Receive `content-ready` with Host-verified stable K and N. A `contentStable`
    flag must represent real verified frozen bytes; it is not an Agent assertion.
-8. After actual writer stop, dispatch a distinct read-only review context, with
+2. After actual writer stop, dispatch a distinct read-only review context, with
    exact spec, tickets, K/N and check evidence; no implementation transcript.
-9. Project and demand checks, independent review, required maintenance, and
+3. Project and demand checks, independent review, required maintenance, and
    blocking finding closure all gate the delivery result. A failed check or
    blocking finding returns work to the implementation method. Only a reviewer
    can close disputed technical findings using verified evidence.
-10. Actual run stop plus satisfied quality gates freezes C = P/K/N/E/review/
-    finding closures/notes. Only the user can accept that exact C.
-11. Explicit return reuses the same demand and starts another result round. C1
-    cannot accept C2. Remote delivery and knowledge reuse eligibility are owned
-    by separate adapters and are never inferred from acceptance.
+4. Actual run stop plus satisfied quality gates freezes C = P/K/N/E/review/
+   finding closures/notes. Only the user can accept that exact C.
+5. Explicit return reuses the same demand and starts another result round. C1
+   cannot accept C2. Remote delivery and knowledge reuse eligibility are owned
+   by separate adapters and are never inferred from acceptance.
 
 ## Reliability and adapter obligations
 
@@ -122,6 +156,13 @@ not completed end-to-end acceptance scenarios. In particular:
 - FI-09 exercises invalidation and late-writer rejection, not OS filesystem denial.
 - FI-10 proves an end event cannot complete business work or release ownership.
 - AC-024/029/030 cover changed N with unchanged K, new evidence, rework, and C1/C2.
+
+`tests/domain-planning.test.ts` covers the versioned planning stages, distinct
+confirmations, valid-answer reuse, decision reopening, review dispositions,
+ticket traceability/dependencies and absence of implementation authority.
+`tests/production-planning.test.ts` composes the installed SDK and actual Host
+protocol with deterministic model output and synthetic native observations.
+Neither suite certifies target Windows isolation or real-agent design quality.
 
 The full real-agent P07 task and platform-level P10 acceptance remain dependent
 on actual methods, Windows confinement/termination, model permissions/budgets,

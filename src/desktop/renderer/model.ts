@@ -1,3 +1,4 @@
+import { PLANNING_STEP_LABELS, planningAttention } from './planning-model.ts';
 import type { Command, CommandKind, Demand, Message, Phase, ViewState } from './types.ts';
 
 export const PHASE_LABELS: Record<Phase, string> = {
@@ -11,7 +12,7 @@ export const MESSAGE_STATES: Record<NonNullable<Message['state']>, { label: stri
   applied: { label: '已落实', explanation: '应用已记录要求落实的回执。' },
 };
 export function needsAttention(demand: Demand): boolean {
-  return demand.control !== 'cancelled' && (demand.blockers.length > 0 || demand.phase === 'blocked' ||
+  return demand.control !== 'cancelled' && (!!planningAttention(demand) || demand.blockers.length > 0 || demand.phase === 'blocked' ||
     ['awaiting-design', 'awaiting-authorization', 'awaiting-acceptance'].includes(demand.phase) ||
     demand.runState === 'unknown' || demand.runState === 'stopping');
 }
@@ -22,6 +23,8 @@ export function demandStatus(demand: Demand): { label: string; tone: 'neutral' |
   if (demand.control === 'paused') return { label: '已暂停', tone: 'neutral' };
   if (demand.control === 'exited') return { label: '已停止 · 待继续', tone: 'neutral' };
   if (demand.blockers.length || demand.phase === 'blocked') return { label: '等待解除阻塞', tone: 'warning' };
+  if (planningAttention(demand)) return { label: planningAttention(demand)!, tone: 'warning' };
+  if (demand.planningFlow && demand.planningFlow.step !== 'complete') return { label: `${PLANNING_STEP_LABELS[demand.planningFlow.step]}${demand.runState === 'running' ? '' : ' · 未运行'}`, tone: demand.runState === 'running' ? 'live' : 'neutral' };
   if (demand.runState === 'running') return { label: PHASE_LABELS[demand.phase], tone: 'live' };
   if (demand.runState === 'queued') return { label: '等待运行资源', tone: 'neutral' };
   if (demand.phase === 'accepted') return { label: '已验收', tone: 'success' };
@@ -33,13 +36,13 @@ export function primaryAction(demand: Demand): { kind: CommandKind; label: strin
   if (demand.control === 'cancelled' || demand.runState === 'stopping' || demand.runState === 'unknown') return null;
   if (demand.control === 'paused' || demand.control === 'exited') return { kind: 'resume', label: '继续这条需求', description: '核对现有授权、运行条件与剩余额度后继续。' };
   if (demand.phase === 'idea') return { kind: 'start-planning', label: '开始规划', description: '准备独立工作区并调查需求。实施需要另外授权。' };
-  if (demand.plan?.ready && !demand.plan.confirmed && demand.phase === 'awaiting-design') return { kind: 'confirm-plan', label: '确认当前方案', description: '确认此版本的范围与设计，实施授权单独处理。' };
+  if (!demand.planningFlow && demand.plan?.ready && !demand.plan.confirmed && demand.phase === 'awaiting-design') return { kind: 'confirm-plan', label: '确认当前方案', description: '确认此版本的范围与设计，实施授权单独处理。' };
   if (demand.plan?.ready && demand.plan.confirmed && demand.phase === 'awaiting-authorization') return { kind: 'authorize-implementation', label: '授权按此方案实施', description: '仅针对当前方案，在有效能力与有限额度内实施。' };
   if (demand.phase === 'awaiting-acceptance' && demand.result) return { kind: 'accept-result', label: '接受这轮成果', description: '验收仅绑定下方成果版本，后续变更需重新检查。' };
   return null;
 }
 export function makeCommand(kind: CommandKind, demand: Demand, requestId: string, text?: string): Command {
-  if (['revise-plan', 'decide-finding', 'resolve-blocker', 'switch-method'].includes(kind)) throw new Error('此决定需要专用表单与精确对象绑定。');
+  if (['revise-plan', 'decide-finding', 'resolve-blocker', 'switch-method', 'answer-planning-question', 'confirm-understanding', 'confirm-final-design', 'revise-planning'].includes(kind)) throw new Error('此决定需要专用表单与精确对象绑定。');
   const command: Command = { kind, demandId: demand.id, expectedVersion: demand.version, requestId };
   if (kind === 'confirm-plan' || kind === 'authorize-implementation') {
     if (!demand.plan) throw new Error('方案尚未就绪，请刷新后重试。');

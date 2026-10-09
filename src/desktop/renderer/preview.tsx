@@ -1,6 +1,9 @@
 /** Isolated synthetic preview entry. Never imported by main.tsx or included in production output. */
 import { createRoot } from 'react-dom/client';
 import { App } from './App.tsx';
+import { syntheticPlanningFlow } from './planning-preview.ts';
+import { PLANNING_STEPS } from './planning-model.ts';
+import type { PlanningStep } from '../../domain/types.ts';
 import type { ConfigurationSummary, ViewState, WorkbenchBridge } from './types.ts';
 import './styles.css';
 
@@ -67,6 +70,24 @@ const syntheticConfiguration = (): ConfigurationSummary => {
 const params = new URLSearchParams(location.search);
 let state: ViewState = params.get('view') === 'empty' ? { ...syntheticPreview, projects: [], demands: [], selected: undefined } : params.get('view') === 'onboarding' ? { ...syntheticPreview, selected: undefined } : structuredClone(syntheticPreview);
 // Isolated synthetic control fixtures; no production entry imports this module.
+if (params.has('planning')) {
+  const target = state.demands[0]!, selected = params.get('planning') as PlanningStep;
+  const step = PLANNING_STEPS.includes(selected) ? selected : 'awaiting-understanding-confirmation';
+  target.planningFlow = syntheticPlanningFlow(step); target.plan = undefined; target.result = undefined;
+  target.phase = step.includes('confirmation') ? 'awaiting-design' : 'planning'; target.runState = 'stopped';
+  target.messages = []; target.activities = []; target.checks = []; target.blockers = [];
+  if (params.has('planningHistory')) { const { history, ...previous } = syntheticPlanningFlow('complete'); previous.revision = 3; target.planningFlow.history.push(previous); }
+  const planningState = params.get('planningState');
+  if (planningState === 'paused' || planningState === 'exited' || planningState === 'cancelled') target.control = planningState;
+  if (planningState === 'blocked') { target.phase = 'blocked'; target.blockers = ['合成阻塞：运行条件尚待核验']; }
+  if (planningState === 'running' || planningState === 'stopping' || planningState === 'unknown' || planningState === 'queued') target.runState = planningState;
+  if (planningState === 'offline') state.runtime.connection = 'disconnected';
+  if (step === 'complete') {
+    target.phase = 'awaiting-authorization';
+    target.plan = { id: 'synthetic-staged-plan', scope: target.planningFlow.understanding!.scope, ready: true, confirmed: true, spec: target.planningFlow.spec!.evidence, tickets: { id: 'synthetic-ticket-index', digest: 'f'.repeat(64), location: 'synthetic-only://ticket-index' } };
+  }
+}
+
 if (params.has('decisions')) {
   const target = state.demands[0]!;
   target.result = undefined; target.phase = 'blocked'; target.runState = 'stopped';
@@ -117,6 +138,7 @@ const latency = Math.min(1000, Math.max(0, Number(params.get('latency')) || 0));
 const waitForSyntheticResponse = () => new Promise<void>(resolve => setTimeout(resolve, latency));
 const listeners = new Set<(next: ViewState) => void>();
 const publish = () => { state = { ...state, sequence: state.sequence + 1 }; for (const listener of listeners) listener(structuredClone(state)); return structuredClone(state); };
+window.addEventListener('pi-kanban:synthetic-change-planning', () => { const flow = state.demands[0]?.planningFlow; if (flow) { flow.revision += 1; flow.step = 'design'; } publish(); });
 window.addEventListener('pi-kanban:synthetic-change-version', () => { state.demands[0]!.version += 1; publish(); });
 window.addEventListener('pi-kanban:synthetic-change-configuration', () => { if (state.configuration) state.configuration.configurationDigest = '9'.repeat(64); publish(); });
 const previewBridge: WorkbenchBridge = {

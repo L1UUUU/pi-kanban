@@ -1,12 +1,14 @@
 import type { WorkflowService, WorkbenchStore } from '../domain/index.ts';
 import type { RunAttempt, WorkerReport, ReportVerification, Receipt } from '../domain/types.ts';
 import { RuntimeSupervisor } from '../runtime/supervisor.ts';
-import type { RuntimeDriver, LaunchRequest } from '../runtime/types.ts';
+import type { RuntimeDriver, LaunchRequest, RuntimeRole } from '../runtime/types.ts';
 import { ModelBudgetLedger } from '../runtime/budget.ts';
 
 /** Implementations are trusted Host adapters backed by observed facts. Never map
  * renderer/Worker JSON directly into these prerequisites or verifications. */
 export interface ExecutionPrerequisites {
+  /** Host-selected read-only planning delegates remain separate domain attempts. */
+  runtimeRoleFor?(run: RunAttempt): RuntimeRole;
   inspect(demandId: string): { profileVerified: boolean; budgetAvailable: boolean; workspaceVerified: boolean; blockers: string[] };
   launchFor(run: RunAttempt): Omit<LaunchRequest, 'demandId' | 'grantId' | 'role' | 'writes' | 'highResource'>;
   verifyWorkspaceAfterStop(demandId: string): boolean;
@@ -33,7 +35,7 @@ export class ExecutionCoordinator {
     this.#limits = new ModelBudgetLedger(store.db, () => { throw new Error('The coordinator cannot grant model spend.'); });
     this.supervisor = new RuntimeSupervisor(store.db, driver, request => {
       const run = store.getRun(request.grantId), demand = store.getDemand(run.demandId);
-      if (request.demandId !== run.demandId || request.role !== run.stage || request.writes !== run.writer || run.status !== 'starting' || demand.control !== 'active') throw new Error('Launch no longer matches the current authorized domain run.');
+      if (request.demandId !== run.demandId || request.role !== (prerequisites.runtimeRoleFor?.(run) ?? run.stage) || request.writes !== run.writer || run.status !== 'starting' || demand.control !== 'active') throw new Error('Launch no longer matches the current authorized domain run.');
       const facts = prerequisites.inspect(run.demandId);
       if (!facts.profileVerified || !facts.budgetAvailable || !facts.workspaceVerified) throw new Error(facts.blockers.join('; ') || 'Execution prerequisites changed.');
     });
@@ -58,7 +60,7 @@ export class ExecutionCoordinator {
         }
         this.#store.db.prepare("INSERT INTO host_run_bindings VALUES(?,NULL,'launch-intent')").run(run.id);
         try {
-          const launched = await this.supervisor.launch({ ...this.#prerequisites.launchFor(run), demandId: run.demandId, grantId: run.id, role: run.stage, writes: run.writer, highResource: run.highResource });
+          const launched = await this.supervisor.launch({ ...this.#prerequisites.launchFor(run), demandId: run.demandId, grantId: run.id, role: this.#prerequisites.runtimeRoleFor?.(run) ?? run.stage, writes: run.writer, highResource: run.highResource });
           this.#store.db.prepare("UPDATE host_run_bindings SET runtime_run_id=?,status='bound' WHERE domain_run_id=?").run(launched.runId, run.id);
           // Pause arriving during async creation must win over late registration.
           const current = this.#store.getRun(run.id);
@@ -104,7 +106,8 @@ export class ExecutionCoordinator {
     const demand = this.#store.getDemand(run.demandId);
     const returns = demand.acceptances.filter(item => item.decision === 'returned').length;
     const revisions = this.#store.history(run.demandId).filter(item => item.kind === 'user-command' && (item.data as { command?: { type?: string } }).command?.type === 'revise-plan').length;
-    const key = `execution:${run.demandId}:${run.stage}:returns-${returns}:revisions-${revisions}:${run.planId ?? 'initial'}:${run.contentId ?? 'work'}`;
+    const planning = run.planningStep ? `:planning-${run.planningFlowId}:${run.planningRevision}:${run.planningStep}` : '';
+    const key = `execution:${run.demandId}:${run.stage}:returns-${returns}:revisions-${revisions}:${run.planId ?? 'initial'}:${run.contentId ?? 'work'}${planning}`;
     this.#store.db.prepare('INSERT INTO host_run_operation_keys VALUES(?,?)').run(run.id, key);
     return key;
   }

@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { applyPlanningCommand, applyPlanningMessage, applyPlanningReport, ensurePlanningFlow, isStagedPlanning, nextPlanningStep, planningArtifactRefs, resetPlanning, STAGED_PLANNING_ADAPTER } from './planning.ts';
 import { DomainError, WorkbenchStore, canonical, digest, invariant } from './store.ts';
 import type { Acceptance, ArtifactRef, Demand, DispatchConditions, Methods, MethodSnapshot, PlanRevision, Project, Receipt, RecoveryProof, ReportVerification, RunAttempt, Stage, StopProof, UserCommand, UserContext, WorkerContext, WorkerReport } from './types.ts';
 
@@ -61,20 +62,29 @@ export class WorkflowService {
   execute(command: UserCommand, user: UserContext): Receipt {
     this.assertUser(user);
     return this.apply(`user:${user.userId}:${command.requestId}`,command, demand => {
-      if (['pause','cancel','resume','exit','switch-method','resolve-blocker'].includes(command.type)) invariant(Number.isInteger(command.expectedRevision) && command.expectedRevision!>=1,'VERSION_REQUIRED','This control must bind the currently displayed demand revision.');
+      if (['pause','cancel','resume','exit','switch-method','resolve-blocker','answer-planning-question','confirm-understanding','confirm-final-design','revise-planning'].includes(command.type)) invariant(Number.isInteger(command.expectedRevision) && command.expectedRevision!>=1,'VERSION_REQUIRED','This control must bind the currently displayed demand revision.');
       if (command.expectedRevision !== undefined) invariant(command.expectedRevision === demand.revision,'STALE_CONTROL','The displayed demand revision changed. Refresh before deciding.');
       switch (command.type) {
+        case 'answer-planning-question': case 'confirm-understanding': case 'confirm-final-design': case 'revise-planning': {
+          invariant(!this.store.listRuns(demand.id).some(activeRun), 'RUN_ACTIVE', 'Verify the planning context has stopped before recording a decision.');
+          const status = applyPlanningCommand(demand, command, user.userId, now());
+          if (status === 'noop') return ['noop', 'Planning decision already recorded.'];
+          if (command.type === 'revise-planning') demand.cycle++;
+          break;
+        }
         case 'start-planning':
           invariant(demand.control==='active','CONTROL_BLOCKED','Resume before planning.');
           if (demand.planningStarted) return ['noop','Planning already requested.'];
           demand.planningStarted=true; demand.methodSnapshot=structuredClone(this.store.getProject(demand.projectId).methods); break;
         case 'confirm-plan':
+          invariant(!demand.planningFlow, 'STAGED_CONFIRMATION_REQUIRED', 'Staged planning requires its separate requirement and final design confirmations.');
           this.currentPlan(demand,command.planId);
           if (demand.confirmedPlanId===command.planId) return ['noop','Design already confirmed.'];
           demand.confirmedPlanId=command.planId; break;
         case 'authorize-implementation': {
           const designChanged=!!command.confirmDesign && demand.confirmedPlanId!==command.planId;
-          this.currentPlan(demand,command.planId);
+          const authorizedPlan = this.currentPlan(demand,command.planId);
+          if (demand.planningFlow) invariant(authorizedPlan.ready && demand.planningFlow.step === 'complete' && demand.confirmedPlanId === authorizedPlan.id && authorizedPlan.designBinding?.finalConfirmationDigest === demand.planningFlow.finalDesignConfirmation?.digest, 'STAGED_CONFIRMATION_REQUIRED', 'Finish separately confirmed staged planning before granting implementation authority.');
           if (command.confirmDesign) demand.confirmedPlanId=command.planId;
           if (!designChanged && demand.grant?.planId===command.planId && (!command.localCommit || demand.grant.localCommit)) return ['noop','Implementation authority already exists.'];
           demand.grant={planId:command.planId,userId:user.userId,localCommit:command.localCommit ?? demand.grant?.localCommit ?? false,createdAt:now()}; break;
@@ -94,6 +104,7 @@ export class WorkflowService {
           this.currentPlan(demand,command.previousPlanId); text(command.reason,'reason');
           invariant(!demand.activeResultId,'RESULT_PROTECTED','Return the exact result before changing its plan.');
           invariant(!this.store.listRuns(demand.id).some(activeRun),'WRITER_ACTIVE','Stop the existing run before revising the plan.');
+          if (demand.planningFlow) resetPlanning(demand, 'requirements');
           demand.activePlanId=undefined; demand.confirmedPlanId=undefined; demand.grant=undefined; demand.activeContentId=undefined; demand.cycle++; demand.blockedReasons=[]; break;
         case 'accept-result': {
           invariant(demand.activeResultId===command.resultId,'STALE_RESULT','Acceptance targets a specific current result, not the latest result.');
@@ -112,11 +123,21 @@ export class WorkflowService {
           method(command.method); text(command.reason,'reason'); invariant(command.impactReviewed,'IMPACT_UNREVIEWED','Method changes require recorded impact review.');
           invariant(!this.store.listRuns(demand.id).some(activeRun),'RUN_ACTIVE','Stop the current run before replacing its method.');
           invariant(!demand.activeResultId,'RESULT_PROTECTED','Submitted results are immutable.');
+          if (command.stage === 'planning' && demand.planningFlow) {
+            invariant(command.method.adapter === STAGED_PLANNING_ADAPTER, 'STAGED_METHOD_DOWNGRADE', 'A staged planning flow cannot switch to a method that bypasses its decisions.');
+            resetPlanning(demand, 'requirements'); demand.planningFlow.step = 'facts'; demand.planningFlow.facts = undefined; demand.planningFlow.understanding = undefined;
+          }
+          if (command.stage === 'planning' && !demand.planningFlow && command.method.adapter === STAGED_PLANNING_ADAPTER) { demand.activePlanId = undefined; demand.confirmedPlanId = undefined; demand.grant = undefined; demand.activeContentId = undefined; }
           demand.methodSnapshot[command.stage]=structuredClone(command.method); demand.cycle++; break;
         case 'message':
           text(command.messageId,'messageId'); text(command.text,'text');
           invariant(['question','information','change-request'].includes(command.kind),'INVALID_INPUT','Unknown message kind.');
           if(demand.messages.some(m=>m.id===command.messageId)) { invariant(demand.messages.some(m=>m.id===command.messageId && m.text===command.text && m.kind===command.kind),'CONTENT_CONFLICT','Message ID content differs.'); return ['noop','Message already saved.']; }
+          if (demand.planningFlow) {
+            applyPlanningMessage(demand, { id: command.messageId, text: command.text, kind: command.kind }, user.userId, now());
+            if (command.kind === 'change-request') { demand.cycle++; this.stopRuns(demand, 'planning-scope-changed'); }
+            else if (this.store.listRuns(demand.id).some(run => activeRun(run) && run.stage === 'planning')) this.stopRuns(demand, 'planning-inputs-changed');
+          }
           demand.messages.push({id:command.messageId,text:command.text,kind:command.kind,state:'saved'}); break;
         case 'decide-finding': {
           text(command.reason,'reason');const finding=demand.findings.find(f=>f.id===command.findingId);
@@ -145,11 +166,17 @@ export class WorkflowService {
     return this.apply(`run:${report.runId}:${report.requestId}`,report,demand=>{
       const run=this.store.getRun(report.runId);
       const newerRun=this.store.listRuns(demand.id).some(other=>other.generation>run.generation);
-      const stale=newerRun || (run.planId && run.planId!==demand.activePlanId) || run.cycle!==demand.cycle || (run.contentId && run.contentId!==demand.activeContentId);
+      const stale=(run.planningFlowId && (run.planningFlowId !== demand.planningFlow?.id || run.planningRevision !== demand.planningFlow.revision || run.planningStep !== demand.planningFlow.step)) || newerRun || (run.planId && run.planId!==demand.activePlanId) || run.cycle!==demand.cycle || (run.contentId && run.contentId!==demand.activeContentId);
       if(stale) { this.audit(demand.id,'historical-report',report); return ['historical','Report retained for its original version.']; }
       invariant(!demand.activeResultId || report.type==='runtime-ended','RESULT_PROTECTED','Submitted content cannot be changed by a report.');
       switch(report.type) {
+        case 'planning-facts': case 'planning-questions': case 'planning-clarification': case 'planning-design': case 'planning-design-review': case 'planning-design-resolution': case 'planning-spec': case 'planning-tickets': {
+          const contexts = this.store.listRuns(demand.id).filter(other => other.id !== run.id);
+          invariant(!contexts.some(other => other.contextId === run.contextId), 'REVIEW_NOT_INDEPENDENT', 'Each staged step requires a new context identity.');
+          applyPlanningReport(demand, run, report, verification); break;
+        }
         case 'plan-draft': {
+          invariant(!demand.planningFlow && !isStagedPlanning(demand), 'STAGED_REPORT_REQUIRED', 'Legacy plan-draft cannot bypass staged planning.');
           this.role(run,'planning'); const plan=report.plan; text(plan.id,'plan.id'); text(plan.scope,'plan.scope'); artifact(plan.spec); artifact(plan.tickets); this.validateChecks(plan.requiredChecks);
           invariant(Array.isArray(plan.unresolvedQuestions),'INVALID_PLAN','Unresolved questions must be explicit.');
           const existing=demand.plans.find(p=>p.id===plan.id);
@@ -159,6 +186,7 @@ export class WorkflowService {
           run.planId=plan.id; this.store.saveRun(run); break;
         }
         case 'plan-ready': {
+          invariant(!demand.planningFlow && !isStagedPlanning(demand), 'STAGED_REPORT_REQUIRED', 'Legacy plan-ready cannot bypass staged planning.');
           this.role(run,'planning'); const plan=this.currentPlan(demand,report.planId);
           invariant(verification.artifactsVerified,'ARTIFACTS_UNVERIFIED','Host must verify exact spec, ticket, and review artifacts.');
           invariant(plan.unresolvedQuestions.length===0,'UNRESOLVED_DESIGN','Current scope has unresolved questions.');
@@ -254,7 +282,8 @@ export class WorkflowService {
         const content=demand.contents.find(c=>c.id===demand.activeContentId);
         const plan=demand.plans.find(p=>p.id===demand.activePlanId);
         const generation=Math.max(0,...this.store.listRuns(demand.id).map(r=>r.generation))+1;
-        const run: RunAttempt={id:id('run'),demandId:demand.id,stage,generation,contextId:id('context'),planId:plan?.id,contentId:stage==='review'?content?.id:undefined,cycle:demand.cycle,status:'starting',writer:stage==='implementation',highResource,method:structuredClone(selected),contextSources:[...(plan?[plan.spec.id,plan.tickets.id]:[]),...(stage==='review' && content?[content.code.id,...content.knowledge.map(n=>n.id),...demand.checks.filter(e=>e.contentId===content.id).map(e=>e.evidence.id)]:[])],createdAt:now()};
+        const planningStep = stage === 'planning' ? nextPlanningStep(demand) : null;
+        const run: RunAttempt={id:id('run'),demandId:demand.id,stage,...(planningStep ? {planningStep,planningFlowId:demand.planningFlow!.id,planningRevision:demand.planningFlow!.revision} : {}),generation,contextId:id('context'),planId:plan?.id,contentId:stage==='review'?content?.id:undefined,cycle:demand.cycle,status:'starting',writer:stage==='implementation',highResource,method:structuredClone(selected),contextSources:[...(planningStep ? planningArtifactRefs(demand, planningStep).map(ref => ref.id) : []),...(plan?[plan.spec.id,plan.tickets.id]:[]),...(stage==='review' && content?[content.code.id,...content.knowledge.map(n=>n.id),...demand.checks.filter(e=>e.contentId===content.id).map(e=>e.evidence.id)]:[])],createdAt:now()};
         this.store.saveRun(run); demand.revision++; this.store.saveDemand(demand); this.store.db.prepare("UPDATE domain_outbox SET status='done' WHERE id=?").run(entry.id); this.audit(demand.id,'run-claimed',run); return run;
       }
       return null;
@@ -322,6 +351,26 @@ export class WorkflowService {
       this.reconcile(demand); demand.revision++; this.store.saveDemand(demand); return demand;
     });
   }
+  /** Trusted Host observation of changed source since the exact independent facts
+   * run. A repeated/stale observation cannot reset newer facts or human choices. */
+  invalidatePlanningSource(demandId: string, expectedFactsRunId: string, reason: string): Demand {
+    text(expectedFactsRunId, 'facts run'); text(reason, 'source change reason');
+    return this.store.transaction(() => {
+      const demand = this.store.getDemand(demandId), flow = demand.planningFlow;
+      if (!flow?.facts || flow.facts.runId !== expectedFactsRunId) return demand;
+      if (demand.activeResultId) {
+        const blocker = `Planning source changed: ${reason}`;
+        if (demand.blockedReasons.includes(blocker)) return demand;
+        demand.blockedReasons.push(blocker);
+      } else {
+        resetPlanning(demand, 'requirements');
+        flow.facts = undefined; flow.understanding = undefined; flow.step = 'facts'; demand.cycle++;
+      }
+      this.stopRuns(demand, 'planning-source-changed');
+      this.audit(demandId, 'planning-source-invalidated', { expectedFactsRunId, reason, protectedResult: demand.activeResultId ?? null });
+      this.reconcile(demand); demand.revision++; this.store.saveDemand(demand); return demand;
+    });
+  }
   /** Detect external modifications without replacing an immutable C or its acceptance. */
   invalidateCurrentContent(demandId: string, reason: string): Demand {
     text(reason,'reason');return this.store.transaction(()=>{const d=this.store.getDemand(demandId);d.blockedReasons.push(`Content changed: ${reason}`);if(d.activeContentId && !d.invalidatedContentIds.includes(d.activeContentId))d.invalidatedContentIds.push(d.activeContentId);this.stopRuns(d,'content-changed');this.audit(d.id,'content-invalidated',{contentId:d.activeContentId,resultId:d.activeResultId,reason});d.phase='blocked';d.revision++;this.store.saveDemand(d);this.notify(d,`content-changed:${d.activeContentId}`,reason);return d;});
@@ -353,10 +402,11 @@ export class WorkflowService {
   private requiredChecks(d: Demand) { const project=this.store.getProject(d.projectId); const plan=d.plans.find(p=>p.id===d.activePlanId);const map=new Map(project.baseChecks.map(c=>[c.id,c]));for(const c of plan?.requiredChecks ?? []) { invariant(!map.has(c.id) || canonical(map.get(c.id))===canonical(c),'CHECK_REQUIREMENT_CONFLICT','Demand cannot override project check requirements.');map.set(c.id,c); }return [...map.values()]; }
   private validateStopProof(proof: StopProof): void { invariant(proof.processAbsent && proof.descendantsAbsent && proof.workspaceVerified,'STOP_UNVERIFIED','Actual process tree absence and workspace state must be verified.');text(proof.evidence,'stop evidence'); }
   private stopRuns(d: Demand, reason: string): void { for(const run of this.store.listRuns(d.id).filter(activeRun)){run.status='stopping';run.stopReason=reason;this.store.saveRun(run);this.enqueue(`stop:${run.id}`,d.id,'stop-run',{runId:run.id,reason});} }
-  private intentKey(d: Demand, stage: Stage): string { return `start:${d.id}:${stage}:${d.activePlanId??'draft'}:${stage==='review'?d.activeContentId??'none':'work'}:${d.cycle}:attempt:${Math.max(0,...this.store.listRuns(d.id).map(r=>r.generation))+1}`; }
+  private intentKey(d: Demand, stage: Stage): string { return `start:${d.id}:${stage}:${d.activePlanId??'draft'}:${stage==='review'?d.activeContentId??'none':'work'}:${d.cycle}:${stage === 'planning' && d.planningFlow ? `${d.planningFlow.id}:${d.planningFlow.revision}:${d.planningFlow.step}` : 'legacy'}:attempt:${Math.max(0,...this.store.listRuns(d.id).map(r=>r.generation))+1}`; }
   private nextStage(d: Demand): Stage | null {
     if((d.activeContentId && d.invalidatedContentIds.includes(d.activeContentId)) || d.control!=='active' || d.blockedReasons.length || d.activeResultId || !d.planningStarted) return null;
     const plan=d.plans.find(p=>p.id===d.activePlanId);
+    if (isStagedPlanning(d) && d.planningFlow && d.planningFlow.step !== 'complete') return nextPlanningStep(d) ? 'planning' : null;
     if(!plan?.ready) return 'planning';
     if(d.confirmedPlanId!==plan.id || d.grant?.planId!==plan.id) return null;
     if(!d.activeContentId) return 'implementation';
@@ -368,12 +418,14 @@ export class WorkflowService {
     return 'review';
   }
   private reconcile(d: Demand): void {
+    ensurePlanningFlow(d);
     if(d.activeContentId && d.invalidatedContentIds.includes(d.activeContentId)) {d.phase='blocked';return;}
     if(d.blockedReasons.length) {d.phase='blocked';for(const reason of new Set(d.blockedReasons))this.notify(d,`blocked:${digest(reason)}`,reason);return;}
     if(d.activeResultId) { d.phase=d.acceptances.some(a=>a.resultId===d.activeResultId && a.decision==='accepted')?'accepted':'awaiting-acceptance'; return; }
     if(!d.planningStarted) {d.phase='idea';return;}
     const plan=d.plans.find(p=>p.id===d.activePlanId);
-    if(!plan?.ready) d.phase='planning';
+    if (d.planningFlow && d.planningFlow.step !== 'complete') d.phase = ['awaiting-understanding-confirmation', 'awaiting-final-design-confirmation'].includes(d.planningFlow.step) ? 'awaiting-design' : 'planning';
+    else if(!plan?.ready) d.phase='planning';
     else if(d.confirmedPlanId!==plan.id) d.phase='awaiting-design';
     else if(d.grant?.planId!==plan.id) d.phase='awaiting-authorization';
     else if(!d.activeContentId) d.phase=d.cycle?'rework':'implementing';
@@ -391,7 +443,7 @@ export class WorkflowService {
     const stage=this.nextStage(d);
     if(stage && !this.store.listRuns(d.id).some(activeRun)) {
       if(!d.methodSnapshot[stage]) {d.phase='blocked';this.notify(d,`method:${stage}` ,`Missing ${stage} method; no fallback is permitted.`);return;}
-      this.enqueue(this.intentKey(d,stage),d.id,'start-run',{stage,planId:d.activePlanId??null,contentId:d.activeContentId??null,cycle:d.cycle});
+      this.enqueue(this.intentKey(d,stage),d.id,'start-run',{stage,planningStep:stage === 'planning' ? nextPlanningStep(d) : null,planningFlowId:d.planningFlow?.id??null,planningRevision:d.planningFlow?.revision??null,planId:d.activePlanId??null,contentId:d.activeContentId??null,cycle:d.cycle});
     }
   }
   private enqueue(key: string,demandId: string,kind: string,payload: unknown): void {this.store.db.prepare('INSERT OR IGNORE INTO domain_outbox(business_key,demand_id,kind,payload,created_at) VALUES (?,?,?,?,?)').run(key,demandId,kind,JSON.stringify(payload),now());}

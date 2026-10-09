@@ -61,7 +61,8 @@ test('production captures demand-frozen method bytes, not later settings/files',
   writeFileSync(f.configuration.methods.planning!.path, 'changed unapproved source');
   assert.deepEqual(f.production.evidence.method(demand.methodSnapshot.planning!), before);
   assert.throws(() => f.production.evidence.freezeMethod(demand.methodSnapshot.planning!, [{ ...before[0]!, content: 'different' }]));
-  const data = f.production.requiredModelData('demand'); assert.ok(data.some(item => item.id === 'method-review')); assert.ok(data.some(item => item.id === 'source-scope:demand'));
+  assert.throws(() => f.production.requiredModelData('demand'), /Production planning requires design-feature-staged-v1/, 'A retained legacy snapshot does not silently enable a production planning bypass.');
+  assert.equal(f.production.evidence.sourceMaterial('demand').id, 'source-scope:demand');
   assert.equal(f.production.prepareDemand('demand', f.binding.initialBaseline).worktreePath, f.binding.worktreePath);
 });
 test('production rejects unsupported real runtime while keeping source/demand state', async t => {

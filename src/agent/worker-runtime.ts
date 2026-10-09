@@ -12,6 +12,9 @@ import { PrivateModelPipeClient,PrivateFrameDecoder,encodePrivateFrame } from '.
 import type { ProviderResponse } from '../runtime/model-broker.ts';
 import { controlledTools } from './controlled-tools.ts';
 import type { NativePinnedWorkspace } from './controlled-tools.ts';
+import { createPlanningSkillSession } from './planning-skills.ts';
+import type { PlanningSkillProjection } from './planning-skills.ts';
+import type { PlanningWorkStep } from '../domain/types.ts';
 
 export interface WorkerInit {
   version:1;type:'worker.init';runId:string;generation:string;demandId:string;domainRunId:string;domainGeneration:number;
@@ -24,8 +27,10 @@ export interface WorkerInit {
   shellEnabled?:false;
   /** Private Host assertion delivered only after verified native launch, not model data. */
   workspaceCapability?:NativePinnedWorkspace;
+  planning?:{flowId:string;flowRevision:number;inputDigest:string;step:PlanningWorkStep;contextId:string};
+  planningSkills?:PlanningSkillProjection;
 }
-const reportTypes=new Set(['plan-draft','plan-ready','content-ready','check','review','dispute','resolve-finding','blocked','message-delivered','message-applied','runtime-ended']);
+const reportTypes=new Set(['plan-draft','plan-ready','content-ready','check','review','dispute','resolve-finding','blocked','message-delivered','message-applied','runtime-ended','planning-facts','planning-questions','planning-clarification','planning-design','planning-design-review','planning-design-resolution','planning-spec','planning-tickets']);
 export function validateWorkerInit(input:unknown,generation:string):WorkerInit{
   if(!input||typeof input!=='object'||Array.isArray(input))throw new RuntimeError('WORKER_BOOTSTRAP_INVALID','Object bootstrap required');const value=input as WorkerInit;
   if(value.version!==1||value.type!=='worker.init'||value.generation!==generation||!['planning','implementation','review','boundary-review','check'].includes(value.role)||!Number.isSafeInteger(value.domainGeneration)||value.domainGeneration<1)
@@ -34,6 +39,11 @@ export function validateWorkerInit(input:unknown,generation:string):WorkerInit{
   if(!/^[a-f0-9]{64}$/.test(value.capability)||!Array.isArray(value.materials)||!value.limits)throw new RuntimeError('WORKER_BOOTSTRAP_INVALID','Private capability and limits required');
   if(value.checkOnly!==undefined&&(value.checkOnly!==true||value.role!=='check'))throw new RuntimeError('WORKER_BOOTSTRAP_INVALID','Check-only bootstrap requires the bounded check role');
   if(value.shellEnabled!==undefined&&value.shellEnabled!==false)throw new RuntimeError('SHELL_NOT_SUPPORTED','The Node-only Worker cannot enable a shell tool');
+  if(value.planning!==undefined||value.planningSkills!==undefined){
+    const p=value.planning;
+    if(!p||!value.planningSkills||value.checkOnly||typeof p.flowId!=='string'||!p.flowId||!Number.isSafeInteger(p.flowRevision)||p.flowRevision<1||!(/^[a-f0-9]{64}$/).test(p.inputDigest)||typeof p.contextId!=='string'||!p.contextId||p.step!==value.planningSkills.stage||value.role!==(['facts','design-review'].includes(p.step)?'boundary-review':'planning'))throw new RuntimeError('WORKER_BOOTSTRAP_INVALID','Planning projection must match its private stage, flow and read-only role');
+    createPlanningSkillSession(value.planningSkills);
+  }
   if(value.workspaceCapability!==undefined){const cap=value.workspaceCapability;if(!cap||typeof cap!=='object'||cap.version!==1||cap.kind!=='native-pinned-workspace'||cap.path!==value.workspace||cap.generation!==generation||Object.keys(cap).sort().join(',')!=='generation,kind,path,version')throw new RuntimeError('WORKER_BOOTSTRAP_INVALID','Native workspace capability does not match the private run');}
   for(const key of ['maxFileBytes','commandTimeoutMs','maxOutputBytes'] as const){const limit=value.limits[key];if(!Number.isSafeInteger(limit)||limit<1)throw new RuntimeError('FINITE_POLICY_REQUIRED','Worker limits must be finite');}return value;
 }
@@ -50,7 +60,7 @@ export async function runWorkerFromStreams(input:Readable,output:Writable,expect
   modelRequests.on('data',(chunk:Buffer)=>{if(output.writableLength+chunk.length>2*1024*1024)close(new RuntimeError('WORKER_BACKPRESSURE','Model output queue full'));else output.write(chunk);});
   input.on('data',(chunk:Buffer)=>{try{for(const frame of decoder.push(chunk)){const value=JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(frame)) as Record<string,unknown>;
     if(!init){init=validateWorkerInit(value,expectedGeneration);resolveInit(init);continue;}
-    if((value.type==='worker.receipt'||value.type==='worker.check-result'||value.type==='worker.write-result')&&typeof value.requestId==='string'){const wait=pending.get(value.requestId);if(!wait)throw new RuntimeError('REPORT_REPLAY','Unexpected report receipt');pending.delete(value.requestId);if(value.ok===true)wait.resolve(value.value);else wait.reject(new RuntimeError('REPORT_REJECTED','Host rejected report'));}
+    if((value.type==='worker.receipt'||value.type==='worker.check-result'||value.type==='worker.write-result'||value.type==='worker.skill-result')&&typeof value.requestId==='string'){const wait=pending.get(value.requestId);if(!wait)throw new RuntimeError('REPORT_REPLAY','Unexpected report receipt');pending.delete(value.requestId);if(value.ok===true)wait.resolve(value.value);else wait.reject(new RuntimeError('REPORT_REJECTED','Host rejected report'));}
     else if(value.type==='worker.abort'){void session?.session.abort();}
     else if(typeof value.sequence==='number'&&typeof value.ok==='boolean')modelResponses.write(encodePrivateFrame(frame));
     else throw new RuntimeError('WORKER_CONTROL_DENIED','Unknown Worker control frame');
@@ -63,11 +73,16 @@ export async function runWorkerFromStreams(input:Readable,output:Writable,expect
     const channel=new FramedPiModelChannel(boot,(frame,signal)=>client.send(frame,signal) as Promise<ProviderResponse>);
     const report=async(body:Record<string,unknown>)=>{
       if(!reportTypes.has(String(body.type)))throw new RuntimeError('REPORT_TYPE_DENIED','Unknown business report');
-      const requestId=randomUUID();const bound={...body,requestId,demandId:boot.demandId,runId:boot.domainRunId,generation:boot.domainGeneration};
+      if(boot.planning&&body.type!=='blocked'&&!planningSkills?.hasLoadedPrimary())throw new RuntimeError('PLANNING_SKILL_NOT_LOADED','Load the exact active stage skill before reporting.');
+      const requestId=randomUUID();const bound={...body,...(boot.planning?{flowId:boot.planning.flowId,flowRevision:boot.planning.flowRevision}:{}),requestId,demandId:boot.demandId,runId:boot.domainRunId,generation:boot.domainGeneration};
       const reply=new Promise((resolve,reject)=>{pending.set(requestId,{resolve,reject});});
       send({version:1,type:'worker.report',runtimeRunId:boot.runId,generation:boot.generation,capability:boot.capability,report:bound});return reply;
     };
-    const tools=controlledTools({workspace:boot.workspace,scratch:boot.scratch,role:boot.role,generation:boot.generation,workspaceCapability:boot.workspaceCapability,...boot.limits,report,
+    const planningSkills=boot.planningSkills?createPlanningSkillSession(boot.planningSkills,{onRead:async(resource)=>{
+      const requestId=randomUUID();const reply=new Promise<unknown>((resolve,reject)=>pending.set(requestId,{resolve,reject}));
+      send({version:1,type:'worker.skill-request',runId:boot.runId,generation:boot.generation,capability:boot.capability,requestId,resource});await reply;
+    }}):undefined;
+    const tools=controlledTools({workspace:boot.workspace,scratch:boot.scratch,role:boot.role,generation:boot.generation,workspaceCapability:boot.workspaceCapability,planningStep:boot.planning?.step,...boot.limits,report,
       write:async(toolCallId,path,content,perform)=>{
         const requestId=randomUUID();const exchange=(type:string,body:Record<string,unknown>)=>{const response=new Promise<unknown>((resolve,reject)=>pending.set(requestId,{resolve,reject}));send({version:1,type,runId:boot.runId,generation:boot.generation,capability:boot.capability,requestId,...body});return response;};
         try{await exchange('worker.write-request',{action:'write',toolCallId,path,sha256:createHash('sha256').update(content).digest('hex'),bytes:Buffer.byteLength(content)});perform();await exchange('worker.write-complete',{});}
@@ -88,7 +103,8 @@ export async function runWorkerFromStreams(input:Readable,output:Writable,expect
         finally{signal?.removeEventListener('abort',abort);}
       },
       stopRequired:reason=>send({version:1,type:'worker.stop-required',runId:boot.runId,generation:boot.generation,capability:boot.capability,reason})});
-    session=await createBrokeredPiSession({cwd:boot.workspace,agentDir:boot.sessionDir,role:boot.role,materials:boot.materials,sessionManager:manager,channel,tools,model:boot.model,compaction:boot.compaction,retry:boot.retry});
+    tools.push(...(planningSkills?.tools??[]));
+    session=await createBrokeredPiSession({cwd:boot.workspace,agentDir:boot.sessionDir,role:boot.role,materials:boot.materials,sessionManager:manager,channel,tools,planningSkills,model:boot.model,compaction:boot.compaction,retry:boot.retry});
     send({version:1,type:'worker.ready',runId:boot.runId,generation:boot.generation,sessionId:manager.getSessionId()});
     session.session.subscribe(event=>{if(event.type==='agent_settled'||event.type==='agent_end'||event.type==='tool_execution_start'||event.type==='tool_execution_end')
       send({version:1,type:'worker.event',runId:boot.runId,generation:boot.generation,event});});

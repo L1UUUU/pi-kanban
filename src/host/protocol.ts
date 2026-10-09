@@ -1,6 +1,7 @@
 /** The desktop control protocol is deliberately separate from Worker reports. */
 export const MAX_FRAME_BYTES = 128 * 1024;
-export const COMMANDS = new Set(['start-planning', 'confirm-plan', 'authorize-implementation', 'pause', 'resume', 'cancel', 'accept-result', 'return-result', 'revise-plan', 'decide-finding', 'resolve-blocker', 'switch-method']);
+export const PLANNING_COMMANDS = new Set(['answer-planning-question', 'confirm-understanding', 'confirm-final-design', 'revise-planning']);
+export const COMMANDS = new Set(['start-planning', 'confirm-plan', 'authorize-implementation', 'pause', 'resume', 'cancel', 'accept-result', 'return-result', 'revise-plan', 'decide-finding', 'resolve-blocker', 'switch-method', ...PLANNING_COMMANDS]);
 export class ProtocolError extends Error {
   code: string;
   constructor(code: string, message: string) { super(message); this.code = code; }
@@ -14,6 +15,11 @@ export function text(value: unknown, name: string, max = 20_000, allowEmpty = fa
   return value;
 }
 export function id(value: unknown, name = 'identifier'): string { return text(value, name, 160); }
+export function digest(value: unknown, name = 'artifact digest'): string {
+  const result = text(value, name, 64);
+  if (!/^[a-f0-9]{64}$/.test(result)) throw new ProtocolError('INVALID_INPUT', `Invalid ${name}.`);
+  return result;
+}
 export function revision(value: unknown): number {
   if (!Number.isSafeInteger(value) || Number(value) < 0) throw new ProtocolError('INVALID_INPUT', 'An explicit current version is required.');
   return Number(value);

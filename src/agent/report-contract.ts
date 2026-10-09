@@ -1,6 +1,8 @@
 import { Type } from '@earendil-works/pi-ai';
 import type { TSchema } from '@earendil-works/pi-ai';
 import type { RuntimeRole } from '../runtime/types.ts';
+import type { PlanningWorkStep } from '../domain/types.ts';
+import { planningReportParameters, planningReportInstructions } from './planning-report-contract.ts';
 
 const strict = { additionalProperties: false };
 const id = () => Type.String({ minLength: 1, maxLength: 200, pattern: '^[A-Za-z0-9][A-Za-z0-9_.:/@-]*$' });
@@ -20,7 +22,8 @@ const resolveFinding = Type.Object({ type: Type.Literal('resolve-finding'), find
 
 /** A model-facing adapter contract, not permission or evidence. The transport and
  * Host still bind identity, enforce role/current versions and independently verify facts. */
-export function controlledReportParameters(role: RuntimeRole) {
+export function controlledReportParameters(role: RuntimeRole, planningStep?: PlanningWorkStep) {
+  if (planningStep) return planningReportParameters(planningStep);
   const reports: Record<RuntimeRole, TSchema[]> = { planning: [planDraft, blocked, ...messages], 'boundary-review': [planReady, blocked], implementation: [contentReady, dispute, blocked, ...messages], review: [check, review, resolveFinding, blocked, ...messages], check: [blocked] };
   return Type.Object({ report: Type.Union(reports[role]) }, strict);
 }
@@ -35,4 +38,4 @@ const stageInstructions: Record<RuntimeRole, string> = {
 Submit review:{reviewId,contentId,evidence,knowledgeReviewed:true,findings:[{id,severity,location,basis,impact,verification}]} with a concrete new check-evidence artifact. Cover source correctness, required behavior and necessary local maintenance; zero findings is not proof by itself. Findings are blocking, suggestion, or decision; only users resolve decision findings. Independently recheck each fix and submit resolve-finding:{findingId,contentId,evidence,outcome:"fixed"|"false-positive"|"not-applicable"}; the latter two require a recorded dispute. A passed check alone does not replace a review or close findings.`,
   check: 'This is a Host-only check lane. No Agent model session or report is authorized.',
 };
-export function reportAdapterInstructions(role: RuntimeRole): string { return `${shared}\n\n${stageInstructions[role]}`; }
+export function reportAdapterInstructions(role: RuntimeRole, planningStep?: PlanningWorkStep): string { return planningStep ? planningReportInstructions(planningStep) : `${shared}\n\n${stageInstructions[role]}`; }

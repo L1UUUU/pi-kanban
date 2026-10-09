@@ -1,5 +1,5 @@
 import type { KnowledgeAction, KnowledgeLifecycleView } from '../../host/knowledge-lifecycle.ts';
-import type { ArtifactRef, Finding, Methods, Stage } from '../../domain/types.ts';
+import type { ArtifactRef, Finding, Methods, PlanningFlow, Stage } from '../../domain/types.ts';
 import type { ConfigurationSummary } from '../../host/configuration.ts';
 export type { ConfigurationSummary, ProviderConfiguration } from '../../host/configuration.ts';
 /** Display-only Host snapshot. This is not an authorization boundary or a second workflow engine. */
@@ -35,6 +35,7 @@ export interface Demand {
   phase: Phase;
   control: Control;
   plan?: Plan;
+  planningFlow?: PlanningFlow;
   result?: Result;
   blockers: string[];
   /** Persisted workflow blockers, excluding runtime diagnostic prerequisites. */
@@ -69,7 +70,7 @@ export interface ViewState {
   /** Only set by the isolated synthetic preview entry; never inferred from a missing bridge. */
   preview?: boolean;
 }
-export type CommandKind = 'start-planning' | 'confirm-plan' | 'authorize-implementation' | 'pause' | 'resume' | 'cancel' | 'accept-result' | 'return-result' | 'revise-plan' | 'decide-finding' | 'resolve-blocker' | 'switch-method';
+export type CommandKind = 'start-planning' | 'confirm-plan' | 'authorize-implementation' | 'pause' | 'resume' | 'cancel' | 'accept-result' | 'return-result' | 'revise-plan' | 'decide-finding' | 'resolve-blocker' | 'switch-method' | 'answer-planning-question' | 'confirm-understanding' | 'confirm-final-design' | 'revise-planning';
 export interface Command {
   kind: CommandKind;
   demandId: string;
@@ -89,6 +90,15 @@ export interface Command {
   authorName?: string;
   authorEmail?: string;
   text?: string;
+  flowId?: string;
+  flowRevision?: number;
+  understandingId?: string;
+  designId?: string;
+  digest?: string;
+  questionId?: string;
+  questionDigest?: string;
+  answer?: string;
+  scope?: 'requirements' | 'design';
   requestId: string;
 }
 export interface ModelAuthorizationCommand {

@@ -59,11 +59,51 @@ The complete Worker -> actual SDK -> controlled report -> framed Host broker -> 
 provider responses. The same native entry is wired to `VerifiedWindowsDriver`; its machine,
 artifact hashes, private handles and actual ACL/Job evidence must pass before real launch.
 
+## Staged planning integration
+
+Production planning uses `design-feature-staged-v1`; plain `explicit-text-v1`
+planning is accepted only by the explicitly synthetic composition path.
+`planning-skills.ts` reconstructs the immutable private entry and exact public
+dependency graph from frozen Host materials. Each fresh Worker gets only its
+selected skill and owned references. Pi's real `ResourceLoader.getSkills()`
+registers its original metadata, including disabled invocation flags.
+
+`controlled_skill` and `controlled_skill_resource` return original bodies only
+after the authenticated `worker.skill-request` receives the Host receipt.
+No method body is initially injected, and no arbitrary skill, filesystem or
+network resource can be selected. Staged `getAgentsFiles()` stays empty; approved
+source and generated artifacts enter the labeled untrusted task-data lane.
+The upstream originals and restrictions stay unchanged; scoped automatic Host
+invocation and local artifact destinations are documented in
+[the resource adapter contract](../../docs/planning-method-bundle.md).
+
+The private bootstrap binds flow ID/revision, step and exact input digest.
+Facts and design review use separate fresh read-only contexts; all planning
+stages have no source write/delete tools and cannot implement tickets. Bounded
+`controlled_node` checks remain available for fact investigation and validation
+under the existing read-only role, finite native/runtime/model grant and private
+scratch limits. They cannot modify source or use a shell/child-IPC fallback.
+The Host requires
+observed primary-skill loading and verified process stop before accepting a
+typed stage handoff. It rejects legacy plan reports, stale flow state and
+unverified artifact references. Requirement understanding and final reviewed
+design/test seams have distinct owner confirmations before local spec/tickets.
+Planning completion never grants implementation permission.
+
+The installed-Pi resource tests exercise progressive tool loading and rejection
+paths. The production journey tests exercise these same methods through actual
+Worker/Host framing using deterministic provider responses and synthetic native
+observations. The private entry stays external; no private text is checked into
+test fixtures. These tests do not establish real-model output quality or native
+isolation, and CI for the new final commit remains to be verified.
+
 ## Deliberately remaining
 
 - Complete the target Windows 11 private-handle and isolation matrix. Hosted-Windows actual Node/Pi probes passed; no in-process test substitutes for target evidence.
 - Validate real provider cancellation/late billing under explicitly authorized data/spend limits.
-- Obtain actual design-feature and downstream method sources/digests.
+- Explicitly configure the external private design-feature entry and the pinned
+  public method bundle for each installation; validate real-model behavior under
+  approved data and spend limits.
 - Verify the exact Node/Pi combination and full role/ACL/read boundary matrix. Bash/POSIX is excluded from the approved first product scope.
 - Run genuine planning, implementation, independent review, repair, and human acceptance.
 

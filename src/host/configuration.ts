@@ -2,6 +2,8 @@ import { createHash, randomUUID } from 'node:crypto';
 import { closeSync, constants, existsSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readSync, realpathSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { isAbsolute, join, parse, resolve, sep } from 'node:path';
 import type { AgentMaterial } from '../agent/resources.ts';
+import { createBundledPlanningManifest, parsePlanningSkillManifest, planningManifestMaterial, planningBundleDigest, PLANNING_SKILL_ADAPTER, resolvePlanningBundle, PINNED_PLANNING_COMMIT } from '../agent/planning-skills.ts';
+import type { PlanningSkillManifest } from '../agent/planning-skills.ts';
 import type { Methods, MethodSnapshot, Stage } from '../domain/types.ts';
 import type { ModelGrant } from '../runtime/budget.ts';
 import { RuntimeError } from '../runtime/types.ts';
@@ -32,6 +34,8 @@ export interface RuntimeConfiguration {
 }
 export interface MethodSourceConfiguration extends FileReference {
   logicalName: string; version: string; adapter: string; dependencies: FileReference[];
+  /** Explicit portable graph; original private entry remains an external file reference. */
+  skillBundle?: PlanningSkillManifest;
 }
 export interface ModelLimits {
   maxRequests: number; maxTokens: number; maxCostMicros: number;
@@ -64,6 +68,14 @@ export interface LoadedMethods {
   summaries: MethodConfigurationSummary[]; blockers: string[];
 }
 export interface ModelDecisionReference { id: string; demandId: string; decisionId: string }
+
+/** Convenience constructor for an explicitly selected vendor root; files are checked by loadMethods. */
+export function bundledPlanningMethod(entry: FileReference, vendorRoot: string): MethodSourceConfiguration {
+  const checkedEntry = fileReference(entry, 'planning entry'), root = localPath(vendorRoot, 'planning vendor root');
+  const skillBundle = createBundledPlanningManifest(checkedEntry);
+  return { ...checkedEntry, logicalName: 'design-feature', version: `upstream-${PINNED_PLANNING_COMMIT}`, adapter: PLANNING_SKILL_ADAPTER,
+    dependencies: skillBundle.resources.filter(resource => resource.id !== entry.id).map(resource => ({ id: resource.id, path: join(root, ...resource.path.split('/')), sha256: resource.sha256 })), skillBundle };
+}
 
 function fail(code: string, message: string): never { throw new RuntimeError(code, message); }
 function object(value: unknown, allowed: readonly string[], label: string, optional: readonly string[] = []): Record<string, unknown> {
@@ -155,14 +167,23 @@ function runtimeConfiguration(value: unknown): RuntimeConfiguration {
   };
 }
 function methodSource(value: unknown, stage: Stage): MethodSourceConfiguration {
-  const ref = fileReference(value, `methods.${stage}`, ['logicalName', 'version', 'adapter', 'dependencies']);
-  const o = value as Record<string, unknown>;
+  const o = object(value, ['id', 'path', 'sha256', 'logicalName', 'version', 'adapter', 'dependencies', 'skillBundle'], `methods.${stage}`, ['skillBundle']);
+  const ref = fileReference({ id: o.id, path: o.path, sha256: o.sha256 }, `methods.${stage}`);
   const logicalName = identifier(o.logicalName, `methods.${stage}.logicalName`);
   if (stage === 'planning' && logicalName !== 'design-feature') fail('PLANNING_METHOD_REQUIRED', 'Planning must point to the supplied design-feature method; candidate text cannot silently replace it.');
   const dependencies = array(o.dependencies, `methods.${stage}.dependencies`, 64, v => fileReference(v, 'method dependency'));
   unique([ref.id, ...dependencies.map(d => d.id)], 'Method and dependency identifiers');
   unique([ref.path, ...dependencies.map(d => d.path)], 'Method and dependency paths');
-  return { ...ref, logicalName, version: string(o.version, 'method version', 80), adapter: identifier(o.adapter, 'method adapter'), dependencies };
+  const adapter = identifier(o.adapter, 'method adapter');
+  if (Object.hasOwn(o, 'skillBundle') && (stage !== 'planning' || adapter !== PLANNING_SKILL_ADAPTER)) fail('INVALID_CONFIGURATION', 'Only the explicit staged planning adapter accepts a skill bundle.');
+  if (adapter === PLANNING_SKILL_ADAPTER && (stage !== 'planning' || !Object.hasOwn(o, 'skillBundle'))) fail('PLANNING_METHOD_REQUIRED', 'Staged planning requires its explicit digest-locked skill graph.');
+  const skillBundle = Object.hasOwn(o, 'skillBundle') ? parsePlanningSkillManifest(o.skillBundle) : undefined;
+  if (skillBundle) {
+    const references = [ref, ...dependencies];
+    if (skillBundle.entryId !== ref.id || skillBundle.resources.length !== references.length || skillBundle.resources.some(resource => !references.some(reference => reference.id === resource.id && reference.sha256 === resource.sha256))) fail('INVALID_CONFIGURATION', 'The planning graph must bind every configured method/dependency exactly once by identity and digest.');
+    if (references.some(reference => reference.id === `${ref.id}:skill-bundle`)) fail('INVALID_CONFIGURATION', 'The generated planning manifest identity is reserved.');
+  }
+  return { ...ref, logicalName, version: string(o.version, 'method version', 80), adapter, dependencies, ...(skillBundle ? { skillBundle } : {}) };
 }
 function limits(value: unknown): ModelLimits {
   const o = object(value, ['maxRequests', 'maxTokens', 'maxCostMicros', 'currency', 'expiresAt', 'meteringPolicy'], 'provider.limits');
@@ -203,6 +224,7 @@ export function parseConfiguration(value: unknown): WorkbenchConfiguration {
     if (materialIdentities.has(ref.id) && materialIdentities.get(ref.id) !== identity) fail('INVALID_CONFIGURATION', 'A material identifier cannot refer to different files or revisions across stages.');
     materialIdentities.set(ref.id, identity);
   }
+  if (parsed.methods.planning?.skillBundle && materialIdentities.has(`${parsed.methods.planning.id}:skill-bundle`)) fail('INVALID_CONFIGURATION', 'No configured stage may reuse the generated planning manifest identity.');
   if (Buffer.byteLength(JSON.stringify(parsed), 'utf8') > MAX_CONFIGURATION_BYTES) fail('CONFIGURATION_TOO_LARGE', 'Configuration exceeds the bounded control frame.');
   return parsed;
 }
@@ -268,6 +290,7 @@ function errorText(error: unknown): string {
   return `CONFIGURATION_FILE_UNAVAILABLE: ${typeof code === 'string' ? code : 'unable to read the explicitly configured file'}`;
 }
 function methodDigest(source: MethodSourceConfiguration): string {
+  if (source.skillBundle) return planningBundleDigest(source.id, source.version, source.skillBundle);
   return sha256(JSON.stringify({ id: source.id, logicalName: source.logicalName, version: source.version, adapter: source.adapter,
     files: [{ id: source.id, sha256: source.sha256 }, ...source.dependencies.map(d => ({ id: d.id, sha256: d.sha256 })).sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))] }));
 }
@@ -294,7 +317,14 @@ export function loadMethods(configuration: WorkbenchConfiguration): LoadedMethod
           if (sha256(content!) !== reference.sha256) fail('METHOD_ENCODING_INVALID', 'Method text must round-trip as exact UTF-8 without a byte-order mark.');
           materials.push({ id: reference.id, kind: 'method', sha256: reference.sha256, content: content! });
         }
-        const snapshot: MethodSnapshot = { id: source.id, version: source.version, digest: methodDigest(source), adapter: source.adapter, dependencies: source.dependencies.map(d => `${d.id}@${d.sha256}`).sort() };
+        const manifest = source.skillBundle ? planningManifestMaterial(source.id, source.skillBundle) : undefined;
+        if (manifest) {
+          totalBytes += Buffer.byteLength(manifest.content, 'utf8');
+          if (totalBytes > MAX_METHOD_TOTAL_BYTES) fail('CONFIGURATION_TOO_LARGE', 'The three stages exceed the total method material bound.');
+          materials.push(manifest);
+        }
+        const snapshot: MethodSnapshot = { id: source.id, version: source.version, digest: methodDigest(source), adapter: source.adapter, dependencies: [...source.dependencies.map(d => `${d.id}@${d.sha256}`), ...(manifest ? [`${manifest.id}@${manifest.sha256}`] : [])].sort() };
+        if (manifest) resolvePlanningBundle(snapshot, materials);
         result.methods[stage] = snapshot; result.materials[stage] = materials;
         summary.status = 'configured'; summary.snapshot = snapshot;
       } catch (error) { summary.status = 'invalid'; summary.blockers.push(errorText(error)); }

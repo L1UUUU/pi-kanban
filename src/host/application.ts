@@ -5,7 +5,7 @@ import { createHash } from 'node:crypto';
 import { WorkflowService, WorkbenchStore } from '../domain/index.ts';
 import type { Demand, UserCommand, Stage } from '../domain/types.ts';
 import type { ViewState, DemandView } from '../desktop/renderer/types.ts';
-import { COMMANDS, ProtocolError, id, record, revision, text } from './protocol.ts';
+import { COMMANDS, PLANNING_COMMANDS, ProtocolError, digest, id, record, revision, text } from './protocol.ts';
 import { ModelBudgetLedger } from '../runtime/budget.ts';
 import { WorkspaceService, ImmutableObjectStore } from '../workspace/index.ts';
 import { KnowledgeService } from '../knowledge/index.ts';
@@ -105,6 +105,7 @@ export class HostApplication {
     try { binding = this.workspace.getBinding(d.id); } catch { binding = null; }
     return {
       id: d.id, projectId: d.projectId, title: d.title, description: d.description, version: d.revision, phase: d.phase, control: d.control,
+      planningFlow: d.planningFlow ? structuredClone(d.planningFlow) : undefined,
       plan: plan ? { id: plan.id, scope: plan.scope, ready: plan.ready, confirmed: d.confirmedPlanId === plan.id, specPath: plan.spec.location, spec: structuredClone(plan.spec), tickets: structuredClone(plan.tickets), boundaryReviewEvidence: plan.boundaryReview ? structuredClone(plan.boundaryReview.evidence) : undefined, requiredChecks: plan.requiredChecks.map(c => c.name), unresolvedQuestions: [...plan.unresolvedQuestions] } : undefined,
       result: result ? { id: result.id, contentId: result.contentId, notes: result.notes, createdAt: result.createdAt, codeRef: result.K.location, codeArtifact: structuredClone(result.K), knowledgeArtifacts: structuredClone(result.N), reviewEvidence: structuredClone(result.review.evidence), knowledgeRefs: result.N.map(n => n.id), accepted: d.acceptances.some(a => a.resultId === result.id && a.decision === 'accepted') } : undefined,
       activeContentId: d.activeContentId, methodSnapshot: structuredClone(d.methodSnapshot), findings: structuredClone(d.findings), workflowBlockers: [...d.blockedReasons],
@@ -203,7 +204,17 @@ export class HostApplication {
         const common = { requestId: id(params.requestId), demandId: id(params.demandId), expectedRevision: revision(params.expectedVersion) };
         let command: UserCommand;
         let localAuthor: { name: string; email: string } | undefined;
-        if (kind === 'authorize-implementation') {
+        if (PLANNING_COMMANDS.has(kind)) {
+          const binding = { ...common, flowId: id(params.flowId, 'planning flow'), flowRevision: revision(params.flowRevision) };
+          if (kind === 'confirm-understanding') command = { ...binding, type: kind, understandingId: id(params.understandingId, 'requirements version'), digest: digest(params.digest, 'requirements digest') };
+          else if (kind === 'confirm-final-design') command = { ...binding, type: kind, designId: id(params.designId, 'design version'), digest: digest(params.digest, 'final design and resolution digest') };
+          else if (kind === 'answer-planning-question') command = { ...binding, type: kind, questionId: id(params.questionId, 'planning question'), questionDigest: digest(params.questionDigest, 'planning question digest'), answer: text(params.answer, 'planning answer') };
+          else {
+            if (params.scope !== 'requirements' && params.scope !== 'design') throw new ProtocolError('INVALID_INPUT', 'Select requirements or design as the revision scope.');
+            command = { ...binding, type: 'revise-planning', scope: params.scope, reason: text(params.text, 'scoped planning revision') };
+          }
+        }
+        else if (kind === 'authorize-implementation') {
           if (params.localCommit !== undefined && typeof params.localCommit !== 'boolean') throw new ProtocolError('INVALID_INPUT', 'Local commit permission must be explicit.');
           if (params.localCommit === true) {
             localAuthor = { name: text(params.authorName, 'local commit author', 200), email: text(params.authorEmail, 'local commit email', 320) };
@@ -232,7 +243,11 @@ export class HostApplication {
           command = { ...common, type: kind, stage, method, impactReviewed: true, reason: text(params.text, 'method change reason') };
         }
         else command = { ...common, type: kind as 'start-planning' | 'pause' | 'resume' | 'cancel' };
-        if (['revise-plan', 'resolve-blocker', 'switch-method', 'decide-finding'].includes(kind)) {
+        // Replays are checked against the original command hash by WorkflowService.
+        // A receipt lookup must not turn a lost response into a new decision or
+        // reject it merely because the already-authorized next stage has started.
+        const planningReplay = PLANNING_COMMANDS.has(kind) && !!this.store.db.prepare('SELECT 1 FROM domain_receipts WHERE key=?').get(`user:${this.#user.userId}:${common.requestId}`);
+        if ((!planningReplay && PLANNING_COMMANDS.has(kind)) || ['revise-plan', 'resolve-blocker', 'switch-method', 'decide-finding'].includes(kind)) {
           if (this.coordinator.supervisor.list().some(run => run.demandId === common.demandId && run.state !== 'stopped')) throw new ProtocolError('RUNTIME_OCCUPIED', 'Verify the complete native execution tree has stopped before this decision.');
           if (this.store.getDemand(common.demandId).activeResultId) throw new ProtocolError('RESULT_PROTECTED', 'Return the exact submitted result before changing its decisions.');
         }

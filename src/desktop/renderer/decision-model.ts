@@ -20,6 +20,7 @@ export function decisionUnavailable(review: DecisionReview, state: ViewState): s
   if (latest.result) return '请先退回当前稳定成果，再更改方案、方法或阻塞。';
   if (!['idle', 'stopped'].includes(latest.runState ?? 'unknown')) return '请先暂停并核验旧执行已经停止。';
   if (review.kind === 'revise-plan') {
+    if (latest.planningFlow) return '请使用分阶段规划中的需求或设计修订，保留仍有效的确认。';
     if (!target.plan || latest.plan?.id !== target.plan.id) return '当前方案已变化，请重新核对。';
   }
   if (review.kind === 'decide-finding') {
@@ -42,6 +43,7 @@ export function makeDecisionCommand(review: DecisionReview, input: DecisionInput
   const target = review.demand;
   const command: Command = { kind: review.kind, demandId: target.id, expectedVersion: target.version, requestId, text };
   if (review.kind === 'revise-plan') {
+    if (target.planningFlow) throw new Error('分阶段规划需要限定范围修订。');
     if (!target.plan) throw new Error('没有可修订的当前方案。');
     command.previousPlanId = target.plan.id;
   } else if (review.kind === 'decide-finding') {
