@@ -269,7 +269,7 @@ a cleanup blocker instead of being skipped or falsely certified clean.
 
 `appcontainer-no-network-v3` is a separately named primary-scope AppContainer + Job
 candidate. It omits the LPAC opt-out attribute, grants zero capabilities, and verifies
-both the actual AppContainer SID and the token's exact LPAC/non-LPAC state before
+both the actual AppContainer SID and the token's observed AAP access policy before
 resuming any instruction. The same Job, bounded private pipes, exact runtime file grants,
 source-role restrictions, disk monitor and authenticated cleanup apply. This variant
 performs no ancestor or volume-root ACL edits and never elevates or falls back.
@@ -288,3 +288,37 @@ node native/windows/probe-worker.mjs --helper build/native/Release/pi_kanban_nat
 ```
 
 Primary token-state API: https://learn.microsoft.com/en-us/windows/win32/api/winnt/ne-winnt-token_information_class
+
+
+The first v3 comparison failed pre-resume because Windows returned invalid parameter for
+`GetTokenInformation(TokenIsLessPrivilegedAppContainer)`; the enum's presence was not a
+supported query contract on that host. That result is retained as a failed experiment.
+The unsupported query is removed, never interpreted as false. Supported AppContainer,
+exact SID and capability checks remain, along with the explicitly selected creation flags.
+
+Before the business Worker is resumed, the helper now uses supported token duplication
+and same-identity impersonation APIs for two real filesystem reads. New scratch fixtures
+have protected DACLs granting the exact generated SID or ALL_APPLICATION_PACKAGES,
+respectively (plus Host/SYSTEM ownership); files are random CREATE_NEW names held against
+write/delete replacement. Exact-SID bytes must be readable for every policy. The AAP-only
+bytes must be readable for ordinary v3 and return actual ACCESS_DENIED for LPAC. Any token,
+impersonation, revert or other read failure aborts pre-resume; failed APIs are not denial
+proof. Only those helper-created synthetic files are removed by handle closure before
+untrusted code runs. Native telemetry records this trusted differential observation and
+the Host requires it, bound to the selected policy and exact helper digest.
+
+https://learn.microsoft.com/en-us/windows/win32/api/securitybaseapi/nf-securitybaseapi-duplicatetokenex
+https://learn.microsoft.com/en-us/windows/win32/api/securitybaseapi/nf-securitybaseapi-impersonateloggedonuser
+
+Once CreateProcess, exact birth capture and Job assignment succeed, a later pre-resume
+verification failure retains those trusted handles and identity for the finalizer. It
+still records launch failure; only actual zero-Job/revocation proof can authenticate clean
+recovery. A failure before birth capture or Job assignment remains unknown rather than
+being mislabeled never-created.
+
+The same exact-token differential runs before every native-mediated Node/Bash command,
+not only the primary Worker. A shared native mutex keeps these short-lived trusted
+fixtures out of concurrent disk traversal without weakening any missing/permission/reparse
+failure rule. A check-policy failure terminates the entire Job before returning failure.
+If reverting impersonation itself fails, the helper exits immediately and writes no clean
+receipt; kernel Job-handle closure kills descendants and recovery remains explicitly unknown.

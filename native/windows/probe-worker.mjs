@@ -105,6 +105,7 @@ async function runPiRole(role, workspaceOverride) {
   const run = launch(role, role, workspaceOverride); await run.wait(() => run.event('native.started'), 'native Node Worker launch');
   assert.ok(run.event('native.resources', event => event.phase === 'provision' && event.status === 0));
   assert.equal(run.event('native.started').policyVariant, policyVariant);
+  assert.equal(run.event('native.started').policyAccessVerified, true); assert.equal(run.event('native.started').allApplicationPackagesReadable, policyVariant === 'appcontainer-no-network-v3');
   const capability = randomBytes(32).toString('hex'), sessionId = `session-${randomUUID()}`, runId = `runtime-${randomUUID()}`;
   const args = ['-e', accessProgram(run, role)];
   const init = { version: 1, type: 'worker.init', runId, generation: run.generation, demandId: 'probe', domainRunId: 'domain-probe', domainGeneration: 1, role, workspace: run.workspace, scratch: run.scratch, sessionDir: run.sessionDir, sessionId, capability, prompt: 'Execute only deterministic fixture instructions through the private Host channel.', materials: [],

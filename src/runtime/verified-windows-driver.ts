@@ -57,7 +57,7 @@ export class VerifiedWindowsDriver implements RuntimeDriver {
   private nativeEvent(control:Control,frame:Uint8Array){
     const event=JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(frame)) as Record<string,unknown>;
     if(event.type==='native.started'){
-      if(event.policyVariant!==(this.profile.config.policyVariant??'lpac-strict-v1')||event.generation!==control.run.generation||!Number.isSafeInteger(event.pid)||Number(event.pid)<1||typeof event.birth!=='string'||!/^\d+$/.test(event.birth))throw new RuntimeError('NATIVE_IDENTITY_MISMATCH','Invalid native process identity');
+      if(event.policyAccessVerified!==true||event.allApplicationPackagesReadable!==(this.profile.config.policyVariant==='appcontainer-no-network-v3')||event.policyVariant!==(this.profile.config.policyVariant??'lpac-strict-v1')||event.generation!==control.run.generation||!Number.isSafeInteger(event.pid)||Number(event.pid)<1||typeof event.birth!=='string'||!/^\d+$/.test(event.birth))throw new RuntimeError('NATIVE_IDENTITY_MISMATCH','Invalid native process identity');
       if(control.identity)throw new RuntimeError('NATIVE_IDENTITY_MISMATCH','Duplicate native launch identity');
       control.identity={pid:Number(event.pid),birth:event.birth,generation:control.run.generation,controlId:control.run.runId,driver:this.id};
       this.recovery?.bind(control.run.runId,control.identity);

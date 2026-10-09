@@ -170,6 +170,8 @@ void RunRole(const fs::path& root,const std::wstring& role,SOCKET listener) {
   std::cout<<"{\"phase\":\"native-launch\",\"status\":"<<launch<<",\"stage\":\""<<job.LastStage()<<"\",\"pid\":"<<job.Identity().pid<<"}"<<std::endl;
   CloseHandle(in_read);CloseHandle(out_write);CloseHandle(log_write);
   Require(launch==ERROR_SUCCESS,"candidate launch failed (retain evidence; do not relax policy)");
+  Require(job.PolicyAccessVerified()&&job.AllPackagesReadable()==ordinary_appcontainer,"trusted pre-resume policy differential must match exact candidate");
+  std::cout<<"{\"phase\":\"native-policy-access\",\"exactSidReadable\":true,\"allApplicationPackagesReadable\":"<<job.AllPackagesReadable()<<",\"verifiedBeforeResume\":true}"<<std::endl;
   DWORD available=0;const ULONGLONG deadline=GetTickCount64()+7000;
   while(GetTickCount64()<deadline){if(PeekNamedPipe(out_read,nullptr,0,nullptr,&available,nullptr)&&available)break;Sleep(10);}
   Require(available>0&&available<16384,"bounded private report timeout");std::vector<char> report(available);DWORD received=0;

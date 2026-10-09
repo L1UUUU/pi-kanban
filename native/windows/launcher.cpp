@@ -1,4 +1,5 @@
 #include "launcher.hpp"
+#include "policy-access.hpp"
 #ifdef _WIN32
 #include <bcrypt.h>
 #include <sddl.h>
@@ -203,15 +204,24 @@ DWORD ControlledJob::Launch(const LaunchDescriptor& d, const PrivateHandles& cha
     block.data(), d.workspace.c_str(), &startup.StartupInfo, &created)) return GetLastError();
   ever_created_=true;
   Handle process{created.hProcess}, thread{created.hThread};
-  const auto fail = [&](DWORD failure) { TerminateProcess(process.value, failure); WaitForSingleObject(process.value, 5000); return failure; };
+  FILETIME exit{}, kernel{}, user{}, birth{};bool birth_confirmed=false,assigned=false;
+  const auto fail = [&](DWORD failure) {
+    TerminateProcess(process.value, failure);WaitForSingleObject(process.value, 5000);
+    // Preserve the actual assigned Job and exact birth identity even when a
+    // pre-resume check fails. Finalization must independently stop/census/revoke;
+    // this is never relabeled as never-created or inferred from PID absence.
+    if(assigned&&birth_confirmed){identity_={created.dwProcessId,birth,d.generation};job_=job.release();process_=process.release();}
+    return failure;
+  };
+  stage_ = "record-created-process-identity";
+  if(!GetProcessTimes(process.value,&birth,&exit,&kernel,&user))return fail(GetLastError());birth_confirmed=true;
   stage_ = "assign-job";
-  if (!AssignProcessToJobObject(job.value, process.value)) return fail(GetLastError());
+  if (!AssignProcessToJobObject(job.value, process.value)) return fail(GetLastError());assigned=true;
   BOOL in_job = FALSE;
   if (!IsProcessInJob(process.value, job.value, &in_job) || !in_job) return fail(ERROR_ACCESS_DENIED);
   stage_ = "verify-appcontainer-token";
   Handle token;
-  if (!OpenProcessToken(process.value, TOKEN_QUERY, &token.value)) return fail(GetLastError());
-  DWORD actual_lpac=0,lpac_bytes=0;if(!GetTokenInformation(token.value,TokenIsLessPrivilegedAppContainer,&actual_lpac,sizeof(actual_lpac),&lpac_bytes)||!!actual_lpac!=lpac)return fail(ERROR_ACCESS_DENIED);
+  if (!OpenProcessToken(process.value, TOKEN_QUERY|TOKEN_DUPLICATE, &token.value)) return fail(GetLastError());
   DWORD is_container = 0, returned = 0;
   if (!GetTokenInformation(token.value, TokenIsAppContainer, &is_container, sizeof(is_container), &returned) || !is_container) return fail(ERROR_ACCESS_DENIED);
   DWORD token_size = 0; GetTokenInformation(token.value, TokenAppContainerSid, nullptr, 0, &token_size);
@@ -221,8 +231,9 @@ DWORD ControlledJob::Launch(const LaunchDescriptor& d, const PrivateHandles& cha
   DWORD capability_bytes=0;GetTokenInformation(token.value,TokenCapabilities,nullptr,0,&capability_bytes);std::vector<unsigned char> capability_info(capability_bytes);
   if(!capability_bytes||!GetTokenInformation(token.value,TokenCapabilities,capability_info.data(),capability_bytes,&capability_bytes))return fail(ERROR_ACCESS_DENIED);
   const auto* actual_capabilities=reinterpret_cast<TOKEN_GROUPS*>(capability_info.data());if(actual_capabilities->GroupCount!=security.CapabilityCount||(security.CapabilityCount&&!EqualSid(actual_capabilities->Groups[0].Sid,registry.entry.Sid)))return fail(ERROR_ACCESS_DENIED);
-  FILETIME exit{}, kernel{}, user{}, birth{};
-  if (!GetProcessTimes(process.value, &birth, &exit, &kernel, &user)) return fail(GetLastError());
+  stage_ = "verify-policy-filesystem-access";
+  {std::lock_guard policy_lock(policy_probe_mutex_);error=policy_access::Verify(token.value,d,sid.value,&all_packages_readable_);}
+  if(error)return fail(error);policy_access_verified_=true;
   // No untrusted instruction has run before containment and identity checks complete.
   stage_ = "resume-contained-process";
   if (ResumeThread(thread.value) == static_cast<DWORD>(-1)) return fail(GetLastError());
@@ -278,13 +289,15 @@ DWORD ControlledJob::SpawnPinnedCheck(const LaunchDescriptor& d,const std::wstri
   const auto fail = [&](DWORD failure) { TerminateProcess(process.value, failure); WaitForSingleObject(process.value, 5000); return failure; };
   if (!AssignProcessToJobObject(job_, process.value)) return fail(GetLastError());
   BOOL in_job = FALSE; if (!IsProcessInJob(process.value, job_, &in_job) || !in_job) return fail(ERROR_ACCESS_DENIED);
-  Handle token; if (!OpenProcessToken(process.value, TOKEN_QUERY, &token.value)) return fail(GetLastError());
-  DWORD actual_lpac=0,lpac_bytes=0;if(!GetTokenInformation(token.value,TokenIsLessPrivilegedAppContainer,&actual_lpac,sizeof(actual_lpac),&lpac_bytes)||!!actual_lpac!=lpac)return fail(ERROR_ACCESS_DENIED);
+  Handle token; if (!OpenProcessToken(process.value, TOKEN_QUERY|TOKEN_DUPLICATE, &token.value)) return fail(GetLastError());
   DWORD bytes = 0; GetTokenInformation(token.value, TokenAppContainerSid, nullptr, 0, &bytes); std::vector<unsigned char> data(bytes);
   if (!bytes || !GetTokenInformation(token.value, TokenAppContainerSid, data.data(), bytes, &bytes) || !EqualSid(reinterpret_cast<TOKEN_APPCONTAINER_INFORMATION*>(data.data())->TokenAppContainer, sid.value)) return fail(ERROR_ACCESS_DENIED);
   DWORD capability_bytes=0;GetTokenInformation(token.value,TokenCapabilities,nullptr,0,&capability_bytes);std::vector<unsigned char> capability_info(capability_bytes);
   if(!capability_bytes||!GetTokenInformation(token.value,TokenCapabilities,capability_info.data(),capability_bytes,&capability_bytes))return fail(ERROR_ACCESS_DENIED);
   const auto* actual_capabilities=reinterpret_cast<TOKEN_GROUPS*>(capability_info.data());if(actual_capabilities->GroupCount!=security.CapabilityCount||(security.CapabilityCount&&!EqualSid(actual_capabilities->Groups[0].Sid,registry.entry.Sid)))return fail(ERROR_ACCESS_DENIED);
+  bool packages_readable=false;
+  {std::lock_guard policy_lock(policy_probe_mutex_);error=policy_access::Verify(token.value,d,sid.value,&packages_readable);}
+  if(error){stopping_=true;if(!TerminateJobObject(job_,error))::ExitProcess(error);return fail(error);}
   if (ResumeThread(thread.value) == static_cast<DWORD>(-1)) return fail(GetLastError());
   *result = created; result->hProcess = process.release(); result->hThread = thread.release(); return ERROR_SUCCESS;
 }

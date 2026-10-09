@@ -46,7 +46,8 @@ class ControlledJob {
   ~ControlledJob();
   ControlledJob(const ControlledJob&) = delete;
   ControlledJob& operator=(const ControlledJob&) = delete;
-  // Descriptor requires already-provisioned resource ACLs. Does not change ACLs or install anything.
+  // Requires pre-provisioned resource ACLs. Never rewrites existing ACLs; verifies
+  // token policy with new, short-lived synthetic scratch files before execution.
   DWORD Launch(const LaunchDescriptor&, const PrivateHandles&);
   DWORD Stop(DWORD exit_code = ERROR_CANCELLED);
   DWORD SpawnNodeCheck(const LaunchDescriptor&, const std::vector<std::wstring>& args, HANDLE input, HANDLE output, PROCESS_INFORMATION* process);
@@ -54,6 +55,9 @@ class ControlledJob {
   DWORD ActiveProcesses(DWORD* count) const;
   DWORD ProcessIds(std::vector<DWORD>& ids) const;
   bool EverCreated() const {return ever_created_;}
+  bool PolicyAccessVerified() const {return policy_access_verified_;}
+  bool AllPackagesReadable() const {return all_packages_readable_;}
+  std::mutex& PolicyProbeMutex() {return policy_probe_mutex_;}
   const ProcessIdentity& Identity() const { return identity_; }
   const char* LastStage() const { return stage_; }
  private:
@@ -65,9 +69,10 @@ class ControlledJob {
   const char* stage_ = "not-started";
   // Serialize child creation with terminal stop. Once stopped no new process may
   // enter this generation, including a command already queued on the Host pipe.
-  std::mutex spawn_stop_mutex_;
+  std::mutex spawn_stop_mutex_,policy_probe_mutex_;
   bool stopping_ = false;
   bool ever_created_ = false;
+  bool policy_access_verified_ = false,all_packages_readable_ = false;
 };
 std::wstring AppContainerProfileName(const std::wstring& demand,const std::wstring& role,const std::wstring& generation);
 DWORD ValidateDescriptor(const LaunchDescriptor&);
