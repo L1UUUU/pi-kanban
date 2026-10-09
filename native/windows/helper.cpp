@@ -69,7 +69,7 @@ std::string ProcessDetailsJson(const ControlledJob& job,const std::vector<DWORD>
   }
   return "{\"limit\":8,\"imageCharacterLimit\":512,\"omitted\":"+std::to_string(ids.size()-count)+",\"processes\":"+entries+"]}";
 }
-void Check(ControlledJob& job,const LaunchDescriptor& d,const Json command,std::atomic<bool>& checking){
+void Check(ControlledJob& job,const LaunchDescriptor& d,const Json command,std::atomic<bool>& checking,std::mutex& receipt_mutex){
   try{
     const auto request_id=command.at(L"requestId").str();
     if(request_id.empty()||request_id.size()>200||std::any_of(request_id.begin(),request_id.end(),[](wchar_t c){return !((c>=L'a'&&c<=L'z')||(c>=L'A'&&c<=L'Z')||(c>=L'0'&&c<=L'9')||c==L'-');}))throw std::runtime_error("invalid check identity");
@@ -83,34 +83,45 @@ void Check(ControlledJob& job,const LaunchDescriptor& d,const Json command,std::
     std::vector<DWORD> baseline;if(job.ProcessIds(baseline))throw std::runtime_error("Job census before check");
     const std::string baseline_details=ProcessDetailsJson(job,baseline);
     PROCESS_INFORMATION process{};const bool shell=command.at(L"type").str()==L"run-shell";const DWORD launched=shell?job.SpawnShellCheck(d,args,in_read,out_write,&process):job.SpawnNodeCheck(d,args,in_read,out_write,&process);CloseHandle(in_read);CloseHandle(out_write);
-    if(launched){CloseHandle(out_read);checking=false;Event("{\"type\":\"native.check-result\",\"requestId\":"+id+",\"generation\":\""+ToUtf8(d.generation)+"\",\"pid\":0,\"status\":"+std::to_string(launched)+",\"reason\":\"launch-failed\",\"exitCode\":null,\"outputBase64\":\"\",\"arguments\":"+ToUtf8(Serialize(input_args))+"}");return;}
+    if(launched){CloseHandle(out_read);{std::lock_guard publication(receipt_mutex);checking=false;Event("{\"type\":\"native.check-result\",\"requestId\":"+id+",\"generation\":\""+ToUtf8(d.generation)+"\",\"pid\":0,\"status\":"+std::to_string(launched)+",\"reason\":\"launch-failed\",\"exitCode\":null,\"outputBase64\":\"\",\"arguments\":"+ToUtf8(Serialize(input_args))+"}");}return;}
     FILETIME birth{},exited{},kernel{},user{};
     if(!GetProcessTimes(process.hProcess,&birth,&exited,&kernel,&user))throw std::runtime_error("check process identity");
     const uint64_t creation=(static_cast<uint64_t>(birth.dwHighDateTime)<<32)|birth.dwLowDateTime;
     CloseHandle(process.hThread);std::atomic<bool> output_done=false,overflow=false;std::string output;DWORD output_read_status=ERROR_SUCCESS;
     std::thread reader([&]{char buffer[4096];DWORD received=0;for(;;){const BOOL read=ReadFile(out_read,buffer,sizeof(buffer),&received,nullptr);if(!read){output_read_status=GetLastError();break;}if(!received)break;if(output.size()+received>limit){overflow=true;job.Stop();break;}output.append(buffer,received);}output_done=true;});
-    const DWORD waited=WaitForSingleObject(process.hProcess,timeout);std::string reason="exited";
+    const DWORD waited=WaitForSingleObject(process.hProcess,timeout);const ULONGLONG completion_started=GetTickCount64(),completion_deadline=completion_started+250;std::string reason="exited";
     if(waited!=WAIT_OBJECT_0){reason="timeout";job.Stop();WaitForSingleObject(process.hProcess,5000);}
-    DWORD exit_code=STILL_ACTIVE;const bool exit_confirmed=!!GetExitCodeProcess(process.hProcess,&exit_code)&&exit_code!=STILL_ACTIVE;CloseHandle(process.hProcess);
+    DWORD exit_code=STILL_ACTIVE;const bool exit_confirmed=!!GetExitCodeProcess(process.hProcess,&exit_code)&&exit_code!=STILL_ACTIVE;
     if(!exit_confirmed){job.Stop();reason="descendants-survived";}
-    std::vector<DWORD> after;const DWORD census_error=job.ProcessIds(after);
-    if(census_error){reason="descendants-survived";job.Stop();}
-    std::vector<DWORD> unexpected;for(const DWORD pid:after)if(pid!=process.dwProcessId&&std::find(baseline.begin(),baseline.end(),pid)==baseline.end())unexpected.push_back(pid);
-    // Identify observed unexpected processes before their existing Job-wide stop.
-    // No image, API failure or apparent exit exempts a PID from that stop.
+    std::vector<DWORD> after,unexpected,initial_after,initial_unexpected;DWORD census_error=ERROR_SUCCESS;unsigned observations=0;
+    bool settled=false,completion_timed_out=false,normal_pipe_end=false;ULONGLONG completion_wait_ms=0;
+    std::string initial_details;
+    // A signaled command does not imply its console/process rundown or pipe
+    // reader has completed. Share the existing 250 ms budget across both actual
+    // observations; no executable name or apparent exit code exempts a PID.
+    for(;;){
+      after.clear();unexpected.clear();census_error=job.ProcessIds(after);++observations;
+      for(const DWORD pid:after)if(std::find(baseline.begin(),baseline.end(),pid)==baseline.end())unexpected.push_back(pid);
+      if(observations==1){initial_after=after;initial_unexpected=unexpected;initial_details=ProcessDetailsJson(job,unexpected);}
+      const bool reader_done=output_done.load();
+      normal_pipe_end=reader_done&&(output_read_status==ERROR_SUCCESS||output_read_status==ERROR_BROKEN_PIPE);
+      const ULONGLONG now=GetTickCount64();completion_wait_ms=now-completion_started;
+      if(census_error||reason!="exited"||overflow||(reader_done&&!normal_pipe_end))break;
+      if(now>completion_deadline){completion_timed_out=true;break;}
+      if(unexpected.empty()&&normal_pipe_end){settled=true;break;}
+      if(now>=completion_deadline){completion_timed_out=true;break;}
+      Sleep(static_cast<DWORD>(std::min<ULONGLONG>(10,completion_deadline-now)));
+    }
+    const bool drain_timed_out=completion_timed_out&&!normal_pipe_end;
+    // Keep first and final snapshots, including a transient extra PID that
+    // really left the Job. Metadata never influences the settlement decision.
     const std::string unexpected_details=ProcessDetailsJson(job,unexpected);
-    if(!unexpected.empty()){reason="descendants-survived";job.Stop();}
-    const ULONGLONG drain_started=GetTickCount64();
-    for(unsigned i=0;i<25&&!output_done;i++)Sleep(10);
-    const bool drain_timed_out=!output_done;const ULONGLONG drain_wait_ms=GetTickCount64()-drain_started;
-    if(drain_timed_out){reason="descendants-survived";job.Stop();}
-    reader.join();CloseHandle(out_read);if(overflow)reason="output-limit";
-    // Observation only: preserve the existing failure reasons and 25 x 10 ms
-    // drain bound, but distinguish unexpected Job PIDs from reader completion.
-    const std::string completion="{\"waitStatus\":"+std::to_string(waited)+",\"exitConfirmed\":"+(exit_confirmed?"true":"false")+",\"censusStatus\":"+std::to_string(census_error)+",\"baselinePids\":"+ProcessListJson(baseline)+",\"afterPids\":"+ProcessListJson(after)+",\"unexpectedPids\":"+ProcessListJson(unexpected)+",\"baselineProcesses\":"+baseline_details+",\"unexpectedProcesses\":"+unexpected_details+",\"outputDrainTimedOut\":"+(drain_timed_out?"true":"false")+",\"outputDrainWaitMs\":"+std::to_string(drain_wait_ms)+",\"outputReadStatus\":"+std::to_string(output_read_status)+"}";
+    if(!settled){if(reason=="exited"||census_error)reason="descendants-survived";job.Stop();}
+    reader.join();CloseHandle(out_read);CloseHandle(process.hProcess);if(overflow)reason="output-limit";
+    const std::string completion="{\"waitStatus\":"+std::to_string(waited)+",\"exitConfirmed\":"+(exit_confirmed?"true":"false")+",\"censusStatus\":"+std::to_string(census_error)+",\"baselinePids\":"+ProcessListJson(baseline)+",\"initialAfterPids\":"+ProcessListJson(initial_after)+",\"initialUnexpectedPids\":"+ProcessListJson(initial_unexpected)+",\"afterPids\":"+ProcessListJson(after)+",\"unexpectedPids\":"+ProcessListJson(unexpected)+",\"baselineProcesses\":"+baseline_details+",\"initialUnexpectedProcesses\":"+initial_details+",\"unexpectedProcesses\":"+unexpected_details+",\"completionBudgetMs\":250,\"completionWaitMs\":"+std::to_string(completion_wait_ms)+",\"completionTimedOut\":"+(completion_timed_out?"true":"false")+",\"settled\":"+(settled?"true":"false")+",\"censusObservations\":"+std::to_string(observations)+",\"outputDrainTimedOut\":"+(drain_timed_out?"true":"false")+",\"outputDrainWaitMs\":"+std::to_string(completion_wait_ms)+",\"outputReadStatus\":"+std::to_string(output_read_status)+"}";
     // Release once before publishing. A second clear after Event could overwrite
     // the true value belonging to the next check queued on receipt delivery.
-    checking=false;Event("{\"type\":\"native.check-result\",\"requestId\":"+id+",\"generation\":\""+ToUtf8(d.generation)+"\",\"pid\":"+std::to_string(process.dwProcessId)+",\"birth\":\""+std::to_string(creation)+"\",\"status\":"+std::to_string(census_error)+",\"reason\":\""+reason+"\",\"exitCode\":"+std::to_string(exit_code)+",\"outputBase64\":\""+Base64(output)+"\",\"arguments\":"+ToUtf8(Serialize(input_args))+",\"completion\":"+completion+"}");
+    {std::lock_guard publication(receipt_mutex);checking=false;Event("{\"type\":\"native.check-result\",\"requestId\":"+id+",\"generation\":\""+ToUtf8(d.generation)+"\",\"pid\":"+std::to_string(process.dwProcessId)+",\"birth\":\""+std::to_string(creation)+"\",\"status\":"+std::to_string(census_error)+",\"reason\":\""+reason+"\",\"exitCode\":"+std::to_string(exit_code)+",\"outputBase64\":\""+Base64(output)+"\",\"arguments\":"+ToUtf8(Serialize(input_args))+",\"completion\":"+completion+"}");}
   }catch(...){Shutdown(ERROR_INVALID_DATA);}
 }
 void Observation(ControlledJob& job,const std::string& generation){std::vector<DWORD> ids;const DWORD error=job.ProcessIds(ids);std::string list;for(DWORD pid:ids){if(!list.empty())list+=",";list+=std::to_string(pid);}Event("{\"type\":\"native.observation\",\"generation\":\""+generation+"\",\"status\":"+std::to_string(error)+",\"activePids\":["+list+"]}");}
@@ -156,17 +167,24 @@ int wmain(){
     if(launch){Event("{\"type\":\"native.launch-failed\",\"status\":"+std::to_string(launch)+",\"stage\":\""+job.LastStage()+"\"}");Shutdown(launch);}
     const auto& identity=job.Identity();const uint64_t birth=(static_cast<uint64_t>(identity.creation_time.dwHighDateTime)<<32)|identity.creation_time.dwLowDateTime;
     Event("{\"type\":\"native.started\",\"generation\":\""+generation+"\",\"pid\":"+std::to_string(identity.pid)+",\"birth\":\""+std::to_string(birth)+"\",\"policyVariant\":\""+ToUtf8(d.policy_variant)+"\",\"policyAccessVerified\":"+(job.PolicyAccessVerified()?"true":"false")+",\"allApplicationPackagesReadable\":"+(job.AllPackagesReadable()?"true":"false")+"}");
-    std::atomic<bool> checking=false,worker_output_done=false,worker_log_done=false;
+    std::atomic<bool> checking=false,worker_output_done=false,worker_log_done=false;std::mutex receipt_mutex;
     std::thread([measure_disk,poll=d.disk_poll_ms]{for(;;){Sleep(poll);const DWORD status=measure_disk();if(status)Shutdown(status);}}).detach();
     std::mutex queue_mutex;std::condition_variable queue_ready;std::deque<std::string> queue;
     // All threads are bounded to this helper process. Process exit closes the only Job handle.
     std::thread([&]{for(;;){std::string body;{std::unique_lock lock(queue_mutex);queue_ready.wait(lock,[&]{return !queue.empty();});body=std::move(queue.front());queue.pop_front();}if(!Frame(in_write,body))Shutdown(ERROR_BROKEN_PIPE);}}).detach();
     std::thread([&]{try{uint64_t bytes=0;std::string body;while(ReadFrame(out_read,body)){bytes+=body.size();if(bytes>d.output_limit_bytes){Shutdown(ERROR_BUFFER_OVERFLOW);}JsonParser(body).parse();if(!Frame(GetStdHandle(STD_OUTPUT_HANDLE),body))Shutdown(ERROR_BROKEN_PIPE);}worker_output_done=true;}catch(...){Shutdown(ERROR_INVALID_DATA);}}).detach();
     std::thread([&]{uint64_t total=0;char bytes[4096];DWORD read=0;while(ReadFile(log_read,bytes,sizeof(bytes),&read,nullptr)&&read){total+=read;if(total>d.output_limit_bytes){Shutdown(ERROR_BUFFER_OVERFLOW);}Event("{\"type\":\"native.worker-log\",\"generation\":\""+generation+"\",\"bytesBase64\":\""+Base64(std::string(bytes,read))+"\"}");}worker_log_done=true;}).detach();
-    std::thread([&]{for(;;){Sleep(25);DWORD active=0;if(!checking&&job.ActiveProcesses(&active)==ERROR_SUCCESS&&!active){for(unsigned n=0;n<100&&(!worker_output_done||!worker_log_done);n++)Sleep(10);if(!worker_output_done||!worker_log_done){Shutdown(ERROR_TIMEOUT);}Shutdown(0);}}}).detach();
+    std::thread([&]{for(;;){Sleep(25);DWORD active=0;if(!checking&&job.ActiveProcesses(&active)==ERROR_SUCCESS&&!active){
+      for(unsigned n=0;n<100&&(!worker_output_done||!worker_log_done);n++)Sleep(10);
+      // The preliminary census may be stale. Serialize the final checks with
+      // receipt publication so zero-Job finalization cannot discard its proof.
+      std::lock_guard publication(receipt_mutex);DWORD final_active=0;
+      if(checking||job.ActiveProcesses(&final_active)!=ERROR_SUCCESS||final_active)continue;
+      if(!worker_output_done||!worker_log_done){Shutdown(ERROR_TIMEOUT);}Shutdown(0);
+    }}}).detach();
     try { std::string body;while(ReadFrame(GetStdHandle(STD_INPUT_HANDLE),body)){
       const auto command=JsonParser(body).parse();const auto type=command.at(L"type").str();
-      if(type==L"run-node"||type==L"run-shell"){if(checking.exchange(true))throw std::runtime_error("check already active");std::thread([&,command]{Check(job,d,command,checking);}).detach();continue;}
+      if(type==L"run-node"||type==L"run-shell"){if(checking.exchange(true))throw std::runtime_error("check already active");std::thread([&,command]{Check(job,d,command,checking,receipt_mutex);}).detach();continue;}
       if(type==L"stop"&&command.fields.size()==1)Shutdown(0);
       if(type==L"query"&&command.fields.size()==1){Observation(job,generation);continue;}
       if(type!=L"worker-input"||command.fields.size()!=2)throw std::runtime_error("unknown native control command");

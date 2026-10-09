@@ -180,6 +180,48 @@ async function runPiRole(role, workspaceOverride) {
   return run;
 }
 
+async function runCompletionDescendantFixture(persistent) {
+  const suffix = persistent ? 'persistent-descendant' : 'short-lived-descendant';
+  const run = launch('implementation', suffix, undefined, true);
+  await run.wait(() => run.event('native.started'), `${suffix} Worker`);
+  const started = run.event('native.started');
+  run.runRecord.identity = { pid: started.pid, birth: started.birth, generation: run.generation, controlId: run.runRecord.runId, driver: 'windows-appcontainer-job-v1' };
+  run.recoveryStore.bind(run.runRecord.runId, run.runRecord.identity);
+  const ready = join(run.scratch, 'child-ready.json'), heartbeat = join(run.scratch, 'child-heartbeat.txt'), exited = join(run.scratch, 'child-exited.txt');
+  // Child stdin belongs only to the command parent. Its EOF proves that parent
+  // closed its handle; the short-lived child's 75 ms timer starts at that point,
+  // not at process creation. Child stdout/stderr never hold the helper's pipe.
+  const childProgram = `const fs=require('node:fs');const beat=()=>fs.appendFileSync(${JSON.stringify(heartbeat)},'tick\\n');const timer=setInterval(beat,10);process.stdin.on('end',()=>{${persistent ? '' : `setTimeout(()=>{clearInterval(timer);fs.writeFileSync(${JSON.stringify(exited)},${JSON.stringify(challenge)});process.exit(0)},75);`}});process.stdin.resume();beat();fs.writeFileSync(${JSON.stringify(`${ready}.tmp`)},JSON.stringify({challenge:${JSON.stringify(challenge)},pid:process.pid}));fs.renameSync(${JSON.stringify(`${ready}.tmp`)},${JSON.stringify(ready)});`;
+  const parentProgram = `const fs=require('node:fs'),cp=require('node:child_process');const child=cp.spawn(process.execPath,['--preserve-symlinks','--preserve-symlinks-main','-e',${JSON.stringify(childProgram)}],{stdio:['pipe','ignore','ignore'],windowsHide:true,env:process.env});child.on('error',error=>{process.stderr.write(String(error));process.exit(2)});const deadline=Date.now()+5000;const timer=setInterval(()=>{if(fs.existsSync(${JSON.stringify(ready)})&&fs.existsSync(${JSON.stringify(heartbeat)})){const value=JSON.parse(fs.readFileSync(${JSON.stringify(ready)},'utf8'));const bytes=fs.statSync(${JSON.stringify(heartbeat)}).size;if(value.pid===child.pid&&value.challenge===${JSON.stringify(challenge)}&&bytes>0){clearInterval(timer);process.stdout.write(JSON.stringify({challenge:value.challenge,childPid:child.pid,heartbeatBytes:bytes}));process.exit(0)}}if(Date.now()>=deadline)process.exit(3)},5);`;
+  const args = ['-e', parentProgram];
+  assert.ok(parentProgram.length <= 8192, 'Bounded parent command fixture');
+  run.send({ type: 'run-node', requestId: suffix, args, timeoutMs: 10000, maxOutputBytes: 4096 });
+  await run.wait(() => run.event('native.check-result', event => event.requestId === suffix), `${suffix} exact command receipt`, 15000);
+  const receipt = run.event('native.check-result', event => event.requestId === suffix), diagnostic = JSON.stringify(receipt);
+  assert.equal(receipt.generation, run.generation); assert.deepEqual(receipt.arguments, args); assert.equal(receipt.status, 0, diagnostic); assert.equal(receipt.exitCode, 0, diagnostic);
+  const result = JSON.parse(Buffer.from(receipt.outputBase64, 'base64').toString('utf8'));
+  assert.equal(result.challenge, challenge); assert.ok(Number.isInteger(result.childPid) && result.childPid > 0 && result.heartbeatBytes > 0);
+  assert.deepEqual(JSON.parse(readFileSync(ready, 'utf8')), { challenge, pid: result.childPid }); assert.ok(statSync(heartbeat).size >= result.heartbeatBytes);
+  assert.equal(receipt.completion.completionBudgetMs, 250); assert.equal(receipt.completion.waitStatus, 0); assert.equal(receipt.completion.exitConfirmed, true); assert.equal(receipt.completion.censusStatus, 0);
+  assert.ok(receipt.completion.initialUnexpectedPids.includes(result.childPid), 'Fixture must actually overlap parent exit and first native census; a scheduling miss is not branch coverage');
+  const childObservation = receipt.completion.initialUnexpectedProcesses.processes.find(value => value.pid === result.childPid);
+  assert.ok(childObservation, diagnostic); assert.equal(childObservation.openStatus, 0); assert.equal(childObservation.waitStatus, 258); assert.equal(childObservation.exitCode, 259); assert.equal(childObservation.membershipStatus, 0); assert.equal(childObservation.inJob, true);
+  assert.equal(receipt.completion.outputDrainTimedOut, false); assert.ok([0, 109].includes(receipt.completion.outputReadStatus));
+  if (persistent) {
+    assert.equal(receipt.reason, 'descendants-survived', diagnostic); assert.equal(receipt.completion.settled, false); assert.equal(receipt.completion.completionTimedOut, true); assert.ok(receipt.completion.unexpectedPids.includes(result.childPid));
+    await run.wait(() => run.exited, 'persistent child native failure cleanup');
+    assert.ok(run.event('native.observation', value => value.status === 0 && value.activePids.length === 0)); assert.ok(run.event('native.resources', value => value.phase === 'revoke' && value.status === 0));
+  } else {
+    assert.equal(receipt.reason, 'exited', diagnostic); assert.equal(receipt.completion.settled, true); assert.equal(receipt.completion.completionTimedOut, false); assert.ok(receipt.completion.completionWaitMs <= 250); assert.deepEqual(receipt.completion.unexpectedPids, []);
+    assert.equal(readFileSync(exited, 'utf8'), challenge); await run.stop();
+  }
+  assert.equal(new NativeRecoveryStore(run.recoveryStore.directory).observe(run.runRecord, run.profile)?.state, 'stopped');
+  const size = statSync(heartbeat).size; await delay(150); assert.equal(statSync(heartbeat).size, size, 'Authenticated cleanup must also leave the descendant heartbeat quiescent');
+  passed(persistent ? 'persistent-descendant-denied' : 'short-lived-descendant-settled', persistent
+    ? 'Actual Node command exited zero after its same-Job child wrote a heartbeat; the child remained in first/final native census beyond the shared 250 ms completion window, so the command failed. Zero-Job/revoked-ACL authenticated cleanup and a quiescent heartbeat were independently checked.'
+    : 'Actual Node command exited zero while its same-Job child was still live in first native census; the child exited after parent-pipe EOF and disappeared from final census within the shared 250 ms window. Normal output end, successful receipt and authenticated stop/cleanup were independently checked.');
+}
+
 try {
   record('start', evidence);
   const implemented = await runPiRole('implementation');
@@ -237,11 +279,13 @@ try {
     const concurrentReceipt = concurrentB.event('native.check-result', event => event.requestId === requestId);
     const diagnostic = JSON.stringify({ attempt, status: concurrentReceipt.status, exitCode: concurrentReceipt.exitCode, reason: concurrentReceipt.reason, completion: concurrentReceipt.completion });
     assert.equal(concurrentReceipt.status, 0, diagnostic); assert.equal(concurrentReceipt.exitCode, 0, diagnostic); assert.equal(concurrentReceipt.reason, 'exited', diagnostic); assert.deepEqual(concurrentReceipt.arguments, concurrentArgs); assert.equal(Buffer.from(concurrentReceipt.outputBase64, 'base64').toString('utf8'), challenge);
-    assert.equal(concurrentReceipt.completion?.waitStatus, 0, diagnostic); assert.equal(concurrentReceipt.completion?.exitConfirmed, true, diagnostic); assert.equal(concurrentReceipt.completion?.censusStatus, 0, diagnostic); assert.deepEqual(concurrentReceipt.completion?.unexpectedPids, [], diagnostic); assert.equal(concurrentReceipt.completion?.outputDrainTimedOut, false, diagnostic);
+    assert.equal(concurrentReceipt.completion?.waitStatus, 0, diagnostic); assert.equal(concurrentReceipt.completion?.exitConfirmed, true, diagnostic); assert.equal(concurrentReceipt.completion?.censusStatus, 0, diagnostic); assert.deepEqual(concurrentReceipt.completion?.unexpectedPids, [], diagnostic); assert.equal(concurrentReceipt.completion?.settled, true, diagnostic); assert.equal(concurrentReceipt.completion?.completionBudgetMs, 250, diagnostic); assert.ok(concurrentReceipt.completion?.completionWaitMs <= 250, diagnostic); assert.equal(concurrentReceipt.completion?.outputDrainTimedOut, false, diagnostic); assert.ok([0, 109].includes(concurrentReceipt.completion?.outputReadStatus), diagnostic);
   }
   concurrentB.send({ type: 'query' }); await concurrentB.wait(() => concurrentB.event('native.observation', event => event.status === 0 && event.activePids.includes(concurrentB.event('native.started').pid)), 'other helper remains alive');
   await concurrentB.stop();
   passed('concurrent-acl-isolation', 'Two overlapping helpers shared exact runtime files; A revoked and independently checked old-SID absence while B completed five bounded Node commands that repeatedly read allowed runtime/source and remained denied sibling data. Each receipt retained successful process-wait/Job-census/output-drain observations; B survived A stop and receipt-to-next-command handoffs.');
+  await runCompletionDescendantFixture(false);
+  await runCompletionDescendantFixture(true);
   // Break both Host output readers while a native-contained command produces
   // continuous output. Native Event/forwarding failure must finalize just like EOF.
   const broken = launch('implementation', 'broken-output', undefined, true);

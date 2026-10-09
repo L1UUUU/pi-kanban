@@ -161,23 +161,39 @@ transcripts are retained, including bounded Worker diagnostics. Fixtures contain
 synthetic data and remain available for ACL inspection. A nonzero process status, timeout,
 missing observation, failed revoke or access-policy failure fails the probe.
 
-Native command receipts retain a `completion` diagnostic with the process wait result,
-exit confirmation, before/after/unexpected Job PID lists, census status, output-reader
-status and whether its unchanged 25 x 10 ms drain bound elapsed. An exit code of zero and
-successful census API alone do not prove command completion: an unexpected process or
-unfinished output drain still fails. These fields explain the existing failure reason;
-they grant no success authority. Five bounded commands in the concurrent-cleanup probe
-exercise command completion and receipt-to-next-command handoff without extending its
-existing helper deadline. Both launch failure and normal completion release their single
-check slot before publishing the receipt; the prior command never clears a newer slot.
+Native command completion shares one monotonic **250 ms** window between actual Job
+census and normal output-pipe completion, starting immediately when the command wait
+returns. It repeatedly requires that no process outside the pre-command baseline remains
+and that the reader observed a zero-byte read or `ERROR_BROKEN_PIPE`. The command handle
+stays open through settlement. Query work consumes this same budget; a clean observation
+made only after expiry cannot pass. An API error, surviving child or unfinished output
+still fails and stops the whole Job. Output errors are never treated as normal pipe end.
+
+Receipts retain first/final PID snapshots, read-only process diagnostics, observation
+count, fixed budget, actual elapsed time and settlement/deadline outcome. These explain
+the native result; an executable name, exit code or metadata query never grants an
+exception. Five bounded commands in the concurrent-cleanup probe still exercise normal
+completion and receipt-to-next-command handoff without increasing the helper deadline.
+Both launch failure and normal completion release their single check slot before
+publishing the receipt. Publication is serialized with the natural-shutdown watcher's
+fresh check-slot and zero-Job recheck, so finalization cannot discard the pending receipt.
+
+Paired fixtures start a real child that writes a heartbeat before its Node command parent
+exits zero. The short-lived child starts a 75 ms exit timer only after parent-pipe EOF;
+the probe requires a live first native census and disappearance in the final census within
+the shared 250 ms window. A scheduling miss fails coverage rather than being called a
+settlement pass. The persistent child keeps running with no inherited helper output
+writer; its continued presence must fail command completion despite parent exit zero and
+normal output EOF. Both fixtures require actual zero-Job/revoked-ACL authenticated cleanup
+and an independently quiescent heartbeat. Waiting alone never proves a clean stop.
 
 Baseline and unexpected-process diagnostics additionally attempt read-only handle queries
 for image path, birth/exit time, zero-time wait, exit code and membership in this exact Job.
 Each list records at most eight processes and 512 image-path characters per process, with
 omitted counts and API errors explicit. Handles are non-inheritable and request only
 limited query/synchronize access, without enabling privileges. An observed system image,
-apparently exited process or failed query never exempts the unexpected PID from the
-existing Job-wide stop or turns that failed command into success. The observations are
+apparently exited process or failed query never exempts a remaining PID from the
+deadline's Job-wide stop or turns that failed command into success. The observations are
 sequential snapshots, not permission to terminate or trust a process by bare PID.
 
 The report identifies `toolScope: "node-native-tools-only"`; adding `--git-bash` produces
