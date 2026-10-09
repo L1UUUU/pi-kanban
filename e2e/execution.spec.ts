@@ -27,12 +27,14 @@ for (const width of [1024, 1440]) test(`execution ticket frontier remains readab
 
 test('whole-spec axes preserve original K and open exact TDD and focused evidence without issuing decisions', async ({ page }, testInfo) => {
   await openExecution(page, 'resolution-spec');
-  await page.getByText('TDD 与行为保持证据 · 2', { exact: true }).click();
-  await page.getByRole('button', { name: '阅读失败测试证据', exact: true }).first().click();
+  const currentTddSummary = page.locator('.execution-panel > details.execution-history > summary')
+    .filter({ hasText: /^TDD 与行为保持证据 · 2$/ });
+  await currentTddSummary.click();
+  await currentTddSummary.locator('..').getByRole('button', { name: '阅读失败测试证据', exact: true }).first().click();
   const dialog = page.getByRole('dialog');
   await expect(dialog.locator('.artifact-text')).toContainText('synthetic-red-test-1');
   await page.keyboard.press('Escape');
-  const standards = page.getByRole('article', { name: '项目标准审查', exact: true }).first();
+  const standards = page.locator('.execution-panel > article.execution-axis[aria-label="项目标准审查"]');
   await expect(standards).toContainText('原审查继续保留其内容版本');
   await standards.locator('.execution-review > summary').click();
   await expect(standards).toContainText('有文档依据的违规'); await expect(standards).toContainText('设计异味');
