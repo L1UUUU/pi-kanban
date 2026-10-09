@@ -131,7 +131,7 @@ void RunRole(const fs::path& root,const std::wstring& role,SOCKET listener) {
   d.policy_evidence=L"synthetic-ci-probe-not-G1";d.acl_evidence=L"this-test-provisioned-dacl";d.private_channel_evidence=L"candidate-under-test";
   d.timeout_ms=15000;d.process_limit=4;d.memory_limit_bytes=128ull*1024*1024;d.output_limit_bytes=16384;
   ControlledJob job;DWORD launch=job.Launch(d,{in_read,out_write,log_write});
-  std::cout<<"{\"phase\":\"native-launch\",\"status\":"<<launch<<",\"pid\":"<<job.Identity().pid<<"}"<<std::endl;
+  std::cout<<"{\"phase\":\"native-launch\",\"status\":"<<launch<<",\"stage\":\""<<job.LastStage()<<"\",\"pid\":"<<job.Identity().pid<<"}"<<std::endl;
   CloseHandle(in_read);CloseHandle(out_write);CloseHandle(log_write);
   Require(launch==ERROR_SUCCESS,"candidate launch failed (retain evidence; do not relax policy)");
   DWORD available=0;const ULONGLONG deadline=GetTickCount64()+7000;

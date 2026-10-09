@@ -67,7 +67,8 @@ test('reparse/symlink traversal and path escape are denied before file access',t
 test('configured hooks, signing, filters and fsmonitor are blocked rather than silently skipped',t=>{
  const f=fixture(t);const marker=join(f.root,'hook-ran');writeFileSync(join(f.repo,'.git','hooks','pre-commit'),`#!/bin/sh\ntouch '${marker}'\n`,{mode:0o700});
  assert.throws(()=>f.service.prepare(f.req),/hooks require/);assert.equal(existsSync(marker),false);unlinkSync(join(f.repo,'.git','hooks','pre-commit'));
- for(const key of ['commit.gpgsign','core.fsmonitor','filter.test.clean','core.hooksPath','diff.external','log.showSignature','gpg.program','merge.verifySignatures']){git(f.repo,'config',key,key==='commit.gpgsign'?'true':'malicious-command');assert.throws(()=>f.service.prepare(f.req),/requires a reviewed restricted adapter/);git(f.repo,'config','--unset',key);}
+ for(const key of ['commit.gpgsign','core.fsmonitor','core.hooksPath','diff.external','log.showSignature','gpg.program','merge.verifySignatures']){git(f.repo,'config',key,key==='commit.gpgsign'?'true':'malicious-command');assert.throws(()=>f.service.prepare(f.req),/requires a reviewed restricted adapter/);git(f.repo,'config','--unset',key);}
+ git(f.repo,'config','filter.test.clean','malicious-command');writeFileSync(join(f.repo,'.gitattributes'),'code.txt filter=test\n');assert.throws(()=>f.service.prepare(f.req),/Active filter driver test/);git(f.repo,'config','--unset','filter.test.clean');unlinkSync(join(f.repo,'.gitattributes'));
  assert.equal(existsSync(marker),false);
 });
 test('exact Git object and path scope is checked before source retrieval',t=>{
@@ -148,4 +149,37 @@ test('unused credential helpers are preserved while partial-clone/network execut
  const f=fixture(t);const marker=join(f.root,'credential-helper-ran');git(f.repo,'config','credential.helper',`!touch '${marker}'`);git(f.repo,'config','remote.origin.url',`ext::touch ${marker}`);git(f.repo,'config','protocol.ext.allow','always');
  const w=f.service.prepare(f.req);writeFileSync(join(w.worktreePath,'code.txt'),'local-only change');f.service.commit(saveRequest(w.worktreePath,f.base));assert.equal(existsSync(marker),false);assert.match(git(f.repo,'config','--get','credential.helper'),/touch/);
  git(f.repo,'config','remote.origin.promisor','true');assert.throws(()=>f.service.git.status(w.worktreePath),/requires a reviewed restricted adapter/);assert.equal(existsSync(marker),false);
+});
+
+test('unused LFS, textconv, and merge driver defaults remain intact while real local operations succeed',t=>{
+ const f=fixture(t);const marker=join(f.root,'driver-ran');
+ for(const key of ['filter.lfs.clean','filter.lfs.smudge','filter.lfs.process','diff.astextplain.textconv','merge.custom.driver'])git(f.repo,'config',key,`touch '${marker}'`);
+ git(f.repo,'config','filter.lfs.required','true');const w=f.service.prepare(f.req);writeFileSync(join(w.worktreePath,'code.txt'),'ordinary text');const saved=f.service.commit(saveRequest(w.worktreePath,f.base));assert.ok(saved.commit);assert.equal(existsSync(marker),false);
+ assert.equal(git(f.repo,'config','--get','filter.lfs.required'),'true');assert.match(git(f.repo,'config','--get','diff.astextplain.textconv'),/touch/);
+});
+
+test('active driver attributes from worktree, index, info attributes and macros block before execution',t=>{
+ const f=fixture(t);const marker=join(f.root,'driver-ran');
+ for(const [attribute,key] of [['filter','filter.test.clean'],['diff','diff.test.textconv'],['merge','merge.test.driver']]) {
+  git(f.repo,'config',key,`touch '${marker}'`);
+  writeFileSync(join(f.repo,'.gitattributes'),`[attr]danger ${attribute}=test\ncode.txt danger\n`);assert.throws(()=>f.service.git.status(f.repo),/Active .* driver test/);
+  git(f.repo,'config','--unset',key);git(f.repo,'add','.gitattributes');unlinkSync(join(f.repo,'.gitattributes'));git(f.repo,'config',key,`touch '${marker}'`);assert.throws(()=>f.service.git.status(f.repo),/Active .* driver test/);
+  git(f.repo,'config','--unset',key);git(f.repo,'reset','--','.gitattributes');
+  writeFileSync(join(f.repo,'.git','info','attributes'),`code.txt ${attribute}=test\n`);git(f.repo,'config',key,`touch '${marker}'`);assert.throws(()=>f.service.git.status(f.repo),/Active .* driver test/);git(f.repo,'config','--unset',key);unlinkSync(join(f.repo,'.git','info','attributes'));
+ }
+ assert.equal(existsSync(marker),false);
+});
+
+test('source-tree attributes are checked before checkout even when current worktree unsets them',t=>{
+ const f=fixture(t);writeFileSync(join(f.repo,'.gitattributes'),'code.txt filter=lfs\n');git(f.repo,'add','.gitattributes');git(f.repo,'commit','-m','Formal filtered path fixture');const base=git(f.repo,'rev-parse','HEAD');
+ writeFileSync(join(f.repo,'.gitattributes'),'code.txt -filter\n');git(f.repo,'add','.gitattributes');git(f.repo,'config','filter.lfs.smudge','touch should-never-run');
+ assert.throws(()=>f.service.prepare({...f.req,baseline:base}),/Active filter driver lfs/);assert.equal(existsSync(f.req.worktreePath),false);assert.equal(existsSync(join(f.repo,'should-never-run')),false);
+});
+
+test('synthetic global LFS and Windows textconv defaults are actually discovered without config suppression',t=>{
+ const f=fixture(t);const home=join(f.root,'synthetic-home');mkdirSync(home);const marker=join(f.root,'global-driver-ran');
+ writeFileSync(join(home,'.gitconfig'),`[filter "lfs"]\n clean = touch global-driver-ran\n smudge = touch global-driver-ran\n process = touch global-driver-ran\n required = true\n[diff "astextplain"]\n textconv = touch global-driver-ran\n`);
+ const script=`import {DatabaseSync} from 'node:sqlite';import {writeFileSync,existsSync,readFileSync} from 'node:fs';import {WorkspaceService,digest} from ${JSON.stringify(new URL('../src/workspace/index.ts',import.meta.url).href)};const db=new DatabaseSync(${JSON.stringify(join(f.root,'control.sqlite'))});const service=new WorkspaceService({db,gitExecutable:${JSON.stringify(gitExecutable)}});const request=${JSON.stringify(f.req)};const w=service.prepare(request);writeFileSync(w.worktreePath+'/code.txt','global-config fixture');service.commit({operationId:'global-save',demandId:'a',expectedHead:request.baseline,paths:['code.txt'],expectedFiles:{'code.txt':digest(readFileSync(w.worktreePath+'/code.txt'))},message:'Synthetic global config check',author:{name:'Fixture',email:'fixture@example.invalid'},commitAuthorized:true,writerStopped:true});writeFileSync(w.worktreePath+'/.gitattributes','code.txt filter=lfs\\n');let denied=false;try{service.git.status(w.worktreePath)}catch(e){denied=e.code==='UNSUPPORTED_GIT_CONFIG'}if(!denied)throw Error('Global LFS config was not discovered and enforced');db.close();`;
+ execFileSync(process.execPath,['--input-type=module','-e',script],{cwd:f.repo,env:{...process.env,HOME:home,USERPROFILE:home,XDG_CONFIG_HOME:join(home,'.config')},stdio:'pipe',timeout:60000});
+ assert.equal(existsSync(marker),false);assert.equal(existsSync(join(f.repo,'global-driver-ran')),false);assert.equal(existsSync(join(f.req.worktreePath,'global-driver-ran')),false);
 });

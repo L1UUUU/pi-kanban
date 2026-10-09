@@ -42,12 +42,15 @@ class ControlledJob {
   DWORD Launch(const LaunchDescriptor&, const PrivateHandles&);
   DWORD Stop(DWORD exit_code = ERROR_CANCELLED);
   DWORD ActiveProcesses(DWORD* count) const;
+  DWORD ProcessIds(std::vector<DWORD>& ids) const;
   const ProcessIdentity& Identity() const { return identity_; }
+  const char* LastStage() const { return stage_; }
  private:
   HANDLE job_ = nullptr, process_ = nullptr;
   std::vector<HANDLE> pinned_files_;
   ProcessIdentity identity_;
   std::jthread watchdog_;
+  const char* stage_ = "not-started";
 };
 DWORD ValidateDescriptor(const LaunchDescriptor&);
 }  // namespace pi_kanban

@@ -55,19 +55,42 @@ export class ControlledGit {
   guard(cwd: string): void {
     noLinks(cwd); const common=this.commonDirectory(cwd);this.guardAdministration(common);const config = this.config(cwd);
     for (const [key, values] of config) {
-      const dangerous = /^(filter\.|gpg\.|diff\..*\.(command|textconv)$|merge\..*\.driver$)/.test(key)
+      const dangerous = /^gpg\./.test(key)
         || ['core.hookspath','core.fsmonitor','core.sshcommand','core.gitproxy','core.attributesfile','core.pager','core.editor','core.worktree','core.alternaterefscommand','diff.external','log.showsignature','merge.verifysignatures','sequence.editor'].includes(key)
         || ['extensions.worktreeconfig','extensions.partialclone'].includes(key) || /^remote\..*\.promisor$/.test(key);
       const signing = ['commit.gpgsign','tag.gpgsign'].includes(key) && values.some(v => !['false','no','off','0'].includes(v.toLowerCase()));
       insist(!dangerous && !signing, 'UNSUPPORTED_GIT_CONFIG', `Project Git setting ${key} requires a reviewed restricted adapter; it was not bypassed.`);
     }
     insist(!existsSync(join(common,'objects','info','alternates')),'UNSUPPORTED_GIT_CONFIG','Alternate object stores require explicit project binding and are unsupported.');
+    this.guardActiveDrivers(cwd,config);
     const hooks = join(common,'hooks');
     if (existsSync(hooks)) { noLinks(hooks); for (const name of readdirSync(hooks)) {
       if (name.endsWith('.sample')) continue;
       const path = join(hooks,name); noLinks(path);
       insist(false, 'UNSUPPORTED_GIT_HOOK', 'Project Git hooks require a restricted adapter and were not executed or bypassed.');
     }}
+  }
+  /** Attribute inspection never executes filters, textconv, or custom merge programs. */
+  private guardActiveDrivers(cwd:string,config:Map<string,string[]>,explicitPaths?:string[],source?:string):void {
+    const drivers=new Map<string,Set<string>>([['filter',new Set()],['diff',new Set()],['merge',new Set()]]);
+    for(const key of config.keys()) {
+      const match=key.match(/^(filter)\.(.+)\.(?:clean|smudge|process|required)$/) ?? key.match(/^(diff)\.(.+)\.(?:command|textconv)$/) ?? key.match(/^(merge)\.(.+)\.driver$/);
+      if(match)drivers.get(match[1])!.add(match[2]);
+    }
+    if(![...drivers.values()].some(values=>values.size))return;
+    const defaultMerge=config.get('merge.default')?.at(-1)?.toLowerCase();
+    insist(!defaultMerge || !drivers.get('merge')!.has(defaultMerge),'UNSUPPORTED_GIT_CONFIG','Active default merge driver requires a reviewed restricted adapter; it was not bypassed.');
+    const paths=explicitPaths ?? this.invoke(cwd,['ls-files','--cached','--others','--exclude-standard','-z']).toString().split('\0').filter(Boolean);
+    if(!paths.length)return;
+    const input=[...new Set(paths)].join('\0')+'\0';
+    const views=source ? [[`--source=${source}`]] : [[],['--cached']];
+    for(const view of views) {
+      const attributes=this.invoke(cwd,['check-attr','-z','--stdin',...view,'filter','diff','merge'],input).toString().split('\0');
+      for(let index=0;index+2<attributes.length;index+=3) {
+        const attribute=attributes[index+1];const driver=attributes[index+2].toLowerCase();
+        insist(!drivers.get(attribute)?.has(driver),'UNSUPPORTED_GIT_CONFIG',`Active ${attribute} driver ${driver} requires a reviewed restricted adapter; it was not bypassed.`);
+      }
+    }
   }
   private run(cwd: string, args: string[], input?: string, extraEnv?: Record<string,string>): Buffer { this.guard(cwd); return this.invoke(cwd,args,input,extraEnv); }
   validateBranch(branch: string): void {
@@ -114,10 +137,12 @@ export class ControlledGit {
   verifyTree(cwd: string, commit: string): void {
     this.validateOid(commit);
     const records = this.run(cwd,['ls-tree','-r','-z',commit]).toString().split('\0').filter(Boolean);
+    const paths:string[]=[];
     for (const record of records) {
-      const separator=record.indexOf('\t');const metadata=record.slice(0,separator);const path=record.slice(separator+1);sourcePath(path);
+      const separator=record.indexOf('\t');const metadata=record.slice(0,separator);const path=record.slice(separator+1);sourcePath(path);paths.push(path);
       insist(!metadata.startsWith('120000') && !metadata.startsWith('160000'), 'UNSUPPORTED_TREE', 'Symlinks and submodules require an explicitly verified filesystem adapter.');
     }
+    this.guardActiveDrivers(cwd,this.config(cwd),paths,commit);
   }
   addWorktree(cwd: string, path: string, branch: string, base: string | null): void {
     this.validateBranch(branch); noLinks(path,true); if (base) { this.validateOid(base); this.verifyTree(cwd,base); }
@@ -161,7 +186,7 @@ export class ControlledGit {
     return {mergeHead,unmergedPaths};
   }
   mergeFormal(cwd:string,source:string,message:string,timestamp:string,author:{name:string;email:string}):void {
-    this.validateOid(source);insist(!/[\r\n<>\0]/.test(author.name+author.email) && author.name.length>0 && author.email.includes('@'),'INVALID_AUTHOR','Explicit integration identity is required.');
+    this.validateOid(source);this.verifyTree(cwd,source);insist(!/[\r\n<>\0]/.test(author.name+author.email) && author.name.length>0 && author.email.includes('@'),'INVALID_AUTHOR','Explicit integration identity is required.');
     this.run(cwd,['merge','--no-edit','--no-stat','-m',message,source],undefined,{
       GIT_AUTHOR_NAME:author.name,GIT_COMMITTER_NAME:author.name,GIT_AUTHOR_EMAIL:author.email,GIT_COMMITTER_EMAIL:author.email,
       GIT_AUTHOR_DATE:timestamp,GIT_COMMITTER_DATE:timestamp,

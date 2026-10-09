@@ -26,6 +26,7 @@ jobs:
       - run: npm ci --ignore-scripts
       - run: npm run check
       - name: Record actual environment, without secrets
+        if: always()
         shell: bash
         run: node scripts/diagnostics.mjs > runtime-observation.json
       - uses: actions/upload-artifact@v4
@@ -70,6 +71,6 @@ jobs:
         with:
           name: synthetic-renderer-evidence
           path: |
-            test-results/
-            playwright-report/
+            artifacts/playwright/
+            artifacts/playwright-report/
           retention-days: 14

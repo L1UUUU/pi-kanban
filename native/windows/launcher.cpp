@@ -115,12 +115,15 @@ ControlledJob::~ControlledJob() {
 }
 DWORD ControlledJob::Launch(const LaunchDescriptor& d, const PrivateHandles& channels) {
   if (job_ || process_) return ERROR_ALREADY_EXISTS;
+  stage_ = "validate-descriptor";
   DWORD error = ValidateDescriptor(d); if (error) return error;
   HANDLE node = nullptr, worker = nullptr, workspace = nullptr, scratch = nullptr;
   for (const auto& entry : {std::pair{d.node_executable, false}, std::pair{d.worker_entry, false}, std::pair{d.workspace, true}, std::pair{d.scratch, true}}) {
     HANDLE* target = entry.first == d.node_executable ? &node : entry.first == d.worker_entry ? &worker : entry.first == d.workspace ? &workspace : &scratch;
+    stage_ = "pin-canonical-resources";
     error = PinNoReparse(entry.first, entry.second, pinned_files_, target); if (error) return error;
   }
+  stage_ = "verify-binary-digests";
   if ((error = Digest(node, d.node_sha256)) || (error = Digest(worker, d.worker_sha256))) return error;
   HANDLE inherited[] = {channels.requests_read, channels.reports_write, channels.logs_write};
   if (inherited[0] == inherited[1] || inherited[0] == inherited[2] || inherited[1] == inherited[2]) return ERROR_INVALID_HANDLE;
@@ -128,12 +131,14 @@ DWORD ControlledJob::Launch(const LaunchDescriptor& d, const PrivateHandles& cha
     DWORD flags = 0;
     if (!h || h == INVALID_HANDLE_VALUE || GetFileType(h) != FILE_TYPE_PIPE || !GetHandleInformation(h, &flags) || !(flags & HANDLE_FLAG_INHERIT)) return ERROR_INVALID_HANDLE;
   }
+  stage_ = "derive-appcontainer-sid";
   Sid sid;
   HRESULT hr = DeriveAppContainerSidFromAppContainerName(d.profile_name.c_str(), &sid.value);
   if (FAILED(hr)) return HRESULT_CODE(hr);
   SECURITY_CAPABILITIES security{};
   security.AppContainerSid = sid.value;
   security.CapabilityCount = 0; security.Capabilities = nullptr;  // No broad network capabilities.
+  stage_ = "create-job";
   Handle job{CreateJobObjectW(nullptr, nullptr)}; if (!job.value) return GetLastError();
   JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
   limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_ACTIVE_PROCESS | JOB_OBJECT_LIMIT_JOB_MEMORY;
@@ -141,11 +146,13 @@ DWORD ControlledJob::Launch(const LaunchDescriptor& d, const PrivateHandles& cha
   limits.BasicLimitInformation.ActiveProcessLimit = d.process_limit;
   limits.JobMemoryLimit = d.memory_limit_bytes;
   if (!SetInformationJobObject(job.value, JobObjectExtendedLimitInformation, &limits, sizeof(limits))) return GetLastError();
+  stage_ = "initialize-process-attributes";
   SIZE_T size = 0; InitializeProcThreadAttributeList(nullptr, 3, 0, &size);
   if (!size) return GetLastError();
   Attributes attributes; attributes.bytes.resize(size);
   auto* list = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attributes.bytes.data());
   if (!InitializeProcThreadAttributeList(list, 3, 0, &size)) return GetLastError(); attributes.list = list;
+  stage_ = "set-process-attributes";
   DWORD policy = PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT;
   if (!UpdateProcThreadAttribute(list, 0, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, &security, sizeof(security), nullptr, nullptr) ||
       !UpdateProcThreadAttribute(list, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherited, sizeof(inherited), nullptr, nullptr) ||
@@ -154,21 +161,25 @@ DWORD ControlledJob::Launch(const LaunchDescriptor& d, const PrivateHandles& cha
   startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
   startup.StartupInfo.hStdInput = channels.requests_read; startup.StartupInfo.hStdOutput = channels.reports_write; startup.StartupInfo.hStdError = channels.logs_write;
   std::wstring command = Quote(d.node_executable) + L" " + Quote(d.worker_entry) + L" --controlled-run " + Quote(d.generation);
+  stage_ = "get-windows-directory";
   wchar_t windows[MAX_PATH]{}; if (!GetWindowsDirectoryW(windows, MAX_PATH)) return GetLastError();
   // Explicit minimal environment. No inherited PATH, HOME, auth keys, NODE_OPTIONS, proxy or control tokens.
-  std::vector<std::wstring> environment = {L"PI_OFFLINE=1", L"SystemRoot=" + std::wstring(windows), L"TEMP=" + d.scratch, L"TMP=" + d.scratch};
+  std::vector<std::wstring> environment = {L"APPDATA=" + d.scratch, L"LOCALAPPDATA=" + d.scratch, L"PI_OFFLINE=1", L"SystemDrive=" + std::wstring(windows, 2), L"SystemRoot=" + std::wstring(windows), L"TEMP=" + d.scratch, L"TMP=" + d.scratch, L"USERPROFILE=" + d.scratch};
   std::sort(environment.begin(), environment.end());
   std::vector<wchar_t> block;
   for (const auto& item : environment) { block.insert(block.end(), item.begin(), item.end()); block.push_back(L'\0'); } block.push_back(L'\0');
+  stage_ = "create-suspended-process";
   PROCESS_INFORMATION created{};
   if (!CreateProcessW(d.node_executable.c_str(), command.data(), nullptr, nullptr, TRUE,
     CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW,
     block.data(), d.workspace.c_str(), &startup.StartupInfo, &created)) return GetLastError();
   Handle process{created.hProcess}, thread{created.hThread};
   const auto fail = [&](DWORD failure) { TerminateProcess(process.value, failure); WaitForSingleObject(process.value, 5000); return failure; };
+  stage_ = "assign-job";
   if (!AssignProcessToJobObject(job.value, process.value)) return fail(GetLastError());
   BOOL in_job = FALSE;
   if (!IsProcessInJob(process.value, job.value, &in_job) || !in_job) return fail(ERROR_ACCESS_DENIED);
+  stage_ = "verify-appcontainer-token";
   Handle token;
   if (!OpenProcessToken(process.value, TOKEN_QUERY, &token.value)) return fail(GetLastError());
   DWORD is_container = 0, returned = 0;
@@ -180,7 +191,9 @@ DWORD ControlledJob::Launch(const LaunchDescriptor& d, const PrivateHandles& cha
   FILETIME exit{}, kernel{}, user{}, birth{};
   if (!GetProcessTimes(process.value, &birth, &exit, &kernel, &user)) return fail(GetLastError());
   // No untrusted instruction has run before containment and identity checks complete.
+  stage_ = "resume-contained-process";
   if (ResumeThread(thread.value) == static_cast<DWORD>(-1)) return fail(GetLastError());
+  stage_ = "running";
   identity_ = {created.dwProcessId, birth, d.generation};
   job_ = job.release(); process_ = process.release();
   watchdog_ = std::jthread([this, timeout = d.timeout_ms](std::stop_token stop) {
@@ -195,6 +208,15 @@ DWORD ControlledJob::ActiveProcesses(DWORD* count) const {
   JOBOBJECT_BASIC_ACCOUNTING_INFORMATION info{};
   if (!QueryInformationJobObject(job_, JobObjectBasicAccountingInformation, &info, sizeof(info), nullptr)) return GetLastError();
   *count = info.ActiveProcesses; return ERROR_SUCCESS;
+}
+DWORD ControlledJob::ProcessIds(std::vector<DWORD>& ids) const {
+  if (!job_) return ERROR_INVALID_HANDLE;
+  std::vector<unsigned char> bytes(sizeof(JOBOBJECT_BASIC_PROCESS_ID_LIST) + 64 * sizeof(ULONG_PTR));
+  auto* list = reinterpret_cast<JOBOBJECT_BASIC_PROCESS_ID_LIST*>(bytes.data());
+  if (!QueryInformationJobObject(job_, JobObjectBasicProcessIdList, list, static_cast<DWORD>(bytes.size()), nullptr)) return GetLastError();
+  if (list->NumberOfAssignedProcesses != list->NumberOfProcessIdsInList) return ERROR_MORE_DATA;
+  ids.clear(); for (DWORD i = 0; i < list->NumberOfProcessIdsInList; ++i) ids.push_back(static_cast<DWORD>(list->ProcessIdList[i]));
+  return ERROR_SUCCESS;
 }
 DWORD ControlledJob::Stop(DWORD exit_code) {
   if (!job_) return ERROR_INVALID_HANDLE;
