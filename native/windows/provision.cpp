@@ -92,6 +92,16 @@ DWORD VerifyNoSid(const std::wstring& path,PSID sid){
     PSID trustee=nullptr;error=DaclAceSid(raw,&trustee);if(error)break;if(EqualSid(trustee,sid)){error=ERROR_ACCESS_DENIED;break;}}
   if(descriptor)LocalFree(descriptor);return error;
 }
+DWORD VerifyExplicitDeny(const std::wstring& path,PSID sid){
+  PACL acl=nullptr;PSECURITY_DESCRIPTOR descriptor=nullptr;DWORD error=GetNamedSecurityInfoW(path.c_str(),SE_FILE_OBJECT,DACL_SECURITY_INFORMATION,nullptr,nullptr,&acl,nullptr,&descriptor);if(error)return error;
+  bool denied=false;if(!acl||!IsValidAcl(acl))error=ERROR_INVALID_ACL;else for(DWORD i=0;i<acl->AceCount;i++){LPVOID raw=nullptr;if(!GetAce(acl,i,&raw)){error=GetLastError();break;}const auto* header=static_cast<ACE_HEADER*>(raw);PSID trustee=nullptr;
+    error=DaclAceSid(raw,&trustee);if(error)break;if(!EqualSid(trustee,sid))continue;
+    if(header->AceType==ACCESS_DENIED_ACE_TYPE&&!(header->AceFlags&INHERITED_ACE)&&(static_cast<ACCESS_DENIED_ACE*>(raw)->Mask&FILE_ALL_ACCESS)==FILE_ALL_ACCESS){denied=true;break;}
+    // A matching allow before the explicit deny is not accepted as canonical protection.
+    if(header->AceType==ACCESS_ALLOWED_ACE_TYPE){error=ERROR_ACCESS_DENIED;break;}
+  }
+  if(descriptor)LocalFree(descriptor);return error?error:denied?ERROR_SUCCESS:ERROR_ACCESS_DENIED;
+}
 bool Contains(const std::wstring& root,const std::wstring& path){auto r=root,p=path;std::transform(r.begin(),r.end(),r.begin(),towlower);std::transform(p.begin(),p.end(),p.begin(),towlower);return p==r||(p.size()>r.size()&&p.compare(0,r.size(),r)==0&&p[r.size()]==L'\\');}
 }
 DWORD ScopedResources::Provision(const LaunchDescriptor& d,const std::vector<std::wstring>& readonly_roots,const std::wstring& authorization){
@@ -109,8 +119,22 @@ DWORD ScopedResources::Provision(const LaunchDescriptor& d,const std::vector<std
   for(const auto& root:readonly_roots)if((error=grant(root,FILE_GENERIC_READ|FILE_GENERIC_EXECUTE,GRANT_ACCESS,false)))return error;
   if((error=grant(d.workspace,FILE_GENERIC_READ|(d.role==L"implementation"?(FILE_GENERIC_WRITE|DELETE):0),GRANT_ACCESS,true)))return error;
   if((error=grant(d.scratch,FILE_ALL_ACCESS,GRANT_ACCESS,true)))return error;
-  for(const auto* name:{L".git",L".local"}){const auto internal=(fs::path(d.workspace)/name).wstring();if(GetFileAttributesW(internal.c_str())!=INVALID_FILE_ATTRIBUTES&&
-      (error=grant(internal,FILE_ALL_ACCESS,DENY_ACCESS,true)))return error;}
+  // DELETE can be authorized on the object itself. Do not rely on inherited
+  // deny ordering under the source's inherited DELETE allow: explicitly deny
+  // every existing protected object, including ordinary .git worktree files.
+  const ULONGLONG protection_deadline=GetTickCount64()+10000;size_t protected_count=0;
+  for(const auto* name:{L".git",L".local"}){
+    const fs::path internal=fs::path(d.workspace)/name;const DWORD attributes=GetFileAttributesW(internal.c_str());if(attributes==INVALID_FILE_ATTRIBUTES){const DWORD status=GetLastError();if(status==ERROR_FILE_NOT_FOUND||status==ERROR_PATH_NOT_FOUND)continue;return status;}
+    std::vector<fs::path> protected_paths={internal};if(++protected_count>d.file_limit)return ERROR_DISK_FULL;
+    if(attributes&FILE_ATTRIBUTE_DIRECTORY)for(const auto& entry:fs::recursive_directory_iterator(internal)){
+      if(++protected_count>d.file_limit)return ERROR_DISK_FULL;if(GetTickCount64()>=protection_deadline)return ERROR_TIMEOUT;
+      const DWORD attrs=GetFileAttributesW(entry.path().c_str());if(attrs==INVALID_FILE_ATTRIBUTES)return GetLastError();if(attrs&FILE_ATTRIBUTE_REPARSE_POINT)return ERROR_REPARSE_TAG_INVALID;protected_paths.push_back(entry.path());
+    }
+    for(const auto& path:protected_paths){if(GetTickCount64()>=protection_deadline)return ERROR_TIMEOUT;const DWORD attrs=GetFileAttributesW(path.c_str());if(attrs==INVALID_FILE_ATTRIBUTES)return GetLastError();if(attrs&FILE_ATTRIBUTE_REPARSE_POINT)return ERROR_REPARSE_TAG_INVALID;
+      if((error=grant(path.wstring(),FILE_ALL_ACCESS,DENY_ACCESS,!!(attrs&FILE_ATTRIBUTE_DIRECTORY))))return error;
+      if((error=VerifyExplicitDeny(path.wstring(),sid_))){RecordFailure("protected-explicit-deny",path.wstring(),error);return error;}
+    }
+  }
   // Revised v2 and ordinary v3 do not edit existing ancestors or volume roots.
   // Native pins + fixed Node module flags + explicit private workspace capability
   // replace the failed metadata-grant experiment; there is no policy fallback.

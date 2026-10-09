@@ -67,23 +67,42 @@ std::vector<unsigned char> SidAces(const fs::path& path,PSID sid,BYTE type=255){
   if(descriptor)LocalFree(descriptor);return result;
 }
 void ScopedRevokeRegression(const fs::path& root){
-  const auto base=root/L"revoke-regression",source=base/L"source",scratch=base/L"scratch",bin=base/L"bin";
-  fs::create_directories(source/L".git");fs::create_directories(scratch);fs::create_directories(bin);
-  Write(source/L".git"/L"object","synthetic protected fixture");fs::copy_file(Self(),bin/L"node.fixture");Write(bin/L"worker.fixture","synthetic worker");
-  const auto generation=L"revoke-"+std::to_wstring(GetTickCount64());
-  Profile unrelated(AppContainerProfileName(L"unrelated",L"review",generation));
-  Acl(source/L".git",unrelated.sid,FILE_GENERIC_READ,true);
-  const auto unrelated_before=SidAces(source/L".git",unrelated.sid);Require(!unrelated_before.empty(),"unrelated ACE fixture exists");
-  LaunchDescriptor d;d.demand=L"revoke";d.role=L"implementation";d.generation=generation;d.profile_name=AppContainerProfileName(d.demand,d.role,generation);
-  d.node_executable=(bin/L"node.fixture").wstring();d.worker_entry=(bin/L"worker.fixture").wstring();d.workspace=source.wstring();d.scratch=scratch.wstring();d.node_sha256=Sha256(d.node_executable);d.worker_sha256=Sha256(d.worker_entry);
-  d.policy_evidence=L"synthetic-revoke-regression";d.acl_evidence=L"disposable-resources";d.private_channel_evidence=L"no-process-created";d.timeout_ms=10000;d.process_limit=4;d.memory_limit_bytes=128ull*1024*1024;d.output_limit_bytes=16384;
-  ScopedResources scoped;Require(scoped.Provision(d,{d.node_executable,d.worker_entry},L"disposable-revoke-regression")==ERROR_SUCCESS,"provision revoke regression");
-  PSID generated=nullptr;Require(SUCCEEDED(DeriveAppContainerSidFromAppContainerName(d.profile_name.c_str(),&generated)),"derive regression SID");
-  Require(!SidAces(source/L".git",generated,ACCESS_DENIED_ACE_TYPE).empty(),"protected deny ACE must exist before revoke");
-  Require(scoped.Revoke()==ERROR_SUCCESS,"all generated allow AND deny ACEs must revoke");
-  for(const auto& path:{source,source/L".git",source/L".git"/L"object",scratch,bin/L"node.fixture",bin/L"worker.fixture"})Require(SidAces(path,generated).empty(),"generated SID absent after revoke");
-  Require(SidAces(source/L".git",unrelated.sid)==unrelated_before,"unrelated ACE bytes/order preserved");FreeSid(generated);
-  std::cout<<"{\"phase\":\"native-revoke-regression\",\"protectedDenyRemoved\":true,\"unrelatedAceBytesPreserved\":true}"<<std::endl;
+  for(const bool directory:{true,false}){
+    const auto suffix=directory?L"directory":L"file";
+    const auto base=root/(std::wstring(L"revoke-regression-")+suffix),source=base/L"source",scratch=base/L"scratch",bin=base/L"bin";
+    fs::create_directories(source);fs::create_directories(source/L".local");fs::create_directories(scratch);fs::create_directories(bin);
+    if(directory){fs::create_directories(source/L".git"/L"objects"/L"nested");Write(source/L".git"/L"object","protected Git object");Write(source/L".git"/L"objects"/L"nested"/L"object","nested protected Git object");}else Write(source/L".git","protected worktree pointer");
+    Write(source/L".local"/L"hidden","protected knowledge");Write(source/L"ordinary.txt","allowed deletion");fs::copy_file(Self(),bin/L"node.fixture");Write(bin/L"protected-worker.fixture","synthetic protected-access worker");
+    const auto generation=L"revoke-"+std::to_wstring(GetTickCount64())+L"-"+suffix;
+    Profile unrelated(AppContainerProfileName(L"unrelated",L"review",generation));
+    Acl(source/L".git",unrelated.sid,FILE_GENERIC_READ,directory);
+    // Preserve inheritance here: a protected DACL would hide the inherited-allow
+    // versus inherited-deny ordering bug that this real-token regression covers.
+    PACL fixture_acl=nullptr;PSECURITY_DESCRIPTOR fixture_descriptor=nullptr;const auto git_root=source/L".git";
+    Require(GetNamedSecurityInfoW(git_root.c_str(),SE_FILE_OBJECT,DACL_SECURITY_INFORMATION,nullptr,nullptr,&fixture_acl,nullptr,&fixture_descriptor)==ERROR_SUCCESS,"read fixture inheritance");
+    const DWORD inheritance_status=SetNamedSecurityInfoW(const_cast<LPWSTR>(git_root.c_str()),SE_FILE_OBJECT,DACL_SECURITY_INFORMATION|UNPROTECTED_DACL_SECURITY_INFORMATION,nullptr,nullptr,fixture_acl,nullptr);LocalFree(fixture_descriptor);Require(inheritance_status==ERROR_SUCCESS,"enable fixture inheritance");
+    const auto unrelated_before=SidAces(source/L".git",unrelated.sid);Require(!unrelated_before.empty(),"unrelated ACE fixture exists");
+    LaunchDescriptor d;d.policy_variant=SelectedPolicy();d.demand=L"revoke";d.role=L"implementation";d.generation=generation;d.profile_name=AppContainerProfileName(d.demand,d.role,generation);
+    d.node_executable=(bin/L"node.fixture").wstring();d.worker_entry=(bin/L"protected-worker.fixture").wstring();d.workspace=source.wstring();d.scratch=scratch.wstring();d.node_sha256=Sha256(d.node_executable);d.worker_sha256=Sha256(d.worker_entry);
+    d.policy_evidence=L"synthetic-revoke-regression";d.acl_evidence=L"disposable-resources";d.private_channel_evidence=L"native-private-protection-probe";d.timeout_ms=10000;d.process_limit=4;d.memory_limit_bytes=128ull*1024*1024;d.output_limit_bytes=16384;
+    ScopedResources scoped;Require(scoped.Provision(d,{d.node_executable,d.worker_entry},L"disposable-revoke-regression")==ERROR_SUCCESS,"provision revoke regression");
+    PSID generated=nullptr;Require(SUCCEEDED(DeriveAppContainerSidFromAppContainerName(d.profile_name.c_str(),&generated)),"derive regression SID");
+    Require(!SidAces(source/L".git",generated,ACCESS_DENIED_ACE_TYPE).empty(),"protected deny ACE must exist before revoke");
+    if(directory)for(const auto& path:{source/L".git"/L"object",source/L".git"/L"objects"/L"nested"/L"object"})Require(!SidAces(path,generated,ACCESS_DENIED_ACE_TYPE).empty(),"protected descendant deny must exist");
+    SECURITY_ATTRIBUTES sa{sizeof(sa),nullptr,TRUE};HANDLE in_read=nullptr,in_write=nullptr,out_read=nullptr,out_write=nullptr,log_read=nullptr,log_write=nullptr;
+    Require(!!CreatePipe(&in_read,&in_write,&sa,0)&&!!CreatePipe(&out_read,&out_write,&sa,0)&&!!CreatePipe(&log_read,&log_write,&sa,0),"protected probe pipes");
+    SetHandleInformation(in_write,HANDLE_FLAG_INHERIT,0);SetHandleInformation(out_read,HANDLE_FLAG_INHERIT,0);SetHandleInformation(log_read,HANDLE_FLAG_INHERIT,0);
+    const auto input=source.wstring()+L"\n"+(directory?L"directory":L"file")+L"\n";DWORD sent=0;Require(!!WriteFile(in_write,input.data(),static_cast<DWORD>(input.size()*sizeof(wchar_t)),&sent,nullptr),"protected probe input");
+    ControlledJob job;Require(job.Launch(d,{in_read,out_write,log_write})==ERROR_SUCCESS,"launch actual protected deletion probe");CloseHandle(in_read);CloseHandle(out_write);CloseHandle(log_write);
+    DWORD available=0;const ULONGLONG until=GetTickCount64()+5000;while(GetTickCount64()<until){if(PeekNamedPipe(out_read,nullptr,0,nullptr,&available,nullptr)&&available)break;Sleep(10);}
+    Require(available>0&&available<16384,"bounded protected probe result");std::vector<char> bytes(available);DWORD got=0;Require(!!ReadFile(out_read,bytes.data(),available,&got,nullptr),"read protected probe result");const std::string report(bytes.data(),got);std::cout<<report<<std::flush;Require(report.find("\"passed\":1")!=std::string::npos,"protected read/delete must be denied while ordinary delete works");
+    Require(job.Stop()==ERROR_SUCCESS,"stop actual protected probe");Require(scoped.Revoke()==ERROR_SUCCESS,"all generated allow AND deny ACEs must revoke");
+    for(const auto& path:{source,source/L".git",source/L".local",source/L".local"/L"hidden",scratch,bin/L"node.fixture",bin/L"protected-worker.fixture"})Require(SidAces(path,generated).empty(),"generated SID absent after revoke");
+    if(directory)for(const auto& path:{source/L".git"/L"object",source/L".git"/L"objects"/L"nested"/L"object"})Require(SidAces(path,generated).empty(),"protected descendant SID absent after revoke");
+    Require(SidAces(source/L".git",unrelated.sid)==unrelated_before,"unrelated ACE bytes/order preserved");FreeSid(generated);
+    CloseHandle(in_write);CloseHandle(out_read);CloseHandle(log_read);
+    std::cout<<"{\"phase\":\"native-revoke-regression\",\"protectedDenyRemoved\":true,\"unrelatedAceBytesPreserved\":true}"<<std::endl;
+  }
 }
 bool CanRead(const fs::path& path, DWORD* error) {
   HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -98,6 +117,18 @@ bool CanWrite(const fs::path& path, DWORD* error) {
 void Heartbeat(const fs::path& path) {
   for (;;) { HANDLE file = CreateFileW(path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (file != INVALID_HANDLE_VALUE) { DWORD written = 0; const char x[] = "tick\n"; WriteFile(file, x, sizeof(x)-1, &written, nullptr); CloseHandle(file); } Sleep(20); }
+}
+int ProtectedDeleteChild(){
+  std::vector<wchar_t> buffer(2048);DWORD bytes=0;Require(!!ReadFile(GetStdHandle(STD_INPUT_HANDLE),buffer.data(),static_cast<DWORD>((buffer.size()-1)*sizeof(wchar_t)),&bytes,nullptr),"read protected probe input");
+  std::wistringstream input(std::wstring(buffer.data(),bytes/sizeof(wchar_t)));std::wstring source_text,kind;std::getline(input,source_text);std::getline(input,kind);const fs::path source(source_text),git=kind==L"directory"?source/L".git"/L"object":source/L".git";
+  DWORD read_error=0;const bool git_read=CanRead(git,&read_error),ordinary_delete=!!DeleteFileW((source/L"ordinary.txt").c_str());
+  const bool git_delete=!!DeleteFileW(git.c_str());const DWORD git_error=git_delete?0:GetLastError();
+  const bool local_delete=!!DeleteFileW((source/L".local"/L"hidden").c_str());const DWORD local_error=local_delete?0:GetLastError();
+  bool nested_delete=false;DWORD nested_error=ERROR_ACCESS_DENIED;if(kind==L"directory"){nested_delete=!!DeleteFileW((source/L".git"/L"objects"/L"nested"/L"object").c_str());nested_error=nested_delete?0:GetLastError();}
+  HANDLE root_delete=CreateFileW((source/L".git").c_str(),DELETE,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,nullptr,OPEN_EXISTING,FILE_FLAG_BACKUP_SEMANTICS,nullptr);const DWORD root_error=root_delete==INVALID_HANDLE_VALUE?GetLastError():0;if(root_delete!=INVALID_HANDLE_VALUE)CloseHandle(root_delete);
+  const bool passed=ordinary_delete&&!git_read&&read_error==ERROR_ACCESS_DENIED&&!git_delete&&git_error==ERROR_ACCESS_DENIED&&!local_delete&&local_error==ERROR_ACCESS_DENIED&&!nested_delete&&nested_error==ERROR_ACCESS_DENIED&&root_delete==INVALID_HANDLE_VALUE&&root_error==ERROR_ACCESS_DENIED;
+  std::ostringstream output;output<<"{\"phase\":\"native-protected-deletion\",\"gitDirectory\":"<<(kind==L"directory")<<",\"ordinaryDelete\":"<<ordinary_delete<<",\"gitRead\":"<<git_read<<",\"gitDelete\":"<<git_delete<<",\"gitError\":"<<git_error<<",\"localDelete\":"<<local_delete<<",\"localError\":"<<local_error<<",\"nestedDelete\":"<<nested_delete<<",\"nestedError\":"<<nested_error<<",\"gitRootDeleteError\":"<<root_error<<",\"passed\":"<<passed<<"}\n";
+  const auto report=output.str();DWORD written=0;Require(!!WriteFile(GetStdHandle(STD_OUTPUT_HANDLE),report.data(),static_cast<DWORD>(report.size()),&written,nullptr),"write protected deletion result");return passed?0:1;
 }
 int ProbeChild() {
   // Control data only via the inherited private request handle; no shared host config path.
@@ -216,7 +247,7 @@ int wmain(int argc,wchar_t** argv) {
     // the same fixed startup flags; actual Node/Pi compatibility is separate.
     if(argc>=3&&std::wstring(argv[1])==L"--preserve-symlinks"&&std::wstring(argv[2])==L"--preserve-symlinks-main"){argc-=2;argv+=2;}
     if(argc==3&&std::wstring(argv[1])==L"--descendant"){Heartbeat(argv[2]);return 0;}
-    if(argc==4&&std::wstring(argv[2])==L"--controlled-run")return ProbeChild();
+    if(argc==4&&std::wstring(argv[2])==L"--controlled-run")return fs::path(argv[1]).filename()==L"protected-worker.fixture"?ProtectedDeleteChild():ProbeChild();
     if(argc==2&&std::wstring(argv[1])==L"--registry-read")registry_read_policy=true;
     if(argc==2&&std::wstring(argv[1])==L"--appcontainer")ordinary_appcontainer=true;
     Require(AppContainerProfileName(L"A",L"implementation",L"generation-1")==L"pi-kanban-a898bef33cf31470bdfb100d74db470c2cbf93aea19effb2","Host/native profile-name binding must match");
